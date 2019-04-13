@@ -34,7 +34,7 @@ import (
 
 	"github.com/golang/protobuf/ptypes"
 	"go.uber.org/yarpc/yarpcerrors"
-	"gopkg.in/yaml.v2"
+	yaml "gopkg.in/yaml.v2"
 )
 
 const (
@@ -727,10 +727,10 @@ func printStatelessQueryResult(j *stateless.JobSummary) {
 		j.GetStatus().GetState().String(),
 		creationTimeStr,
 		j.GetInstanceCount(),
-		j.GetStatus().GetPodStats()["RUNNING"],
-		j.GetStatus().GetPodStats()["SUCCEEDED"],
-		j.GetStatus().GetPodStats()["FAILED"],
-		j.GetStatus().GetPodStats()["KILLED"],
+		j.GetStatus().GetPodStats()["POD_STATE_RUNNING"],
+		j.GetStatus().GetPodStats()["POD_STATE_SUCCEEDED"],
+		j.GetStatus().GetPodStats()["POD_STATE_FAILED"],
+		j.GetStatus().GetPodStats()["POD_STATE_KILLED"],
 		j.GetStatus().GetWorkflowStatus().GetState().String(),
 		j.GetStatus().GetWorkflowStatus().GetNumInstancesCompleted(),
 		j.GetStatus().GetWorkflowStatus().GetNumInstancesFailed(),
@@ -893,11 +893,15 @@ func (c *Client) StatelessRestartJobAction(
 }
 
 // StatelessListUpdatesAction lists updates of a job
-func (c *Client) StatelessListUpdatesAction(jobID string) error {
+func (c *Client) StatelessListUpdatesAction(
+	jobID string,
+	updatesLimit uint32,
+) error {
 	resp, err := c.statelessClient.ListJobWorkflows(
 		c.ctx,
 		&statelesssvc.ListJobWorkflowsRequest{
-			JobId: &v1alphapeloton.JobID{Value: jobID},
+			JobId:        &v1alphapeloton.JobID{Value: jobID},
+			UpdatesLimit: updatesLimit,
 		},
 	)
 
@@ -926,6 +930,7 @@ func printListUpdatesResponse(
 			if err := printUpdateInfo(u); err != nil {
 				return err
 			}
+			fmt.Printf("\n\n\n")
 		}
 	}
 

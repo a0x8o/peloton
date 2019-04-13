@@ -27,15 +27,14 @@ import (
 	"time"
 
 	mesos "github.com/uber/peloton/.gen/mesos/v1"
-	"github.com/uber/peloton/.gen/peloton/api/v0/task"
-	stateless "github.com/uber/peloton/.gen/peloton/api/v1alpha/job/stateless"
+	"github.com/uber/peloton/.gen/peloton/api/v1alpha/job/stateless"
 	statelesssvc "github.com/uber/peloton/.gen/peloton/api/v1alpha/job/stateless/svc"
 	jobmocks "github.com/uber/peloton/.gen/peloton/api/v1alpha/job/stateless/svc/mocks"
 	"github.com/uber/peloton/.gen/peloton/api/v1alpha/peloton"
 	"github.com/uber/peloton/.gen/peloton/api/v1alpha/pod"
 	podsvc "github.com/uber/peloton/.gen/peloton/api/v1alpha/pod/svc"
 	podmocks "github.com/uber/peloton/.gen/peloton/api/v1alpha/pod/svc/mocks"
-	watch "github.com/uber/peloton/.gen/peloton/api/v1alpha/watch"
+	"github.com/uber/peloton/.gen/peloton/api/v1alpha/watch"
 	watchsvc "github.com/uber/peloton/.gen/peloton/api/v1alpha/watch/svc"
 	watchmocks "github.com/uber/peloton/.gen/peloton/api/v1alpha/watch/svc/mocks"
 
@@ -44,6 +43,7 @@ import (
 	"github.com/pkg/errors"
 	"github.com/stretchr/testify/suite"
 	"github.com/uber/peloton/pkg/aurorabridge/atop"
+	"github.com/uber/peloton/pkg/aurorabridge/common"
 	"github.com/uber/peloton/pkg/aurorabridge/fixture"
 	"github.com/uber/peloton/pkg/common/util"
 	"go.uber.org/goleak"
@@ -129,7 +129,11 @@ func (suite *EventPublisherTestSuite) TestEventPublisher_AuroraBridgeLeaderStart
 
 	suite.watchClient.EXPECT().
 		Watch(gomock.Any(), &watchsvc.WatchRequest{
-			PodFilter: &watch.PodFilter{},
+			PodFilter: &watch.PodFilter{
+				Labels: []*peloton.Label{
+					common.BridgePodLabel,
+				},
+			},
 		}).Return(suite.stream, nil)
 
 	suite.stream.EXPECT().
@@ -160,7 +164,11 @@ func (suite *EventPublisherTestSuite) TestEventPublisher_JobManagerLeaderChange(
 
 	suite.watchClient.EXPECT().
 		Watch(gomock.Any(), &watchsvc.WatchRequest{
-			PodFilter: &watch.PodFilter{},
+			PodFilter: &watch.PodFilter{
+				Labels: []*peloton.Label{
+					common.BridgePodLabel,
+				},
+			},
 		}).Return(suite.stream, nil)
 
 	suite.stream.EXPECT().
@@ -174,7 +182,11 @@ func (suite *EventPublisherTestSuite) TestEventPublisher_JobManagerLeaderChange(
 
 	suite.watchClient.EXPECT().
 		Watch(gomock.Any(), &watchsvc.WatchRequest{
-			PodFilter: &watch.PodFilter{},
+			PodFilter: &watch.PodFilter{
+				Labels: []*peloton.Label{
+					common.BridgePodLabel,
+				},
+			},
 		}).Return(suite.stream, nil)
 
 	suite.stream.EXPECT().
@@ -210,7 +222,11 @@ func (suite *EventPublisherTestSuite) TestEventPublisher_StreamError() {
 
 	suite.watchClient.EXPECT().
 		Watch(gomock.Any(), &watchsvc.WatchRequest{
-			PodFilter: &watch.PodFilter{},
+			PodFilter: &watch.PodFilter{
+				Labels: []*peloton.Label{
+					common.BridgePodLabel,
+				},
+			},
 		}).Return(suite.stream, nil)
 
 	suite.stream.EXPECT().
@@ -224,7 +240,11 @@ func (suite *EventPublisherTestSuite) TestEventPublisher_StreamError() {
 
 	suite.watchClient.EXPECT().
 		Watch(gomock.Any(), &watchsvc.WatchRequest{
-			PodFilter: &watch.PodFilter{},
+			PodFilter: &watch.PodFilter{
+				Labels: []*peloton.Label{
+					common.BridgePodLabel,
+				},
+			},
 		}).Return(suite.stream, nil)
 
 	suite.stream.EXPECT().
@@ -278,7 +298,11 @@ func (suite *EventPublisherTestSuite) TestEventPublisher_GetTaskStateChangeError
 
 	suite.watchClient.EXPECT().
 		Watch(gomock.Any(), &watchsvc.WatchRequest{
-			PodFilter: &watch.PodFilter{},
+			PodFilter: &watch.PodFilter{
+				Labels: []*peloton.Label{
+					common.BridgePodLabel,
+				},
+			},
 		}).Return(suite.stream, nil).
 		AnyTimes()
 
@@ -364,7 +388,11 @@ func (suite *EventPublisherTestSuite) TestEventPublisher_ReceivePods() {
 
 	suite.watchClient.EXPECT().
 		Watch(gomock.Any(), &watchsvc.WatchRequest{
-			PodFilter: &watch.PodFilter{},
+			PodFilter: &watch.PodFilter{
+				Labels: []*peloton.Label{
+					common.BridgePodLabel,
+				},
+			},
 		}).Return(suite.stream, nil)
 
 	// generates 9 pod summaries
@@ -416,7 +444,7 @@ func (suite *EventPublisherTestSuite) TestEventPublisher_ReceivePods() {
 				Events: []*pod.PodEvent{
 					{
 						PodId:       podSummary.GetStatus().GetPodId(),
-						ActualState: task.TaskState_RUNNING.String(),
+						ActualState: pod.PodState_POD_STATE_RUNNING.String(),
 						Timestamp:   "2019-01-03T22:14:58Z",
 					},
 				},

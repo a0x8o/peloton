@@ -39,6 +39,13 @@ class Client(object):
             *args)
         return res.result.getJobUpdateSummariesResult
 
+    def get_job_update_details(self, *args):
+        res = self._send(
+            ReadOnlyScheduler,
+            ReadOnlyScheduler.getJobUpdateDetails,
+            *args)
+        return res.result.getJobUpdateDetailsResult
+
     def get_job_summary(self, *args):
         res = self._send(
             ReadOnlyScheduler,
@@ -94,6 +101,13 @@ class Client(object):
             AuroraSchedulerManager.pauseJobUpdate,
             *args)
         # pauseJobUpdate has no result
+
+    def rollback_job_update(self, *args):
+        self._send(
+            AuroraSchedulerManager,
+            AuroraSchedulerManager.rollbackJobUpdate,
+            *args)
+        # rollbackJobUpdate has no result
 
     def _send(self, service, method, *args):
         req = method.request(*args)

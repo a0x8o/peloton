@@ -37,6 +37,7 @@ import (
 	"github.com/uber/peloton/pkg/common"
 	"github.com/uber/peloton/pkg/common/leader"
 	"github.com/uber/peloton/pkg/common/util"
+	versionutil "github.com/uber/peloton/pkg/common/util/entityversion"
 	"github.com/uber/peloton/pkg/jobmgr/cached"
 	jobmgrcommon "github.com/uber/peloton/pkg/jobmgr/common"
 	"github.com/uber/peloton/pkg/jobmgr/goalstate"
@@ -230,7 +231,7 @@ func (h *serviceHandler) CreateJob(
 
 	return &svc.CreateJobResponse{
 		JobId: &v1alphapeloton.JobID{Value: pelotonJobID.GetValue()},
-		Version: jobutil.GetJobEntityVersion(
+		Version: versionutil.GetJobEntityVersion(
 			runtimeInfo.GetConfigurationVersion(),
 			runtimeInfo.GetDesiredStateVersion(),
 			runtimeInfo.GetWorkflowVersion(),
@@ -241,6 +242,8 @@ func (h *serviceHandler) CreateJob(
 func (h *serviceHandler) ReplaceJob(
 	ctx context.Context,
 	req *svc.ReplaceJobRequest) (resp *svc.ReplaceJobResponse, err error) {
+	var updateID *peloton.UpdateID
+
 	defer func() {
 		jobID := req.GetJobId().GetValue()
 		specVersion := req.GetSpec().GetRevision().GetVersion()
@@ -260,6 +263,7 @@ func (h *serviceHandler) ReplaceJob(
 			WithField("spec_version", specVersion).
 			WithField("entity_version", entityVersion).
 			WithField("response", resp).
+			WithField("update_id", updateID.GetValue()).
 			Info("JobSVC.ReplaceJob succeeded")
 	}()
 
@@ -631,7 +635,7 @@ func (h *serviceHandler) StartJob(
 		if err != nil {
 			return nil, errors.Wrap(err, "fail to get runtime")
 		}
-		entityVersion := jobutil.GetJobEntityVersion(
+		entityVersion := versionutil.GetJobEntityVersion(
 			jobRuntime.GetConfigurationVersion(),
 			jobRuntime.GetDesiredStateVersion(),
 			jobRuntime.GetWorkflowVersion(),
@@ -660,7 +664,7 @@ func (h *serviceHandler) StartJob(
 
 		h.goalStateDriver.EnqueueJob(pelotonJobID, time.Now())
 		return &svc.StartJobResponse{
-			Version: jobutil.GetJobEntityVersion(
+			Version: versionutil.GetJobEntityVersion(
 				jobRuntime.GetConfigurationVersion(),
 				jobRuntime.GetDesiredStateVersion(),
 				jobRuntime.GetWorkflowVersion(),
@@ -701,7 +705,7 @@ func (h *serviceHandler) StopJob(
 		if err != nil {
 			return nil, errors.Wrap(err, "fail to get runtime")
 		}
-		entityVersion := jobutil.GetJobEntityVersion(
+		entityVersion := versionutil.GetJobEntityVersion(
 			jobRuntime.GetConfigurationVersion(),
 			jobRuntime.GetDesiredStateVersion(),
 			jobRuntime.GetWorkflowVersion(),
@@ -730,7 +734,7 @@ func (h *serviceHandler) StopJob(
 
 		h.goalStateDriver.EnqueueJob(cachedJob.ID(), time.Now())
 		return &svc.StopJobResponse{
-			Version: jobutil.GetJobEntityVersion(
+			Version: versionutil.GetJobEntityVersion(
 				jobRuntime.GetConfigurationVersion(),
 				jobRuntime.GetDesiredStateVersion(),
 				jobRuntime.GetWorkflowVersion(),
@@ -771,7 +775,7 @@ func (h *serviceHandler) DeleteJob(
 			return nil, errors.Wrap(err, "failed to get job runtime")
 		}
 
-		entityVersion := jobutil.GetJobEntityVersion(
+		entityVersion := versionutil.GetJobEntityVersion(
 			runtime.GetConfigurationVersion(),
 			runtime.GetDesiredStateVersion(),
 			runtime.GetWorkflowVersion(),
@@ -839,7 +843,7 @@ func (h *serviceHandler) getJobConfigurationWithVersion(
 	ctx context.Context,
 	jobID *v1alphapeloton.JobID,
 	version *v1alphapeloton.EntityVersion) (*svc.GetJobResponse, error) {
-	configVersion, _, _, err := jobutil.ParseJobEntityVersion(version)
+	configVersion, err := versionutil.GetConfigVersion(version)
 	if err != nil {
 		return nil, err
 	}
@@ -1021,7 +1025,9 @@ func (h *serviceHandler) GetWorkflowEvents(
 	workflowEvents, err := h.updateStore.GetWorkflowEvents(
 		ctx,
 		jobRuntime.GetUpdateID(),
-		req.GetInstanceId())
+		req.GetInstanceId(),
+		req.GetLimit(),
+	)
 	if err != nil {
 		return nil, errors.Wrap(err,
 			fmt.Sprintf("failed to get workflow events for an update %s",
@@ -1312,7 +1318,9 @@ func (h *serviceHandler) ListJobWorkflows(
 		if req.GetInstanceEvents() {
 			instanceWorkflowEvents, err = h.getInstanceWorkflowEvents(
 				ctx,
-				updateModel)
+				updateModel,
+				req.GetInstanceEventsLimit(),
+			)
 			if err != nil {
 				return nil, errors.Wrap(err, "fail to get instance workflow events")
 			}
@@ -1336,13 +1344,16 @@ func (h *serviceHandler) ListJobWorkflows(
 func (h *serviceHandler) getInstanceWorkflowEvents(
 	ctx context.Context,
 	updateModel *models.UpdateModel,
+	limit uint32,
 ) ([]*stateless.WorkflowInfoInstanceWorkflowEvents, error) {
 
 	f := func(ctx context.Context, instance_id interface{}) (interface{}, error) {
 		workflowEvents, err := h.updateStore.GetWorkflowEvents(
 			ctx,
 			updateModel.GetUpdateID(),
-			instance_id.(uint32))
+			instance_id.(uint32),
+			limit,
+		)
 		if err != nil {
 			return nil, errors.Wrap(err,
 				fmt.Sprintf("failed to get workflow events for update %s, instance %d",
@@ -1612,9 +1623,9 @@ func convertCacheToJobStatus(
 	}
 	result.State = stateless.JobState(runtime.GetState())
 	result.CreationTime = runtime.GetCreationTime()
-	result.PodStats = runtime.TaskStats
+	result.PodStats = handlerutil.ConvertTaskStatsToPodStats(runtime.TaskStats)
 	result.DesiredState = stateless.JobState(runtime.GetGoalState())
-	result.Version = jobutil.GetJobEntityVersion(
+	result.Version = versionutil.GetJobEntityVersion(
 		runtime.GetConfigurationVersion(),
 		runtime.GetDesiredStateVersion(),
 		runtime.GetWorkflowVersion())
@@ -1639,8 +1650,8 @@ func convertCacheToWorkflowStatus(
 			len(cachedWorkflow.GetInstancesDone()) -
 			len(cachedWorkflow.GetInstancesFailed()))
 	workflowStatus.InstancesCurrent = cachedWorkflow.GetInstancesCurrent()
-	workflowStatus.PrevVersion = jobutil.GetPodEntityVersion(cachedWorkflow.GetState().JobVersion)
-	workflowStatus.Version = jobutil.GetPodEntityVersion(cachedWorkflow.GetGoalState().JobVersion)
+	workflowStatus.PrevVersion = versionutil.GetPodEntityVersion(cachedWorkflow.GetState().JobVersion)
+	workflowStatus.Version = versionutil.GetPodEntityVersion(cachedWorkflow.GetGoalState().JobVersion)
 	return workflowStatus
 }
 

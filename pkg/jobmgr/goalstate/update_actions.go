@@ -18,6 +18,7 @@ import (
 	"context"
 	"time"
 
+	log "github.com/sirupsen/logrus"
 	pbjob "github.com/uber/peloton/.gen/peloton/api/v0/job"
 	pbupdate "github.com/uber/peloton/.gen/peloton/api/v0/update"
 
@@ -49,7 +50,8 @@ func UpdateAbortIfNeeded(ctx context.Context, entity goalstate.Entity) error {
 
 	// maybe abort a workflow of a terminated job, reenenque job goal
 	// state engine to untrack
-	if util.IsPelotonJobStateTerminal(runtime.GetState()) {
+	if util.IsPelotonJobStateTerminal(runtime.GetState()) &&
+		util.IsPelotonJobStateTerminal(runtime.GetGoalState()) {
 		goalStateDriver.EnqueueJob(updateEnt.jobID, time.Now())
 	}
 
@@ -123,6 +125,17 @@ func UpdateComplete(ctx context.Context, entity goalstate.Entity) error {
 		return err
 	}
 
+	log.WithFields(log.Fields{
+		"update_id":         updateEnt.id.GetValue(),
+		"job_id":            cachedJob.ID().GetValue(),
+		"update_type":       cachedWorkflow.GetWorkflowType().String(),
+		"instances_failed":  len(cachedWorkflow.GetInstancesFailed()),
+		"instances_done":    len(cachedWorkflow.GetInstancesDone()),
+		"instances_added":   len(cachedWorkflow.GetInstancesAdded()),
+		"instances_removed": len(cachedWorkflow.GetInstancesRemoved()),
+		"instances_updated": len(cachedWorkflow.GetInstancesUpdated()),
+	}).Info("update completed")
+
 	// enqueue to the goal state engine to untrack the update
 	goalStateDriver.EnqueueUpdate(updateEnt.jobID, updateEnt.id, time.Now())
 	goalStateDriver.mtx.updateMetrics.UpdateComplete.Inc(1)
@@ -157,7 +170,8 @@ func UpdateUntrack(ctx context.Context, entity goalstate.Entity) error {
 
 	// update can be applied to a terminated job,
 	// need to remove job from cache upon completion
-	if util.IsPelotonJobStateTerminal(runtime.GetState()) {
+	if util.IsPelotonJobStateTerminal(runtime.GetState()) &&
+		util.IsPelotonJobStateTerminal(runtime.GetGoalState()) {
 		goalStateDriver.EnqueueJob(jobID, time.Now())
 	}
 

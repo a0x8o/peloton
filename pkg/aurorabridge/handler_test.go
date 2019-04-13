@@ -22,7 +22,6 @@ import (
 	"testing"
 
 	"github.com/pborman/uuid"
-	"github.com/uber/peloton/.gen/peloton/api/v0/task"
 	"github.com/uber/peloton/.gen/peloton/api/v1alpha/job/stateless"
 	statelesssvc "github.com/uber/peloton/.gen/peloton/api/v1alpha/job/stateless/svc"
 	jobmocks "github.com/uber/peloton/.gen/peloton/api/v1alpha/job/stateless/svc/mocks"
@@ -791,6 +790,10 @@ func (suite *ServiceHandlerTestSuite) expectQueryJobsWithLabels(
 			&statelesssvc.QueryJobsRequest{
 				Spec: &stateless.QuerySpec{
 					Labels: labels,
+					Pagination: &pbquery.PaginationSpec{
+						Limit:    common.QueryJobsLimit,
+						MaxLimit: common.QueryJobsLimit,
+					},
 				},
 			}).
 		Return(&statelesssvc.QueryJobsResponse{Records: summaries}, nil)
@@ -1002,6 +1005,10 @@ func (suite *ServiceHandlerTestSuite) TestGetJobIDsFromTaskQuery_PartialJobKeyFi
 			&statelesssvc.QueryJobsRequest{
 				Spec: &stateless.QuerySpec{
 					Labels: labels,
+					Pagination: &pbquery.PaginationSpec{
+						Limit:    common.QueryJobsLimit,
+						MaxLimit: common.QueryJobsLimit,
+					},
 				},
 			}).
 		Return(&statelesssvc.QueryJobsResponse{Records: summaries}, nil)
@@ -1038,6 +1045,10 @@ func (suite *ServiceHandlerTestSuite) TestGetJobIDsFromTaskQuery_PartialJobKeyEr
 			&statelesssvc.QueryJobsRequest{
 				Spec: &stateless.QuerySpec{
 					Labels: labels,
+					Pagination: &pbquery.PaginationSpec{
+						Limit:    common.QueryJobsLimit,
+						MaxLimit: common.QueryJobsLimit,
+					},
 				},
 			}).
 		Return(nil, errors.New("failed to get job summary"))
@@ -1161,7 +1172,7 @@ func (suite *ServiceHandlerTestSuite) TestGetTasksWithoutConfigs_ParallelismSucc
 						PodId:       podID,
 						Timestamp:   "2019-01-03T22:14:58Z",
 						Message:     "",
-						ActualState: task.TaskState_RUNNING.String(),
+						ActualState: pod.PodState_POD_STATE_RUNNING.String(),
 						Hostname:    "peloton-host-0",
 					},
 				},
@@ -1216,7 +1227,7 @@ func (suite *ServiceHandlerTestSuite) TestGetTasksWithoutConfigs_ParallelismFail
 						PodId:       podID,
 						Timestamp:   "2019-01-03T22:14:58Z",
 						Message:     "",
-						ActualState: task.TaskState_RUNNING.String(),
+						ActualState: pod.PodState_POD_STATE_RUNNING.String(),
 						Hostname:    "peloton-host-0",
 					},
 				},
@@ -1261,7 +1272,7 @@ func (suite *ServiceHandlerTestSuite) TestGetTasksWithoutConfigs_QueryPreviousRu
 		runID          string
 		prevRunID      string
 		currentRun     bool
-		taskState      task.TaskState
+		taskState      pod.PodState
 		expectInResult bool
 	}{
 		{
@@ -1271,7 +1282,7 @@ func (suite *ServiceHandlerTestSuite) TestGetTasksWithoutConfigs_QueryPreviousRu
 			runID:          "3",
 			prevRunID:      "2",
 			currentRun:     true,
-			taskState:      task.TaskState_RUNNING,
+			taskState:      pod.PodState_POD_STATE_RUNNING,
 			expectInResult: true,
 		},
 		{
@@ -1281,7 +1292,7 @@ func (suite *ServiceHandlerTestSuite) TestGetTasksWithoutConfigs_QueryPreviousRu
 			runID:          "2",
 			prevRunID:      "1",
 			currentRun:     false,
-			taskState:      task.TaskState_RUNNING,
+			taskState:      pod.PodState_POD_STATE_RUNNING,
 			expectInResult: true,
 		},
 		{
@@ -1291,7 +1302,7 @@ func (suite *ServiceHandlerTestSuite) TestGetTasksWithoutConfigs_QueryPreviousRu
 			runID:          "1",
 			prevRunID:      "",
 			currentRun:     false,
-			taskState:      task.TaskState_RUNNING,
+			taskState:      pod.PodState_POD_STATE_RUNNING,
 			expectInResult: false,
 		},
 		{
@@ -1301,7 +1312,7 @@ func (suite *ServiceHandlerTestSuite) TestGetTasksWithoutConfigs_QueryPreviousRu
 			runID:          "3",
 			prevRunID:      "2",
 			currentRun:     true,
-			taskState:      task.TaskState_RUNNING,
+			taskState:      pod.PodState_POD_STATE_RUNNING,
 			expectInResult: true,
 		},
 		{
@@ -1311,7 +1322,7 @@ func (suite *ServiceHandlerTestSuite) TestGetTasksWithoutConfigs_QueryPreviousRu
 			runID:          "2",
 			prevRunID:      "1",
 			currentRun:     false,
-			taskState:      task.TaskState_FAILED,
+			taskState:      pod.PodState_POD_STATE_FAILED,
 			expectInResult: false,
 		},
 		{
@@ -1321,7 +1332,7 @@ func (suite *ServiceHandlerTestSuite) TestGetTasksWithoutConfigs_QueryPreviousRu
 			runID:          "1",
 			prevRunID:      "",
 			currentRun:     false,
-			taskState:      task.TaskState_RUNNING,
+			taskState:      pod.PodState_POD_STATE_RUNNING,
 			expectInResult: false,
 		},
 	}
@@ -1731,7 +1742,8 @@ func (suite *ServiceHandlerTestSuite) TestGetJobUpdateSummaries_Success() {
 
 	suite.jobClient.EXPECT().
 		ListJobWorkflows(gomock.Any(), &statelesssvc.ListJobWorkflowsRequest{
-			JobId: id,
+			JobId:               id,
+			InstanceEventsLimit: common.InstanceEventsLimit,
 		}).
 		Return(&statelesssvc.ListJobWorkflowsResponse{
 			WorkflowInfos: []*stateless.WorkflowInfo{fixture.PelotonWorkflowInfo("")},
@@ -1753,7 +1765,8 @@ func (suite *ServiceHandlerTestSuite) TestGetJobUpdateSummaries_Error() {
 
 	suite.jobClient.EXPECT().
 		ListJobWorkflows(gomock.Any(), &statelesssvc.ListJobWorkflowsRequest{
-			JobId: id,
+			JobId:               id,
+			InstanceEventsLimit: common.InstanceEventsLimit,
 		}).
 		Return(nil, errors.New("some error"))
 
@@ -1772,8 +1785,9 @@ func (suite *ServiceHandlerTestSuite) TestGetJobUpdateDetails_Error() {
 
 	suite.jobClient.EXPECT().
 		ListJobWorkflows(gomock.Any(), &statelesssvc.ListJobWorkflowsRequest{
-			JobId:          id,
-			InstanceEvents: true,
+			JobId:               id,
+			InstanceEvents:      true,
+			InstanceEventsLimit: common.InstanceEventsLimit,
 		}).
 		Return(nil, errors.New("some error"))
 
@@ -1811,8 +1825,9 @@ func (suite *ServiceHandlerTestSuite) TestGetJobUpdateDetails_WorkflowsNotFound(
 
 	suite.jobClient.EXPECT().
 		ListJobWorkflows(gomock.Any(), &statelesssvc.ListJobWorkflowsRequest{
-			JobId:          id,
-			InstanceEvents: true,
+			JobId:               id,
+			InstanceEvents:      true,
+			InstanceEventsLimit: common.InstanceEventsLimit,
 		}).
 		Return(nil, yarpcerrors.NotFoundErrorf("workflows not found"))
 
@@ -1847,6 +1862,10 @@ func (suite *ServiceHandlerTestSuite) TestGetJobUpdateDetails_QueryByRoleSuccess
 		QueryJobs(suite.ctx, &statelesssvc.QueryJobsRequest{
 			Spec: &stateless.QuerySpec{
 				Labels: labels,
+				Pagination: &pbquery.PaginationSpec{
+					Limit:    common.QueryJobsLimit,
+					MaxLimit: common.QueryJobsLimit,
+				},
 			},
 		}).
 		Return(&statelesssvc.QueryJobsResponse{
@@ -1871,8 +1890,9 @@ func (suite *ServiceHandlerTestSuite) TestGetJobUpdateDetails_QueryByRoleSuccess
 
 	suite.jobClient.EXPECT().
 		ListJobWorkflows(gomock.Any(), &statelesssvc.ListJobWorkflowsRequest{
-			JobId:          summaries[0].JobId,
-			InstanceEvents: true,
+			JobId:               summaries[0].JobId,
+			InstanceEvents:      true,
+			InstanceEventsLimit: common.InstanceEventsLimit,
 		}).
 		Return(&statelesssvc.ListJobWorkflowsResponse{
 			WorkflowInfos: []*stateless.WorkflowInfo{wf0, wf1, wf2},
@@ -1880,8 +1900,9 @@ func (suite *ServiceHandlerTestSuite) TestGetJobUpdateDetails_QueryByRoleSuccess
 
 	suite.jobClient.EXPECT().
 		ListJobWorkflows(gomock.Any(), &statelesssvc.ListJobWorkflowsRequest{
-			JobId:          summaries[1].JobId,
-			InstanceEvents: true,
+			JobId:               summaries[1].JobId,
+			InstanceEvents:      true,
+			InstanceEventsLimit: common.InstanceEventsLimit,
 		}).
 		Return(&statelesssvc.ListJobWorkflowsResponse{
 			WorkflowInfos: []*stateless.WorkflowInfo{
@@ -1926,8 +1947,9 @@ func (suite *ServiceHandlerTestSuite) TestGetJobUpdateDetails_JoinRollbacksByUpd
 
 	suite.jobClient.EXPECT().
 		ListJobWorkflows(gomock.Any(), &statelesssvc.ListJobWorkflowsRequest{
-			JobId:          id,
-			InstanceEvents: true,
+			JobId:               id,
+			InstanceEvents:      true,
+			InstanceEventsLimit: common.InstanceEventsLimit,
 		}).
 		Return(&statelesssvc.ListJobWorkflowsResponse{
 			WorkflowInfos: []*stateless.WorkflowInfo{
@@ -1967,8 +1989,9 @@ func (suite *ServiceHandlerTestSuite) TestGetJobUpdateDetails_UpdateStatusFilter
 
 	suite.jobClient.EXPECT().
 		ListJobWorkflows(gomock.Any(), &statelesssvc.ListJobWorkflowsRequest{
-			JobId:          id,
-			InstanceEvents: true,
+			JobId:               id,
+			InstanceEvents:      true,
+			InstanceEventsLimit: common.InstanceEventsLimit,
 		}).
 		Return(&statelesssvc.ListJobWorkflowsResponse{
 			WorkflowInfos: []*stateless.WorkflowInfo{

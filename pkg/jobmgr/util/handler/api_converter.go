@@ -15,6 +15,8 @@
 package handler
 
 import (
+	"reflect"
+
 	"github.com/uber/peloton/.gen/peloton/api/v0/job"
 	"github.com/uber/peloton/.gen/peloton/api/v0/peloton"
 	pelotonv0query "github.com/uber/peloton/.gen/peloton/api/v0/query"
@@ -28,7 +30,7 @@ import (
 	"github.com/uber/peloton/.gen/peloton/private/models"
 
 	"github.com/uber/peloton/pkg/common/util"
-	jobutil "github.com/uber/peloton/pkg/jobmgr/util/job"
+	versionutil "github.com/uber/peloton/pkg/common/util/entityversion"
 
 	"go.uber.org/yarpc/yarpcerrors"
 )
@@ -158,8 +160,8 @@ func ConvertTaskRuntimeToPodStatus(runtime *task.RuntimeInfo) *pod.PodStatus {
 		Reason:         runtime.GetReason(),
 		FailureCount:   runtime.GetFailureCount(),
 		VolumeId:       &v1alphapeloton.VolumeID{Value: runtime.GetVolumeID().GetValue()},
-		Version:        jobutil.GetPodEntityVersion(runtime.GetConfigVersion()),
-		DesiredVersion: jobutil.GetPodEntityVersion(runtime.GetDesiredConfigVersion()),
+		Version:        versionutil.GetPodEntityVersion(runtime.GetConfigVersion()),
+		DesiredVersion: versionutil.GetPodEntityVersion(runtime.GetDesiredConfigVersion()),
 		AgentId:        runtime.GetAgentID(),
 		Revision: &v1alphapeloton.Revision{
 			Version:   runtime.GetRevision().GetVersion(),
@@ -175,12 +177,17 @@ func ConvertTaskRuntimeToPodStatus(runtime *task.RuntimeInfo) *pod.PodStatus {
 }
 
 // ConvertTaskConfigToPodSpec converts v0 task.TaskConfig to v1alpha pod.PodSpec
-func ConvertTaskConfigToPodSpec(taskConfig *task.TaskConfig) *pod.PodSpec {
+func ConvertTaskConfigToPodSpec(taskConfig *task.TaskConfig, jobID string, instanceID uint32) *pod.PodSpec {
 	result := &pod.PodSpec{
-		PodName:                &v1alphapeloton.PodName{Value: taskConfig.GetName()},
 		Controller:             taskConfig.GetController(),
 		KillGracePeriodSeconds: taskConfig.GetKillGracePeriodSeconds(),
 		Revocable:              taskConfig.GetRevocable(),
+	}
+
+	if len(jobID) != 0 {
+		result.PodName = &v1alphapeloton.PodName{
+			Value: util.CreatePelotonTaskID(jobID, instanceID),
+		}
 	}
 
 	if taskConfig.GetConstraint() != nil {
@@ -210,18 +217,31 @@ func ConvertTaskConfigToPodSpec(taskConfig *task.TaskConfig) *pod.PodSpec {
 		}
 	}
 
-	container := &pod.ContainerSpec{
-		Name: taskConfig.GetName(),
-		Resource: &pod.ResourceSpec{
+	container := &pod.ContainerSpec{}
+	if len(taskConfig.GetName()) != 0 {
+		container.Name = taskConfig.GetName()
+	}
+
+	if taskConfig.GetResource() != nil {
+		container.Resource = &pod.ResourceSpec{
 			CpuLimit:    taskConfig.GetResource().GetCpuLimit(),
 			MemLimitMb:  taskConfig.GetResource().GetMemLimitMb(),
 			DiskLimitMb: taskConfig.GetResource().GetDiskLimitMb(),
 			FdLimit:     taskConfig.GetResource().GetFdLimit(),
 			GpuLimit:    taskConfig.GetResource().GetGpuLimit(),
-		},
-		Container: taskConfig.GetContainer(),
-		Command:   taskConfig.GetCommand(),
-		Executor:  taskConfig.GetExecutor(),
+		}
+	}
+
+	if taskConfig.GetContainer() != nil {
+		container.Container = taskConfig.GetContainer()
+	}
+
+	if taskConfig.GetCommand() != nil {
+		container.Command = taskConfig.GetCommand()
+	}
+
+	if taskConfig.GetExecutor() != nil {
+		container.Executor = taskConfig.GetExecutor()
 	}
 
 	if taskConfig.GetPorts() != nil {
@@ -254,7 +274,9 @@ func ConvertTaskConfigToPodSpec(taskConfig *task.TaskConfig) *pod.PodSpec {
 		}
 	}
 
-	result.Containers = []*pod.ContainerSpec{container}
+	if !reflect.DeepEqual(*container, pod.ContainerSpec{}) {
+		result.Containers = []*pod.ContainerSpec{container}
+	}
 
 	return result
 }
@@ -277,28 +299,42 @@ func ConvertLabels(labels []*peloton.Label) []*v1alphapeloton.Label {
 func ConvertTaskConstraintsToPodConstraints(constraints []*task.Constraint) []*pod.Constraint {
 	var podConstraints []*pod.Constraint
 	for _, constraint := range constraints {
-		podConstraints = append(podConstraints, &pod.Constraint{
+		podConstraint := &pod.Constraint{
 			Type: pod.Constraint_Type(constraint.GetType()),
-			LabelConstraint: &pod.LabelConstraint{
+		}
+
+		if constraint.GetLabelConstraint() != nil {
+			podConstraint.LabelConstraint = &pod.LabelConstraint{
 				Kind: pod.LabelConstraint_Kind(
 					constraint.GetLabelConstraint().GetKind(),
 				),
 				Condition: pod.LabelConstraint_Condition(
 					constraint.GetLabelConstraint().GetCondition(),
 				),
-				Label: &v1alphapeloton.Label{
+				Requirement: constraint.GetLabelConstraint().GetRequirement(),
+			}
+
+			if constraint.GetLabelConstraint().GetLabel() != nil {
+				podConstraint.LabelConstraint.Label = &v1alphapeloton.Label{
 					Key:   constraint.GetLabelConstraint().GetLabel().GetKey(),
 					Value: constraint.GetLabelConstraint().GetLabel().GetValue(),
-				},
-				Requirement: constraint.GetLabelConstraint().GetRequirement(),
-			},
-			AndConstraint: &pod.AndConstraint{
+				}
+			}
+		}
+
+		if constraint.GetAndConstraint() != nil {
+			podConstraint.AndConstraint = &pod.AndConstraint{
 				Constraints: ConvertTaskConstraintsToPodConstraints(constraint.GetAndConstraint().GetConstraints()),
-			},
-			OrConstraint: &pod.OrConstraint{
+			}
+		}
+
+		if constraint.GetOrConstraint() != nil {
+			podConstraint.OrConstraint = &pod.OrConstraint{
 				Constraints: ConvertTaskConstraintsToPodConstraints(constraint.GetOrConstraint().GetConstraints()),
-			},
-		})
+			}
+		}
+
+		podConstraints = append(podConstraints, podConstraint)
 	}
 	return podConstraints
 }
@@ -360,7 +396,7 @@ func ConvertV1SecretsToV0Secrets(secrets []*v1alphapeloton.Secret) []*peloton.Se
 func ConvertJobConfigToJobSpec(config *job.JobConfig) *stateless.JobSpec {
 	instanceSpec := make(map[uint32]*pod.PodSpec)
 	for instID, taskConfig := range config.GetInstanceConfig() {
-		instanceSpec[instID] = ConvertTaskConfigToPodSpec(taskConfig)
+		instanceSpec[instID] = ConvertTaskConfigToPodSpec(taskConfig, "", instID)
 	}
 
 	return &stateless.JobSpec{
@@ -378,7 +414,7 @@ func ConvertJobConfigToJobSpec(config *job.JobConfig) *stateless.JobSpec {
 		Labels:        ConvertLabels(config.GetLabels()),
 		InstanceCount: config.GetInstanceCount(),
 		Sla:           ConvertSLAConfigToSLASpec(config.GetSLA()),
-		DefaultSpec:   ConvertTaskConfigToPodSpec(config.GetDefaultConfig()),
+		DefaultSpec:   ConvertTaskConfigToPodSpec(config.GetDefaultConfig(), "", 0),
 		InstanceSpec:  instanceSpec,
 		RespoolId: &v1alphapeloton.ResourcePoolID{
 			Value: config.GetRespoolID().GetValue()},
@@ -395,12 +431,12 @@ func ConvertUpdateModelToWorkflowStatus(
 		return nil
 	}
 
-	entityVersion := jobutil.GetJobEntityVersion(
+	entityVersion := versionutil.GetJobEntityVersion(
 		updateInfo.GetJobConfigVersion(),
 		runtime.GetDesiredStateVersion(),
 		runtime.GetWorkflowVersion(),
 	)
-	prevVersion := jobutil.GetJobEntityVersion(
+	prevVersion := versionutil.GetJobEntityVersion(
 		updateInfo.GetPrevJobConfigVersion(),
 		runtime.GetDesiredStateVersion(),
 		runtime.GetWorkflowVersion(),
@@ -428,7 +464,7 @@ func ConvertRuntimeInfoToJobStatus(
 	updateInfo *models.UpdateModel,
 ) *stateless.JobStatus {
 	result := &stateless.JobStatus{}
-	podConfigVersionStats := make(map[string]uint32)
+	podConfigVersionStats := make(map[string]*stateless.JobStatus_PodStateStats)
 	result.Revision = &v1alphapeloton.Revision{
 		Version:   runtime.GetRevision().GetVersion(),
 		CreatedAt: runtime.GetRevision().GetCreatedAt(),
@@ -437,24 +473,22 @@ func ConvertRuntimeInfoToJobStatus(
 	}
 	result.State = stateless.JobState(runtime.GetState())
 	result.CreationTime = runtime.GetCreationTime()
-	result.PodStats = convertTaskStatsToPodStats(runtime.TaskStats)
+	result.PodStats = ConvertTaskStatsToPodStats(runtime.TaskStats)
 	result.DesiredState = stateless.JobState(runtime.GetGoalState())
-	result.Version = jobutil.GetJobEntityVersion(
+	result.Version = versionutil.GetJobEntityVersion(
 		runtime.GetConfigurationVersion(),
 		runtime.GetDesiredStateVersion(),
 		runtime.GetWorkflowVersion(),
 	)
 	result.WorkflowStatus = ConvertUpdateModelToWorkflowStatus(runtime, updateInfo)
 
-	for configVersion, taskStats := range runtime.GetTaskConfigVersionStats() {
-		entityVersion := jobutil.GetJobEntityVersion(
-			configVersion,
-			runtime.GetDesiredStateVersion(),
-			runtime.GetWorkflowVersion(),
-		)
-		podConfigVersionStats[entityVersion.GetValue()] = taskStats
+	for configVersion, taskStats := range runtime.GetTaskStatsByConfigurationVersion() {
+		entityVersion := versionutil.GetPodEntityVersion(configVersion)
+		podConfigVersionStats[entityVersion.GetValue()] = &stateless.JobStatus_PodStateStats{
+			StateStats: ConvertTaskStatsToPodStats(taskStats.GetStateStats()),
+		}
 	}
-	result.PodConfigurationVersionStats = podConfigVersionStats
+	result.PodStatsByConfigurationVersion = podConfigVersionStats
 	return result
 }
 
@@ -681,7 +715,6 @@ func ConvertPodSpecToTaskConfig(spec *pod.PodSpec) (*task.TaskConfig, error) {
 	}
 
 	result := &task.TaskConfig{
-		Name:                   spec.GetPodName().GetValue(),
 		Controller:             spec.GetController(),
 		KillGracePeriodSeconds: spec.GetKillGracePeriodSeconds(),
 		Revocable:              spec.GetRevocable(),
@@ -694,6 +727,8 @@ func ConvertPodSpecToTaskConfig(spec *pod.PodSpec) (*task.TaskConfig, error) {
 		result.Command = mainContainer.GetCommand()
 		result.Executor = mainContainer.GetExecutor()
 	}
+
+	result.Name = mainContainer.GetName()
 
 	if spec.GetLabels() != nil {
 		var labels []*peloton.Label
@@ -799,10 +834,6 @@ func ConvertPodConstraintsToTaskConstraints(
 		}
 
 		if podConstraint.GetLabelConstraint() != nil {
-			label := &peloton.Label{
-				Key:   podConstraint.GetLabelConstraint().GetLabel().GetKey(),
-				Value: podConstraint.GetLabelConstraint().GetLabel().GetValue(),
-			}
 			taskConstraint.LabelConstraint = &task.LabelConstraint{
 				Kind: task.LabelConstraint_Kind(
 					podConstraint.GetLabelConstraint().GetKind(),
@@ -810,8 +841,14 @@ func ConvertPodConstraintsToTaskConstraints(
 				Condition: task.LabelConstraint_Condition(
 					podConstraint.GetLabelConstraint().GetCondition(),
 				),
-				Label:       label,
 				Requirement: podConstraint.GetLabelConstraint().GetRequirement(),
+			}
+
+			if podConstraint.GetLabelConstraint().GetLabel() != nil {
+				taskConstraint.LabelConstraint.Label = &peloton.Label{
+					Key:   podConstraint.GetLabelConstraint().GetLabel().GetKey(),
+					Value: podConstraint.GetLabelConstraint().GetLabel().GetValue(),
+				}
 			}
 		}
 
@@ -891,19 +928,68 @@ func ConvertTaskInfosToPodInfos(taskInfos []*task.TaskInfo) []*pod.PodInfo {
 	var podInfos []*pod.PodInfo
 	for _, taskInfo := range taskInfos {
 		podInfo := &pod.PodInfo{
-			Spec:   ConvertTaskConfigToPodSpec(taskInfo.GetConfig()),
-			Status: ConvertTaskRuntimeToPodStatus(taskInfo.GetRuntime()),
-		}
-		podInfo.Spec.PodName = &v1alphapeloton.PodName{
-			Value: util.CreatePelotonTaskID(
+			Spec: ConvertTaskConfigToPodSpec(
+				taskInfo.GetConfig(),
 				taskInfo.GetJobId().GetValue(),
 				taskInfo.GetInstanceId(),
 			),
+			Status: ConvertTaskRuntimeToPodStatus(taskInfo.GetRuntime()),
 		}
 		podInfos = append(podInfos, podInfo)
 	}
 
 	return podInfos
+}
+
+// ConvertTaskEventsToPodEvents converts v0 task.PodEvents to v1alpha pod.PodEvents
+func ConvertTaskEventsToPodEvents(taskEvents []*task.PodEvent) []*pod.PodEvent {
+	var result []*pod.PodEvent
+	for _, e := range taskEvents {
+		podID := e.GetTaskId().GetValue()
+		prevPodID := e.GetPrevTaskId().GetValue()
+		desiredPodID := e.GetDesriedTaskId().GetValue()
+		entityVersion := versionutil.GetPodEntityVersion(e.GetConfigVersion())
+
+		desiredEntityVersion := versionutil.GetPodEntityVersion(e.GetDesiredConfigVersion())
+
+		result = append(result, &pod.PodEvent{
+			PodId: &v1alphapeloton.PodID{
+				Value: podID,
+			},
+			ActualState: ConvertTaskStateToPodState(
+				task.TaskState(task.TaskState_value[e.GetActualState()]),
+			).String(),
+			DesiredState: ConvertTaskStateToPodState(
+				task.TaskState(task.TaskState_value[e.GetGoalState()]),
+			).String(),
+			Timestamp:      e.GetTimestamp(),
+			Version:        entityVersion,
+			DesiredVersion: desiredEntityVersion,
+			AgentId:        e.GetAgentID(),
+			Hostname:       e.GetHostname(),
+			Message:        e.GetMessage(),
+			Reason:         e.GetReason(),
+			PrevPodId: &v1alphapeloton.PodID{
+				Value: prevPodID,
+			},
+			Healthy: pod.HealthState(task.HealthState_value[e.GetHealthy()]).String(),
+			DesiredPodId: &v1alphapeloton.PodID{
+				Value: desiredPodID,
+			},
+		})
+	}
+	return result
+}
+
+// ConvertTaskStatsToPodStats converts v0 task stats to v1alpha pod stats
+func ConvertTaskStatsToPodStats(taskStats map[string]uint32) map[string]uint32 {
+	result := make(map[string]uint32)
+	for stateStr, num := range taskStats {
+		taskState := task.TaskState(task.TaskState_value[stateStr])
+		result[ConvertTaskStateToPodState(taskState).String()] = num
+	}
+
+	return result
 }
 
 func convertV1AlphaPaginationSpecToV0PaginationSpec(
@@ -950,20 +1036,14 @@ func convertTaskTerminationStatusToPodTerminationStatus(
 		podReason = pod.TerminationStatus_TERMINATION_STATUS_REASON_PREEMPTED_RESOURCES
 	case task.TerminationStatus_TERMINATION_STATUS_REASON_DEADLINE_TIMEOUT_EXCEEDED:
 		podReason = pod.TerminationStatus_TERMINATION_STATUS_REASON_DEADLINE_TIMEOUT_EXCEEDED
+	case task.TerminationStatus_TERMINATION_STATUS_REASON_KILLED_FOR_UPDATE:
+		podReason = pod.TerminationStatus_TERMINATION_STATUS_REASON_KILLED_FOR_UPDATE
+	case task.TerminationStatus_TERMINATION_STATUS_REASON_KILLED_FOR_RESTART:
+		podReason = pod.TerminationStatus_TERMINATION_STATUS_REASON_KILLED_FOR_RESTART
 	}
 	return &pod.TerminationStatus{
 		Reason:   podReason,
 		ExitCode: termStatus.GetExitCode(),
 		Signal:   termStatus.GetSignal(),
 	}
-}
-
-func convertTaskStatsToPodStats(taskStats map[string]uint32) map[string]uint32 {
-	result := make(map[string]uint32)
-	for stateStr, num := range taskStats {
-		taskState := task.TaskState(task.TaskState_value[stateStr])
-		result[ConvertTaskStateToPodState(taskState).String()] = num
-	}
-
-	return result
 }

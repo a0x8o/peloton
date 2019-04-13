@@ -123,6 +123,9 @@ func (s *updateStrategy) GetRuntimeDiff(jobConfig *pbjob.JobConfig) jobmgrcommon
 		// when updating a task, failure count due to old version should be reset
 		jobmgrcommon.FailureCountField: uint32(0),
 		jobmgrcommon.ReasonField:       "",
+		jobmgrcommon.TerminationStatusField: &pbtask.TerminationStatus{
+			Reason: pbtask.TerminationStatus_TERMINATION_STATUS_REASON_KILLED_FOR_UPDATE,
+		},
 	}
 }
 
@@ -142,6 +145,9 @@ func (s *rollbackStrategy) GetRuntimeDiff(jobConfig *pbjob.JobConfig) jobmgrcomm
 		// when updating a task, failure count due to old version should be reset
 		jobmgrcommon.FailureCountField: uint32(0),
 		jobmgrcommon.ReasonField:       "",
+		jobmgrcommon.TerminationStatusField: &pbtask.TerminationStatus{
+			Reason: pbtask.TerminationStatus_TERMINATION_STATUS_REASON_KILLED_FOR_UPDATE,
+		},
 	}
 }
 
@@ -160,6 +166,9 @@ func (s *restartStrategy) GetRuntimeDiff(jobConfig *pbjob.JobConfig) jobmgrcommo
 		jobmgrcommon.DesiredConfigVersionField: jobConfig.GetChangeLog().GetVersion(),
 		jobmgrcommon.MessageField:              _restartTaskMessage,
 		jobmgrcommon.ReasonField:               "",
+		jobmgrcommon.TerminationStatusField: &pbtask.TerminationStatus{
+			Reason: pbtask.TerminationStatus_TERMINATION_STATUS_REASON_KILLED_FOR_RESTART,
+		},
 	}
 }
 
@@ -201,9 +210,14 @@ func (s *stopStrategy) IsInstanceComplete(desiredConfigVersion uint64, runtime *
 	// 1. runtime desired configuration is set to desiredConfigVersion
 	// runtime configuration does not matter as it will be set to
 	// runtime desired configuration  when it starts
-	if util.IsPelotonStateTerminal(runtime.GetState()) &&
-		util.IsPelotonStateTerminal(runtime.GetGoalState()) {
-		return runtime.GetDesiredConfigVersion() == desiredConfigVersion
+	// 2. runtime desired configuration is set to desiredConfigVersion,
+	// but goal state is not terminal. It means, user may start the
+	// task again via task level API. If this case is not handled,
+	// the stop workflow can get stuck.
+	if runtime.GetDesiredConfigVersion() == desiredConfigVersion {
+		return (util.IsPelotonStateTerminal(runtime.GetState()) &&
+			util.IsPelotonStateTerminal(runtime.GetGoalState())) ||
+			!util.IsPelotonStateTerminal(runtime.GetGoalState())
 	}
 
 	return false
@@ -230,6 +244,9 @@ func (s *stopStrategy) GetRuntimeDiff(jobConfig *pbjob.JobConfig) jobmgrcommon.R
 		jobmgrcommon.GoalStateField:            pbtask.TaskState_KILLED,
 		jobmgrcommon.MessageField:              _stopTaskMessage,
 		jobmgrcommon.ReasonField:               "",
+		jobmgrcommon.TerminationStatusField: &pbtask.TerminationStatus{
+			Reason: pbtask.TerminationStatus_TERMINATION_STATUS_REASON_KILLED_ON_REQUEST,
+		},
 	}
 }
 

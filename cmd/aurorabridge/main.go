@@ -86,6 +86,11 @@ var (
 			"(set $PORT to override)").
 		Envar("GRPC_PORT").
 		Int()
+
+	respoolPath = app.Flag(
+		"respool-path", "Aurora Bridge Resource Pool path").
+		Envar("RESPOOL_PATH").
+		String()
 )
 
 func main() {
@@ -93,7 +98,14 @@ func main() {
 	app.HelpFlag.Short('h')
 	kingpin.MustParse(app.Parse(os.Args[1:]))
 
-	log.SetFormatter(&log.JSONFormatter{})
+	log.SetFormatter(
+		&logging.LogFieldFormatter{
+			Formatter: &log.JSONFormatter{},
+			Fields: log.Fields{
+				common.AppLogField: app.Name,
+			},
+		},
+	)
 
 	var cfg Config
 	if err := config.Parse(&cfg, *cfgFiles...); err != nil {
@@ -114,6 +126,10 @@ func main() {
 
 	if *grpcPort != 0 {
 		cfg.GRPCPort = *grpcPort
+	}
+
+	if len(*respoolPath) > 0 {
+		cfg.RespoolLoader.RespoolPath = *respoolPath
 	}
 
 	initialLevel := log.InfoLevel
@@ -150,16 +166,13 @@ func main() {
 			Fatal("Could not create zk service discovery")
 	}
 
-	clientSendOption := grpc.ClientMaxSendMsgSize(cfg.EventPublisher.GRPCMsgSize)
-	serverSendOption := grpc.ServerMaxSendMsgSize(cfg.EventPublisher.GRPCMsgSize)
 	clientRecvOption := grpc.ClientMaxRecvMsgSize(cfg.EventPublisher.GRPCMsgSize)
 	serverRecvOption := grpc.ServerMaxRecvMsgSize(cfg.EventPublisher.GRPCMsgSize)
 
 	t := grpc.NewTransport(
-		clientSendOption,
-		serverSendOption,
 		clientRecvOption,
-		serverRecvOption)
+		serverRecvOption,
+	)
 
 	outbounds := yarpc.Outbounds{
 		common.PelotonJobManager: transport.Outbounds{

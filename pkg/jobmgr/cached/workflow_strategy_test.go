@@ -267,7 +267,12 @@ func TestUpdateStrategyGetRuntimeDiff(t *testing.T) {
 		t,
 		runtimeDiff[jobmgrcommon.ReasonField].(string),
 	)
-	assert.Len(t, runtimeDiff, 4)
+	assert.Equal(
+		t,
+		runtimeDiff[jobmgrcommon.TerminationStatusField].(*pbtask.TerminationStatus),
+		&pbtask.TerminationStatus{Reason: pbtask.TerminationStatus_TERMINATION_STATUS_REASON_KILLED_FOR_UPDATE},
+	)
+	assert.Len(t, runtimeDiff, 5)
 }
 
 // TestRestartStrategyIsInstanceComplete tests IsInstanceComplete
@@ -513,7 +518,12 @@ func TestRestartStrategyGetRuntimeDiff(t *testing.T) {
 		t,
 		runtimeDiff[jobmgrcommon.ReasonField].(string),
 	)
-	assert.Len(t, runtimeDiff, 4)
+	assert.Equal(
+		t,
+		runtimeDiff[jobmgrcommon.TerminationStatusField].(*pbtask.TerminationStatus),
+		&pbtask.TerminationStatus{Reason: pbtask.TerminationStatus_TERMINATION_STATUS_REASON_KILLED_FOR_RESTART},
+	)
+	assert.Len(t, runtimeDiff, 5)
 }
 
 // TestStartStrategyIsInstanceComplete tests IsInstanceComplete
@@ -763,7 +773,7 @@ func TestStopStrategyIsInstanceComplete(t *testing.T) {
 				Healthy:              pbtask.HealthState_HEALTHY,
 			},
 			desiredConfigVersion: 2,
-			completed:            false,
+			completed:            true,
 		},
 		{
 			taskRuntime: &pbtask.RuntimeInfo{
@@ -774,7 +784,7 @@ func TestStopStrategyIsInstanceComplete(t *testing.T) {
 				Healthy:              pbtask.HealthState_DISABLED,
 			},
 			desiredConfigVersion: 2,
-			completed:            false,
+			completed:            true,
 		},
 		{
 			taskRuntime: &pbtask.RuntimeInfo{
@@ -1003,5 +1013,10 @@ func TestStopStrategyGetRuntimeDiff(t *testing.T) {
 		t,
 		runtimeDiff[jobmgrcommon.ReasonField].(string),
 	)
-	assert.Len(t, runtimeDiff, 5)
+	assert.Equal(
+		t,
+		runtimeDiff[jobmgrcommon.TerminationStatusField].(*pbtask.TerminationStatus),
+		&pbtask.TerminationStatus{Reason: pbtask.TerminationStatus_TERMINATION_STATUS_REASON_KILLED_ON_REQUEST},
+	)
+	assert.Len(t, runtimeDiff, 6)
 }

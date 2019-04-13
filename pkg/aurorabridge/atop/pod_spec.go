@@ -16,10 +16,11 @@ package atop
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"sort"
 
-	"github.com/uber/peloton/.gen/mesos/v1"
+	mesos_v1 "github.com/uber/peloton/.gen/mesos/v1"
 	"github.com/uber/peloton/.gen/peloton/api/v1alpha/peloton"
 	"github.com/uber/peloton/.gen/peloton/api/v1alpha/pod"
 	"github.com/uber/peloton/.gen/thrift/aurora/api"
@@ -35,6 +36,21 @@ func NewPodSpec(
 	t *api.TaskConfig,
 	c ThermosExecutorConfig,
 ) (*pod.PodSpec, error) {
+	// Taking aurora TaskConfig struct from JobUpdateRequest, and
+	// serialize it using Thrift binary protocol. The resulting
+	// byte array will be attached to ExecutorInfo.Data.
+	//
+	// After task placement, jobmgr will deserialize the byte array,
+	// combine it with placement info, and generates aurora AssignedTask
+	// struct, which will be eventually be consumed by thermos executor.
+	//
+	// Leaving encodeTaskConfig at the top since it has the side-effect
+	// of sorting all the "list" fields.
+	executorData, err := encodeTaskConfig(t)
+	if err != nil {
+		return nil, fmt.Errorf("encode task config: %s", err)
+	}
+
 	jobKeyLabel := label.NewAuroraJobKey(t.GetJob())
 	metadataLabels := label.NewAuroraMetadataLabels(t.GetMetadata())
 
@@ -46,18 +62,6 @@ func NewPodSpec(
 	constraint, err := NewConstraint(jobKeyLabel, t.GetConstraints())
 	if err != nil {
 		return nil, fmt.Errorf("new constraint: %s", err)
-	}
-
-	// Taking aurora TaskConfig struct from JobUpdateRequest, and
-	// serialize it using Thrift binary protocol. The resulting
-	// byte array will be attached to ExecutorInfo.Data.
-	//
-	// After task placement, jobmgr will deserialize the byte array,
-	// combine it with placement info, and generates aurora AssignedTask
-	// struct, which will be eventually be consumed by thermos executor.
-	executorData, err := encodeTaskConfig(t)
-	if err != nil {
-		return nil, fmt.Errorf("encode task config: %s", err)
 	}
 
 	return &pod.PodSpec{
@@ -200,6 +204,13 @@ func encodeTaskConfig(t *api.TaskConfig) ([]byte, error) {
 	sort.Stable(common.ResourceByType(t.Resources))
 	sort.Stable(common.ConstraintByName(t.Constraints))
 	sort.Stable(common.MesosFetcherURIByValue(t.MesosFetcherUris))
+
+	if len(t.GetExecutorConfig().GetData()) != 0 {
+		var dat map[string]interface{}
+		json.Unmarshal([]byte(t.GetExecutorConfig().GetData()), &dat)
+		data, _ := json.MarshalIndent(dat, "", "")
+		t.ExecutorConfig.Data = ptr.String(string(data))
+	}
 
 	w, err := t.ToWire()
 	if err != nil {

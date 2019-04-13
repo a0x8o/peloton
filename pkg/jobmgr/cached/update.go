@@ -30,7 +30,6 @@ import (
 	taskutil "github.com/uber/peloton/pkg/jobmgr/util/task"
 	"github.com/uber/peloton/pkg/storage"
 
-	"github.com/gogo/protobuf/proto"
 	log "github.com/sirupsen/logrus"
 	"go.uber.org/yarpc/yarpcerrors"
 )
@@ -897,13 +896,7 @@ func hasInstanceConfigChanged(
 	configVersion uint64,
 	newJobConfig *pbjob.JobConfig,
 	taskStore storage.TaskStore,
-	labelsChanged bool,
 ) (bool, error) {
-	if labelsChanged {
-		// labels have changed, task needs to restarted
-		return true, nil
-	}
-
 	// Get the current task configuration. Cannot use prevTaskConfig to do
 	// so because the task may be still be on an older configuration
 	// version because the previous update may not have succeeded.
@@ -921,7 +914,7 @@ func hasInstanceConfigChanged(
 	newTaskConfig := taskconfig.Merge(
 		newJobConfig.GetDefaultConfig(),
 		newJobConfig.GetInstanceConfig()[instID])
-	return taskConfigChange(prevTaskConfig, newTaskConfig), nil
+	return taskconfig.HasTaskConfigChanged(prevTaskConfig, newTaskConfig), nil
 }
 
 // GetInstancesToProcessForUpdate determines the instances which have been updated in a given
@@ -952,7 +945,7 @@ func GetInstancesToProcessForUpdate(
 		return
 	}
 
-	labelsChanged := labelsChangeCheck(
+	hasJobLabelsChanged := taskconfig.HasPelotonLabelsChanged(
 		prevJobConfig.GetLabels(),
 		newJobConfig.GetLabels(),
 	)
@@ -962,19 +955,20 @@ func GetInstancesToProcessForUpdate(
 			// new instance added
 			instancesAdded = append(instancesAdded, instID)
 		} else {
-			var changed bool
+			changed := hasJobLabelsChanged
 
-			changed, err = hasInstanceConfigChanged(
-				ctx,
-				jobID,
-				instID,
-				runtime.GetConfigVersion(),
-				newJobConfig,
-				taskStore,
-				labelsChanged,
-			)
-			if err != nil {
-				return
+			if !changed {
+				changed, err = hasInstanceConfigChanged(
+					ctx,
+					jobID,
+					instID,
+					runtime.GetConfigVersion(),
+					newJobConfig,
+					taskStore,
+				)
+				if err != nil {
+					return
+				}
 			}
 
 			if changed || runtime.GetConfigVersion() != runtime.GetDesiredConfigVersion() {
@@ -1113,55 +1107,6 @@ func (u *update) addWorkflowEventForInstances(
 
 	// add workflow events for provided instances in parallel batches.
 	return taskutil.RunInParallel(u.id.GetValue(), instances, addWorkflowEvent)
-}
-
-// labelsChangeCheck returns true if the labels have changed
-func labelsChangeCheck(
-	prevLabels []*peloton.Label,
-	newLabels []*peloton.Label) bool {
-	if len(prevLabels) != len(newLabels) {
-		return true
-	}
-
-	for _, label := range newLabels {
-		found := false
-		for _, prevLabel := range prevLabels {
-			if label.GetKey() == prevLabel.GetKey() &&
-				label.GetValue() == prevLabel.GetValue() {
-				found = true
-				break
-			}
-		}
-
-		// label not found
-		if found == false {
-			return true
-		}
-	}
-
-	// all old labels found in new config as well
-	return false
-}
-
-// taskConfigChange returns true if the task config (other than the name)
-// has changed.
-func taskConfigChange(
-	prevTaskConfig *pbtask.TaskConfig,
-	newTaskConfig *pbtask.TaskConfig) bool {
-	if prevTaskConfig == nil || newTaskConfig == nil {
-		return true
-	}
-
-	oldName := prevTaskConfig.GetName()
-	newName := newTaskConfig.GetName()
-	prevTaskConfig.Name = ""
-	newTaskConfig.Name = ""
-
-	changed := !proto.Equal(prevTaskConfig, newTaskConfig)
-
-	prevTaskConfig.Name = oldName
-	newTaskConfig.Name = newName
-	return changed
 }
 
 // contains is a helper function to check if an element is present in the list

@@ -27,8 +27,8 @@ import (
 	"github.com/uber/peloton/.gen/peloton/private/models"
 
 	"github.com/uber/peloton/pkg/common"
+	versionutil "github.com/uber/peloton/pkg/common/util/entityversion"
 	jobmgrcommon "github.com/uber/peloton/pkg/jobmgr/common"
-	jobutil "github.com/uber/peloton/pkg/jobmgr/util/job"
 	storemocks "github.com/uber/peloton/pkg/storage/mocks"
 	objectmocks "github.com/uber/peloton/pkg/storage/objects/mocks"
 
@@ -154,22 +154,6 @@ func initializeCurrentRuntime(state pbtask.TaskState) *pbtask.RuntimeInfo {
 		},
 	}
 	return runtime
-}
-
-func initializeCurrentRuntimes(instanceCount uint32, state pbtask.TaskState) map[uint32]*pbtask.RuntimeInfo {
-	runtimes := make(map[uint32]*pbtask.RuntimeInfo)
-	for i := uint32(0); i < instanceCount; i++ {
-		runtime := &pbtask.RuntimeInfo{
-			State: state,
-			Revision: &peloton.ChangeLog{
-				CreatedAt: uint64(time.Now().UnixNano()),
-				UpdatedAt: uint64(time.Now().UnixNano()),
-				Version:   1,
-			},
-		}
-		runtimes[i] = runtime
-	}
-	return runtimes
 }
 
 func initializeTaskInfos(instanceCount uint32, state pbtask.TaskState) map[uint32]*pbtask.TaskInfo {
@@ -684,6 +668,30 @@ func (suite *JobTestSuite) TestJobCompareAndSetRuntimeUpdateRuntimeFailure() {
 	suite.Nil(suite.job.runtime)
 }
 
+// TestJobCompareAndSetRuntimeWithGoalStateDeleted tests replace job runtime
+// which fails due to job goal state is deleted
+func (suite *JobTestSuite) TestJobCompareAndSetRuntimeWithGoalStateDeleted() {
+	jobRuntime := &pbjob.RuntimeInfo{
+		State:     pbjob.JobState_RUNNING,
+		GoalState: pbjob.JobState_RUNNING,
+		Revision: &peloton.ChangeLog{
+			Version: 1,
+		},
+	}
+
+	suite.job.runtime = &pbjob.RuntimeInfo{
+		State:     pbjob.JobState_RUNNING,
+		GoalState: pbjob.JobState_DELETED,
+		Revision: &peloton.ChangeLog{
+			Version: 1,
+		},
+	}
+
+	_, err := suite.job.CompareAndSetRuntime(context.Background(), jobRuntime)
+	suite.Error(err)
+	suite.checkListenersNotCalled()
+}
+
 // TestJobUpdateConfig tests update job which new config
 func (suite *JobTestSuite) TestJobUpdateConfig() {
 	jobConfig := &pbjob.JobConfig{
@@ -783,13 +791,17 @@ func (suite *JobTestSuite) TestJobUpdateConfigIncorectChangeLog() {
 func (suite *JobTestSuite) TestJobUpdateRuntimeAndConfig() {
 	instanceCount := uint32(10)
 	configVersion := uint64(1)
-	configVersionStats := make(map[uint64]uint32)
-	configVersionStats[configVersion] = instanceCount
+	configStateStats := make(map[uint64]*pbjob.RuntimeInfo_TaskStateStats)
+	configStateStats[configVersion] = &pbjob.RuntimeInfo_TaskStateStats{
+		StateStats: map[string]uint32{
+			pbjob.JobState_RUNNING.String(): instanceCount,
+		},
+	}
 
 	jobRuntime := &pbjob.RuntimeInfo{
-		State:                  pbjob.JobState_RUNNING,
-		GoalState:              pbjob.JobState_SUCCEEDED,
-		TaskConfigVersionStats: configVersionStats,
+		State:                           pbjob.JobState_RUNNING,
+		GoalState:                       pbjob.JobState_SUCCEEDED,
+		TaskStatsByConfigurationVersion: configStateStats,
 	}
 
 	jobConfig := &pbjob.JobConfig{
@@ -844,8 +856,12 @@ func (suite *JobTestSuite) TestJobUpdateRuntimeAndConfig() {
 	suite.Equal(suite.job.runtime.State, jobRuntime.State)
 	suite.Equal(suite.job.runtime.GoalState, jobRuntime.GoalState)
 	suite.Equal(suite.job.config.instanceCount, instanceCount)
-	suite.Equal(len(suite.job.runtime.TaskConfigVersionStats), 1)
-	suite.Equal(suite.job.runtime.TaskConfigVersionStats[configVersion], instanceCount)
+	suite.Equal(len(suite.job.runtime.GetTaskStatsByConfigurationVersion()), 1)
+	suite.Equal(
+		suite.job.runtime.
+			GetTaskStatsByConfigurationVersion()[configVersion].
+			GetStateStats()[pbjob.JobState_RUNNING.String()],
+		instanceCount)
 }
 
 // Test the case job update config when there is no config in cache,
@@ -2025,7 +2041,7 @@ func (suite *JobTestSuite) TestJobCreateWorkflowSuccess() {
 	oldConfigVersion := suite.job.runtime.GetConfigurationVersion()
 	oldWorkflowVersion := suite.job.runtime.GetWorkflowVersion()
 	desiredStateVersion := suite.job.runtime.GetDesiredStateVersion()
-	entityVersion := jobutil.GetJobEntityVersion(
+	entityVersion := versionutil.GetJobEntityVersion(
 		oldConfigVersion,
 		desiredStateVersion,
 		oldWorkflowVersion,
@@ -2117,7 +2133,7 @@ func (suite *JobTestSuite) TestJobCreateWorkflowSuccess() {
 	suite.NotNil(updateID)
 	suite.NoError(err)
 	suite.NotNil(suite.job.workflows[updateID.GetValue()])
-	suite.Equal(newEntityVersion, jobutil.GetJobEntityVersion(
+	suite.Equal(newEntityVersion, versionutil.GetJobEntityVersion(
 		oldConfigVersion+1,
 		desiredStateVersion,
 		oldWorkflowVersion+1,
@@ -2140,7 +2156,7 @@ func (suite *JobTestSuite) TestJobCreateWorkflowWithStartTasksForStoppedJobSucce
 	oldConfigVersion := suite.job.runtime.GetConfigurationVersion()
 	oldWorkflowVersion := suite.job.runtime.GetWorkflowVersion()
 	desiredStateVersion := suite.job.runtime.GetDesiredStateVersion()
-	entityVersion := jobutil.GetJobEntityVersion(
+	entityVersion := versionutil.GetJobEntityVersion(
 		oldConfigVersion,
 		desiredStateVersion,
 		oldWorkflowVersion,
@@ -2235,7 +2251,7 @@ func (suite *JobTestSuite) TestJobCreateWorkflowWithStartTasksForStoppedJobSucce
 	suite.NotNil(updateID)
 	suite.NoError(err)
 	suite.NotNil(suite.job.workflows[updateID.GetValue()])
-	suite.Equal(newEntityVersion, jobutil.GetJobEntityVersion(
+	suite.Equal(newEntityVersion, versionutil.GetJobEntityVersion(
 		oldConfigVersion+1,
 		desiredStateVersion,
 		oldWorkflowVersion+1,
@@ -2253,7 +2269,7 @@ func (suite *JobTestSuite) TestJobCreateWorkflowUpdateConfigFailure() {
 	updateConfig := &pbupdate.UpdateConfig{
 		BatchSize: 10,
 	}
-	entityVersion := jobutil.GetJobEntityVersion(
+	entityVersion := versionutil.GetJobEntityVersion(
 		suite.job.runtime.GetConfigurationVersion(),
 		suite.job.runtime.GetDesiredStateVersion(),
 		suite.job.runtime.GetWorkflowVersion(),
@@ -2313,7 +2329,7 @@ func (suite *JobTestSuite) TestJobCreateWorkflowWorkflowCreationFailure() {
 	updateConfig := &pbupdate.UpdateConfig{
 		BatchSize: 10,
 	}
-	entityVersion := jobutil.GetJobEntityVersion(
+	entityVersion := versionutil.GetJobEntityVersion(
 		suite.job.runtime.GetConfigurationVersion(),
 		suite.job.runtime.GetDesiredStateVersion(),
 		suite.job.runtime.GetWorkflowVersion(),
@@ -2409,7 +2425,7 @@ func (suite *JobTestSuite) TestJobCreateWorkflowUpdateRuntimeFailure() {
 	updateConfig := &pbupdate.UpdateConfig{
 		BatchSize: 10,
 	}
-	entityVersion := jobutil.GetJobEntityVersion(
+	entityVersion := versionutil.GetJobEntityVersion(
 		suite.job.runtime.GetConfigurationVersion(),
 		suite.job.runtime.GetDesiredStateVersion(),
 		suite.job.runtime.GetWorkflowVersion(),
@@ -2501,6 +2517,106 @@ func (suite *JobTestSuite) TestJobCreateWorkflowUpdateRuntimeFailure() {
 	suite.Nil(suite.job.workflows[updateID.GetValue()])
 }
 
+// TestJobCreateWorkflowOnDeletedJobError tests the failure case of
+// creating workflow for a deleted job
+func (suite *JobTestSuite) TestJobCreateWorkflowOnDeletedJobError() {
+	var instancesAdded []uint32
+	var instnacesRemoved []uint32
+	instancesUpdated := []uint32{0, 1, 2}
+
+	suite.job.runtime.GoalState = pbjob.JobState_DELETED
+	workflowType := models.WorkflowType_UPDATE
+	updateConfig := &pbupdate.UpdateConfig{
+		BatchSize: 10,
+	}
+	entityVersion := versionutil.GetJobEntityVersion(
+		suite.job.runtime.GetConfigurationVersion(),
+		suite.job.runtime.GetDesiredStateVersion(),
+		suite.job.runtime.GetWorkflowVersion(),
+	)
+	prevConfig := &pbjob.JobConfig{
+		ChangeLog: &peloton.ChangeLog{Version: 1},
+	}
+	jobConfig := prevConfig
+	configAddOn := &models.ConfigAddOn{}
+
+	for _, i := range instancesUpdated {
+		suite.updateStore.EXPECT().
+			AddWorkflowEvent(
+				gomock.Any(),
+				gomock.Any(),
+				i,
+				workflowType,
+				pbupdate.State_INITIALIZED).Return(nil)
+	}
+
+	gomock.InOrder(
+		suite.jobStore.EXPECT().
+			GetMaxJobConfigVersion(gomock.Any(), suite.jobID.GetValue()).
+			Return(prevConfig.GetChangeLog().GetVersion(), nil),
+
+		suite.jobStore.EXPECT().
+			UpdateJobConfig(gomock.Any(), suite.jobID, gomock.Any(), configAddOn).
+			Do(func(_ context.Context, _ *peloton.JobID, config *pbjob.JobConfig, _ *models.ConfigAddOn) {
+				suite.Equal(
+					config.GetChangeLog().GetVersion(),
+					prevConfig.GetChangeLog().GetVersion()+1)
+			}).
+			Return(nil),
+		suite.jobIndexOps.EXPECT().
+			Update(gomock.Any(), suite.jobID, gomock.Any(), gomock.Any()).
+			Return(nil),
+		suite.updateStore.EXPECT().
+			AddJobUpdateEvent(
+				gomock.Any(),
+				gomock.Any(),
+				gomock.Any(),
+				pbupdate.State_INITIALIZED).
+			Return(nil),
+		suite.updateStore.EXPECT().
+			CreateUpdate(gomock.Any(), gomock.Any()).
+			Do(func(_ context.Context, updateInfo *models.UpdateModel) {
+				suite.Equal(updateInfo.GetJobConfigVersion(),
+					prevConfig.GetChangeLog().GetVersion()+1)
+				suite.Equal(updateInfo.GetPrevJobConfigVersion(), prevConfig.GetChangeLog().GetVersion())
+				suite.Equal(updateInfo.GetState(), pbupdate.State_INITIALIZED)
+				suite.Equal(updateInfo.GetJobID(), suite.jobID)
+				suite.Equal(updateInfo.GetInstancesAdded(), instancesAdded)
+				suite.Equal(updateInfo.GetInstancesUpdated(), instancesUpdated)
+				suite.Equal(updateInfo.GetInstancesRemoved(), instnacesRemoved)
+				suite.Equal(updateInfo.GetType(), workflowType)
+				suite.Equal(updateInfo.GetUpdateConfig(), updateConfig)
+			}).
+			Return(nil),
+	)
+
+	updateID, newEntityVersion, err := suite.job.CreateWorkflow(
+		context.Background(),
+		workflowType,
+		updateConfig,
+		entityVersion,
+		WithConfig(
+			jobConfig,
+			prevConfig,
+			configAddOn,
+		),
+		WithInstanceToProcess(
+			instancesAdded,
+			instancesUpdated,
+			instnacesRemoved,
+		),
+	)
+
+	// still return the update id, since the update may actually persisted in
+	// job runtime.
+	// do not add update in job.workflows because if the update is not persisted
+	// in job runtime, there is no way to clean it up.
+	suite.NotNil(updateID)
+	suite.Error(err)
+	suite.Nil(newEntityVersion)
+	suite.Nil(suite.job.workflows[updateID.GetValue()])
+}
+
 // TestResumeWorkflowSuccess tests the success case
 // of resuming a workflow
 func (suite *JobTestSuite) TestResumeWorkflowSuccess() {
@@ -2508,7 +2624,7 @@ func (suite *JobTestSuite) TestResumeWorkflowSuccess() {
 	oldWorkflowVersion := suite.job.runtime.GetWorkflowVersion()
 	opaque := "test"
 	desiredStateVersion := suite.job.runtime.GetDesiredStateVersion()
-	entityVersion := jobutil.GetJobEntityVersion(
+	entityVersion := versionutil.GetJobEntityVersion(
 		oldConfigVersion,
 		desiredStateVersion,
 		oldWorkflowVersion,
@@ -2557,7 +2673,7 @@ func (suite *JobTestSuite) TestResumeWorkflowSuccess() {
 
 	suite.NoError(err)
 	suite.Equal(
-		jobutil.GetJobEntityVersion(oldConfigVersion, desiredStateVersion, oldWorkflowVersion+1),
+		versionutil.GetJobEntityVersion(oldConfigVersion, desiredStateVersion, oldWorkflowVersion+1),
 		newEntityVersion,
 	)
 	suite.Equal(updateIDResult, updateID)
@@ -2594,7 +2710,7 @@ func (suite *JobTestSuite) TestResumeWorkflowWrongEntityVersionFailure() {
 
 	updateID, newEntityVersion, err := suite.job.ResumeWorkflow(
 		context.Background(),
-		jobutil.GetJobEntityVersion(
+		versionutil.GetJobEntityVersion(
 			suite.job.runtime.GetConfigurationVersion()+1,
 			suite.job.runtime.GetDesiredStateVersion(),
 			suite.job.runtime.GetWorkflowVersion(),
@@ -2611,7 +2727,7 @@ func (suite *JobTestSuite) TestResumeWorkflowNotExistInCacheSuccess() {
 	oldConfigVersion := suite.job.runtime.GetConfigurationVersion()
 	oldWorkflowVersion := suite.job.runtime.GetWorkflowVersion()
 	desiredStateVersion := suite.job.runtime.GetDesiredStateVersion()
-	entityVersion := jobutil.GetJobEntityVersion(oldConfigVersion, desiredStateVersion, oldWorkflowVersion)
+	entityVersion := versionutil.GetJobEntityVersion(oldConfigVersion, desiredStateVersion, oldWorkflowVersion)
 
 	updateID := &peloton.UpdateID{Value: testUpdateID}
 	suite.job.runtime.UpdateID = updateID
@@ -2650,7 +2766,7 @@ func (suite *JobTestSuite) TestResumeWorkflowNotExistInCacheSuccess() {
 	updateIDResult, newEntityVersion, err := suite.job.ResumeWorkflow(context.Background(), entityVersion)
 	suite.NoError(err)
 	suite.Equal(
-		jobutil.GetJobEntityVersion(oldConfigVersion, desiredStateVersion, oldWorkflowVersion+1),
+		versionutil.GetJobEntityVersion(oldConfigVersion, desiredStateVersion, oldWorkflowVersion+1),
 		newEntityVersion,
 	)
 	suite.Equal(updateIDResult, updateID)
@@ -2659,7 +2775,7 @@ func (suite *JobTestSuite) TestResumeWorkflowNotExistInCacheSuccess() {
 // TestResumeWorkflowNoUpdate the case of update pause
 // when there is no update
 func (suite *JobTestSuite) TestResumeWorkflowNoUpdate() {
-	entityVersion := jobutil.GetJobEntityVersion(
+	entityVersion := versionutil.GetJobEntityVersion(
 		suite.job.runtime.GetConfigurationVersion(),
 		suite.job.runtime.GetDesiredStateVersion(),
 		suite.job.runtime.GetWorkflowVersion(),
@@ -2678,7 +2794,7 @@ func (suite *JobTestSuite) TestPauseWorkflowSuccess() {
 	oldWorkflowVersion := suite.job.runtime.GetWorkflowVersion()
 	opaque := "test"
 	desiredStateVersion := suite.job.runtime.GetDesiredStateVersion()
-	entityVersion := jobutil.GetJobEntityVersion(oldConfigVersion, desiredStateVersion, oldWorkflowVersion)
+	entityVersion := versionutil.GetJobEntityVersion(oldConfigVersion, desiredStateVersion, oldWorkflowVersion)
 
 	updateID := &peloton.UpdateID{Value: testUpdateID}
 	suite.job.runtime.UpdateID = updateID
@@ -2721,7 +2837,7 @@ func (suite *JobTestSuite) TestPauseWorkflowSuccess() {
 	)
 	suite.NoError(err)
 	suite.Equal(
-		jobutil.GetJobEntityVersion(oldConfigVersion, desiredStateVersion, oldWorkflowVersion+1),
+		versionutil.GetJobEntityVersion(oldConfigVersion, desiredStateVersion, oldWorkflowVersion+1),
 		newEntityVersion,
 	)
 	suite.Equal(updateIDResult, updateID)
@@ -2757,7 +2873,7 @@ func (suite *JobTestSuite) TestPauseWorkflowWrongEntityVersionFailure() {
 
 	updateID, newEntityVersion, err := suite.job.PauseWorkflow(
 		context.Background(),
-		jobutil.GetJobEntityVersion(
+		versionutil.GetJobEntityVersion(
 			suite.job.runtime.GetConfigurationVersion()+1,
 			suite.job.runtime.GetDesiredStateVersion(),
 			suite.job.runtime.GetWorkflowVersion(),
@@ -2774,7 +2890,7 @@ func (suite *JobTestSuite) TestPauseWorkflowNotExistInCacheSuccess() {
 	oldConfigVersion := suite.job.runtime.GetConfigurationVersion()
 	oldWorkflowVersion := suite.job.runtime.GetWorkflowVersion()
 	desiredStateVersion := suite.job.runtime.GetDesiredStateVersion()
-	entityVersion := jobutil.GetJobEntityVersion(oldConfigVersion, desiredStateVersion, oldWorkflowVersion)
+	entityVersion := versionutil.GetJobEntityVersion(oldConfigVersion, desiredStateVersion, oldWorkflowVersion)
 
 	updateID := &peloton.UpdateID{Value: testUpdateID}
 	suite.job.runtime.UpdateID = updateID
@@ -2812,7 +2928,7 @@ func (suite *JobTestSuite) TestPauseWorkflowNotExistInCacheSuccess() {
 	updateIDResult, newEntityVersion, err := suite.job.PauseWorkflow(context.Background(), entityVersion)
 	suite.NoError(err)
 	suite.Equal(
-		jobutil.GetJobEntityVersion(oldConfigVersion, desiredStateVersion, oldWorkflowVersion+1),
+		versionutil.GetJobEntityVersion(oldConfigVersion, desiredStateVersion, oldWorkflowVersion+1),
 		newEntityVersion,
 	)
 	suite.Equal(updateIDResult, updateID)
@@ -2821,7 +2937,7 @@ func (suite *JobTestSuite) TestPauseWorkflowNotExistInCacheSuccess() {
 // TestPauseWorkflowNoUpdate tests the case of update pause
 // when there is no update
 func (suite *JobTestSuite) TestPauseWorkflowNoUpdate() {
-	entityVersion := jobutil.GetJobEntityVersion(
+	entityVersion := versionutil.GetJobEntityVersion(
 		suite.job.runtime.GetConfigurationVersion(),
 		suite.job.runtime.GetDesiredStateVersion(),
 		suite.job.runtime.GetWorkflowVersion(),
@@ -2840,7 +2956,7 @@ func (suite *JobTestSuite) TestAbortWorkflowSuccess() {
 	oldWorkflowVersion := suite.job.runtime.GetWorkflowVersion()
 	opaque := "test"
 	desiredStateVersion := suite.job.runtime.GetDesiredStateVersion()
-	entityVersion := jobutil.GetJobEntityVersion(oldConfigVersion, desiredStateVersion, oldWorkflowVersion)
+	entityVersion := versionutil.GetJobEntityVersion(oldConfigVersion, desiredStateVersion, oldWorkflowVersion)
 
 	updateID := &peloton.UpdateID{Value: testUpdateID}
 	suite.job.runtime.UpdateID = updateID
@@ -2883,7 +2999,7 @@ func (suite *JobTestSuite) TestAbortWorkflowSuccess() {
 	)
 	suite.NoError(err)
 	suite.Equal(
-		jobutil.GetJobEntityVersion(oldConfigVersion, desiredStateVersion, oldWorkflowVersion+1),
+		versionutil.GetJobEntityVersion(oldConfigVersion, desiredStateVersion, oldWorkflowVersion+1),
 		newEntityVersion,
 	)
 	suite.Equal(updateID, updateIDResult)
@@ -2902,7 +3018,7 @@ func (suite *JobTestSuite) TestAbortWorkflowWrongEntityVersionFailure() {
 
 	updateID, newEntityVersion, err := suite.job.AbortWorkflow(
 		context.Background(),
-		jobutil.GetJobEntityVersion(
+		versionutil.GetJobEntityVersion(
 			suite.job.runtime.GetConfigurationVersion()+1,
 			suite.job.runtime.GetDesiredStateVersion(),
 			suite.job.runtime.GetWorkflowVersion(),
@@ -2937,7 +3053,7 @@ func (suite *JobTestSuite) TestAbortWorkflowNotExistInCacheSuccess() {
 	oldConfigVersion := suite.job.runtime.GetConfigurationVersion()
 	oldWorkflowVersion := suite.job.runtime.GetWorkflowVersion()
 	desiredStateVersion := suite.job.runtime.GetDesiredStateVersion()
-	entityVersion := jobutil.GetJobEntityVersion(
+	entityVersion := versionutil.GetJobEntityVersion(
 		oldConfigVersion,
 		desiredStateVersion,
 		oldWorkflowVersion)
@@ -2981,7 +3097,7 @@ func (suite *JobTestSuite) TestAbortWorkflowNotExistInCacheSuccess() {
 	updateIDResult, newEntityVersion, err := suite.job.AbortWorkflow(context.Background(), entityVersion)
 	suite.NoError(err)
 	suite.Equal(
-		jobutil.GetJobEntityVersion(
+		versionutil.GetJobEntityVersion(
 			oldConfigVersion,
 			desiredStateVersion,
 			oldWorkflowVersion+1),
@@ -2993,7 +3109,7 @@ func (suite *JobTestSuite) TestAbortWorkflowNotExistInCacheSuccess() {
 // TestAbortWorkflowNoUpdate tests the case of update pause
 // when there is no update
 func (suite *JobTestSuite) TestAbortWorkflowNoUpdate() {
-	entityVersion := jobutil.GetJobEntityVersion(
+	entityVersion := versionutil.GetJobEntityVersion(
 		suite.job.runtime.GetConfigurationVersion(),
 		suite.job.runtime.GetDesiredStateVersion(),
 		suite.job.runtime.GetWorkflowVersion(),

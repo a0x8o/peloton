@@ -31,7 +31,7 @@ import (
 	"github.com/uber/peloton/pkg/common/leader"
 	"github.com/uber/peloton/pkg/common/util"
 
-	"gopkg.in/alecthomas/kingpin.v2"
+	kingpin "gopkg.in/alecthomas/kingpin.v2"
 )
 
 var (
@@ -346,8 +346,9 @@ var (
 	statelessStopEntityVersion = statelessStop.Arg("entityVersion",
 		"entity version for concurrency control").Required().String()
 
-	statelessListUpdates     = stateless.Command("list-updates", "list updates")
-	statelessListUpdatesName = statelessListUpdates.Arg("job", "job identifier").Required().String()
+	statelessListUpdates      = stateless.Command("list-updates", "list updates")
+	statelessListUpdatesName  = statelessListUpdates.Arg("job", "job identifier").Required().String()
+	statelessListUpdatesLimit = statelessListUpdates.Flag("limit", "max number of job updates to return").Default("10").Uint32()
 
 	statelessStart              = stateless.Command("start", "start job")
 	statelessStartJobID         = statelessStart.Arg("job", "job identifier").Required().String()
@@ -613,6 +614,9 @@ var (
 
 	// command for list status update events present in the event stream
 	eventStream = hostmgr.Command("events", "list all the task status update events present in event stream")
+
+	// command to disable the kill tasks request to mesos master
+	disableKillTasks = hostmgr.Command("disable-kill-tasks", "disable the kill task request to mesos master")
 )
 
 // TaskRangeValue allows us to define a new target type for kingpin to allow specifying ranges of tasks with from:to syntax as a TaskRangeFlag
@@ -872,6 +876,8 @@ func main() {
 		err = client.OffersGetAction()
 	case getHosts.FullCommand():
 		err = client.HostsGetAction(*getHostsCPU, *getHostsGPU, *getHostsCmpLess, *getHostsHostnames)
+	case disableKillTasks.FullCommand():
+		err = client.DisableKillTasksAction()
 	case podGetEvents.FullCommand():
 		err = client.PodGetEventsAction(*podGetEventsJobName, *podGetEventsInstanceID, *podGetEventsRunID, *podGetEventsLimit)
 	case podGetCache.FullCommand():
@@ -960,7 +966,10 @@ func main() {
 			*statelessRestartInPlace,
 		)
 	case statelessListUpdates.FullCommand():
-		err = client.StatelessListUpdatesAction(*statelessListUpdatesName)
+		err = client.StatelessListUpdatesAction(
+			*statelessListUpdatesName,
+			*statelessListUpdatesLimit,
+		)
 	case workflowEvents.FullCommand():
 		err = client.StatelessWorkflowEventsAction(
 			*workflowEventsJob,

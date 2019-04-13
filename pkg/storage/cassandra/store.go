@@ -28,6 +28,7 @@ import (
 	"strings"
 	"time"
 
+	mesos_v1 "github.com/uber/peloton/.gen/mesos/v1"
 	"github.com/uber/peloton/.gen/peloton/api/v0/job"
 	"github.com/uber/peloton/.gen/peloton/api/v0/peloton"
 	"github.com/uber/peloton/.gen/peloton/api/v0/query"
@@ -36,8 +37,6 @@ import (
 	"github.com/uber/peloton/.gen/peloton/api/v0/update"
 	pb_volume "github.com/uber/peloton/.gen/peloton/api/v0/volume"
 	"github.com/uber/peloton/.gen/peloton/api/v1alpha/job/stateless"
-	v1alphapeloton "github.com/uber/peloton/.gen/peloton/api/v1alpha/peloton"
-	"github.com/uber/peloton/.gen/peloton/api/v1alpha/pod"
 	"github.com/uber/peloton/.gen/peloton/private/models"
 
 	"github.com/uber/peloton/pkg/common"
@@ -1180,7 +1179,7 @@ func (s *Store) GetPodEvents(
 	ctx context.Context,
 	jobID string,
 	instanceID uint32,
-	podID ...string) ([]*pod.PodEvent, error) {
+	podID ...string) ([]*task.PodEvent, error) {
 	var stmt qb.SelectBuilder
 	queryBuilder := s.DataStore.NewQuery()
 
@@ -1218,48 +1217,44 @@ func (s *Store) GetPodEvents(
 		return nil, err
 	}
 
-	var podEvents []*pod.PodEvent
+	var podEvents []*task.PodEvent
 	for _, value := range allResults {
-		podEvent := &pod.PodEvent{}
+		podEvent := &task.PodEvent{}
 
-		podID := fmt.Sprintf("%s-%d-%d",
+		mesosTaskID := fmt.Sprintf("%s-%d-%d",
 			value["job_id"].(qb.UUID),
 			value["instance_id"].(int),
 			value["run_id"].(int64))
 
-		prevPodID := fmt.Sprintf("%s-%d-%d",
+		prevMesosTaskID := fmt.Sprintf("%s-%d-%d",
 			value["job_id"].(qb.UUID),
 			value["instance_id"].(int),
 			value["previous_run_id"].(int64))
 
-		desiredPodID := fmt.Sprintf("%s-%d-%d",
+		desiredMesosTaskID := fmt.Sprintf("%s-%d-%d",
 			value["job_id"].(qb.UUID),
 			value["instance_id"].(int),
 			value["desired_run_id"].(int64))
 
 		// Set podEvent fields
-		podEvent.PodId = &v1alphapeloton.PodID{
-			Value: podID,
+		podEvent.TaskId = &mesos_v1.TaskID{
+			Value: &mesosTaskID,
 		}
-		podEvent.PrevPodId = &v1alphapeloton.PodID{
-			Value: prevPodID,
+		podEvent.PrevTaskId = &mesos_v1.TaskID{
+			Value: &prevMesosTaskID,
 		}
-		podEvent.DesiredPodId = &v1alphapeloton.PodID{
-			Value: desiredPodID,
+		podEvent.DesriedTaskId = &mesos_v1.TaskID{
+			Value: &desiredMesosTaskID,
 		}
 		podEvent.Timestamp =
 			value["update_time"].(qb.UUID).Time().Format(time.RFC3339)
-		podEvent.Version = &v1alphapeloton.EntityVersion{
-			Value: fmt.Sprintf("%d", value["config_version"].(int64)),
-		}
-		podEvent.DesiredVersion = &v1alphapeloton.EntityVersion{
-			Value: fmt.Sprintf("%d", value["desired_config_version"].(int64)),
-		}
+		podEvent.ConfigVersion = uint64(value["config_version"].(int64))
+		podEvent.DesiredConfigVersion = uint64(value["desired_config_version"].(int64))
 		podEvent.ActualState = value["actual_state"].(string)
-		podEvent.DesiredState = value["goal_state"].(string)
+		podEvent.GoalState = value["goal_state"].(string)
 		podEvent.Message = value["message"].(string)
 		podEvent.Reason = value["reason"].(string)
-		podEvent.AgentId = value["agent_id"].(string)
+		podEvent.AgentID = value["agent_id"].(string)
 		podEvent.Hostname = value["hostname"].(string)
 		podEvent.Healthy = value["healthy"].(string)
 
@@ -2941,11 +2936,18 @@ func (s *Store) AddWorkflowEvent(
 func (s *Store) GetWorkflowEvents(
 	ctx context.Context,
 	updateID *peloton.UpdateID,
-	instanceID uint32) ([]*stateless.WorkflowEvent, error) {
+	instanceID uint32,
+	limit uint32,
+) ([]*stateless.WorkflowEvent, error) {
 	queryBuilder := s.DataStore.NewQuery()
 	stmt := queryBuilder.Select("*").From(podWorkflowEventsTable).
 		Where(qb.Eq{"update_id": updateID.GetValue()}).
 		Where(qb.Eq{"instance_id": int(instanceID)})
+
+	if limit > 0 {
+		stmt = stmt.Limit(uint64(limit))
+	}
+
 	result, err := s.executeRead(ctx, stmt)
 	if err != nil {
 		s.metrics.WorkflowMetrics.WorkflowEventsGetFail.Inc(1)
@@ -3355,9 +3357,10 @@ func (s *Store) GetUpdatesForJob(
 	jobID string,
 ) ([]*peloton.UpdateID, error) {
 	var updateIDs []*peloton.UpdateID
+	var updateList []*SortUpdateInfoTS
 
 	queryBuilder := s.DataStore.NewQuery()
-	stmt := queryBuilder.Select("update_id").From(updatesByJobView).
+	stmt := queryBuilder.Select("*").From(updatesByJobView).
 		Where(qb.Eq{"job_id": jobID})
 	allResults, err := s.executeRead(ctx, stmt)
 	if err != nil {
@@ -3379,8 +3382,19 @@ func (s *Store) GetUpdatesForJob(
 			return nil, err
 		}
 
-		updateIDs = append(updateIDs,
-			&peloton.UpdateID{Value: record.UpdateID.String()})
+		// sort as per the job configuration version
+		updateInfo := &SortUpdateInfoTS{
+			updateID:   &peloton.UpdateID{Value: record.UpdateID.String()},
+			createTime: record.CreationTime,
+		}
+
+		updateList = append(updateList, updateInfo)
+	}
+
+	sort.Sort(sort.Reverse(SortedUpdateListTS(updateList)))
+
+	for _, update := range updateList {
+		updateIDs = append(updateIDs, update.updateID)
 	}
 
 	s.metrics.UpdateMetrics.UpdateGetForJob.Inc(1)
@@ -3455,9 +3469,15 @@ func (s *Store) getJobSummaryFromResultMap(
 				// start archiving older jobs and no longer hit this case.
 				summary, err := s.getJobSummaryFromConfig(ctx, summary.Id)
 				if err != nil {
-					return nil, err
+					// no need to throw error here, continue with the rest of
+					// the entries. This is most likely a partially created job
+					// that will be cleaned up by goalstate engine
+					log.WithError(err).
+						WithField("jobID", id.String()).
+						Info("failed to get summary from config")
+				} else {
+					summaryResults = append(summaryResults, summary)
 				}
-				summaryResults = append(summaryResults, summary)
 				continue
 			}
 			summary.Name = name
@@ -3544,4 +3564,22 @@ func (u SortedUpdateList) Len() int      { return len(u) }
 func (u SortedUpdateList) Swap(i, j int) { u[i], u[j] = u[j], u[i] }
 func (u SortedUpdateList) Less(i, j int) bool {
 	return u[i].jobConfigVersion < u[j].jobConfigVersion
+}
+
+// SortUpdateInfoTS is the structure used by the sortable interface for
+// updates, where the sorting will be done according to the update create
+// timestamp for a given job.
+type SortUpdateInfoTS struct {
+	updateID   *peloton.UpdateID
+	createTime time.Time
+}
+
+// SortedUpdateListTS implements a sortable interface for updates according
+// to the create time for a given job.
+type SortedUpdateListTS []*SortUpdateInfoTS
+
+func (u SortedUpdateListTS) Len() int      { return len(u) }
+func (u SortedUpdateListTS) Swap(i, j int) { u[i], u[j] = u[j], u[i] }
+func (u SortedUpdateListTS) Less(i, j int) bool {
+	return u[i].createTime.UnixNano() < u[j].createTime.UnixNano()
 }

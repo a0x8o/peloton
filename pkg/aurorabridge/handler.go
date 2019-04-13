@@ -991,6 +991,9 @@ func (h *ServiceHandler) startJobUpdate(
 	if request.GetSettings().GetBlockIfNoPulsesAfterMs() > 0 {
 		d.AppendUpdateAction(opaquedata.StartPulsed)
 	}
+	if message != nil {
+		d.StartJobUpdateMessage = *message
+	}
 	od, err := d.Serialize()
 	if err != nil {
 		return nil, auroraErrorf("serialize opaque data: %s", err)
@@ -1242,7 +1245,7 @@ func (h *ServiceHandler) RollbackJobUpdate(
 				"message": message,
 			},
 			"result": result,
-		}).Debug("RollbackJobUpdate")
+		}).Debug("RollbackJobUpdate success")
 	}()
 	return newResponse(result, err), nil
 }
@@ -1687,6 +1690,10 @@ func (h *ServiceHandler) queryJobSummaries(
 	req := &statelesssvc.QueryJobsRequest{
 		Spec: &stateless.QuerySpec{
 			Labels: labels,
+			Pagination: &pbquery.PaginationSpec{
+				Limit:    common.QueryJobsLimit,
+				MaxLimit: common.QueryJobsLimit,
+			},
 		},
 	}
 	resp, err := h.jobClient.QueryJobs(ctx, req)
@@ -1914,8 +1921,9 @@ func (h *ServiceHandler) listWorkflows(
 	includeInstanceEvents bool,
 ) ([]*stateless.WorkflowInfo, error) {
 	req := &statelesssvc.ListJobWorkflowsRequest{
-		JobId:          jobID,
-		InstanceEvents: includeInstanceEvents,
+		JobId:               jobID,
+		InstanceEvents:      includeInstanceEvents,
+		InstanceEventsLimit: common.InstanceEventsLimit,
 	}
 	resp, err := h.jobClient.ListJobWorkflows(ctx, req)
 	if err != nil {

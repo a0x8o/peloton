@@ -18,7 +18,6 @@ import (
 	"context"
 	"time"
 
-	mesosv1 "github.com/uber/peloton/.gen/mesos/v1"
 	pbjob "github.com/uber/peloton/.gen/peloton/api/v0/job"
 	"github.com/uber/peloton/.gen/peloton/api/v0/peloton"
 	pbtask "github.com/uber/peloton/.gen/peloton/api/v0/task"
@@ -43,12 +42,12 @@ func UpdateRun(ctx context.Context, entity goalstate.Entity) error {
 	updateEnt := entity.(*updateEntity)
 	goalStateDriver := updateEnt.driver
 
-	log.WithField("update_id", updateEnt.id.GetValue()).
-		Info("update running")
-
 	cachedWorkflow, cachedJob, err := fetchWorkflowAndJobFromCache(
 		ctx, updateEnt.jobID, updateEnt.id, goalStateDriver)
 	if err != nil || cachedWorkflow == nil || cachedJob == nil {
+		log.WithFields(log.Fields{
+			"update_id": updateEnt.id.GetValue(),
+		}).WithError(err).Info("unable to run update")
 		goalStateDriver.mtx.updateMetrics.UpdateRunFail.Inc(1)
 		return err
 	}
@@ -161,6 +160,21 @@ func UpdateRun(ctx context.Context, entity goalstate.Entity) error {
 		goalStateDriver.mtx.updateMetrics.UpdateRunFail.Inc(1)
 		return err
 	}
+
+	// TODO (varung):
+	// - Use len for instances current
+	// - Remove instances_added, instances_removed and instances_updated
+	log.WithFields(log.Fields{
+		"update_id":         updateEnt.id.GetValue(),
+		"job_id":            cachedJob.ID().GetValue(),
+		"update_type":       cachedWorkflow.GetWorkflowType().String(),
+		"instances_current": cachedWorkflow.GetInstancesCurrent(),
+		"instances_failed":  len(cachedWorkflow.GetInstancesFailed()),
+		"instances_done":    len(cachedWorkflow.GetInstancesDone()),
+		"instances_added":   len(cachedWorkflow.GetInstancesAdded()),
+		"instances_removed": len(cachedWorkflow.GetInstancesRemoved()),
+		"instances_updated": len(cachedWorkflow.GetInstancesUpdated()),
+	}).Info("update running")
 
 	goalStateDriver.mtx.updateMetrics.UpdateRun.Inc(1)
 	return nil
@@ -833,7 +847,7 @@ func updateWithRecentRunID(
 
 	// instance removed previously during update is being added back.
 	if len(podEvents) > 0 {
-		runID, err := util.ParseRunID(podEvents[0].GetPodId().GetValue())
+		runID, err := util.ParseRunID(podEvents[0].GetTaskId().GetValue())
 		if err != nil {
 			return err
 		}
@@ -842,9 +856,7 @@ func updateWithRecentRunID(
 			instanceID,
 			runID+1)
 		runtime.DesiredMesosTaskId = runtime.MesosTaskId
-		runtime.PrevMesosTaskId = &mesosv1.TaskID{
-			Value: &podEvents[0].GetPodId().Value,
-		}
+		runtime.PrevMesosTaskId = podEvents[0].GetTaskId()
 	}
 	return nil
 }

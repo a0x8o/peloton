@@ -30,10 +30,10 @@ import (
 
 	"github.com/uber/peloton/pkg/common"
 	"github.com/uber/peloton/pkg/common/taskconfig"
+	versionutil "github.com/uber/peloton/pkg/common/util/entityversion"
 	stringsutil "github.com/uber/peloton/pkg/common/util/strings"
 	jobmgrcommon "github.com/uber/peloton/pkg/jobmgr/common"
 	goalstateutil "github.com/uber/peloton/pkg/jobmgr/util/goalstate"
-	jobutil "github.com/uber/peloton/pkg/jobmgr/util/job"
 	taskutil "github.com/uber/peloton/pkg/jobmgr/util/task"
 
 	"github.com/golang/protobuf/proto"
@@ -42,6 +42,8 @@ import (
 	log "github.com/sirupsen/logrus"
 	"go.uber.org/yarpc/yarpcerrors"
 )
+
+var _updateDeleteJobErr = yarpcerrors.InvalidArgumentErrorf("job is going to be deleted")
 
 // Job in the cache.
 // TODO there a lot of methods in this interface. To determine if
@@ -843,6 +845,12 @@ func (j *job) CompareAndSetRuntime(ctx context.Context, jobRuntime *pbjob.Runtim
 		return nil, err
 	}
 
+	if j.runtime.GetGoalState() == pbjob.JobState_DELETED &&
+		jobRuntime.GetGoalState() != j.runtime.GetGoalState() {
+		return nil, _updateDeleteJobErr
+
+	}
+
 	if j.runtime.GetRevision().GetVersion() !=
 		jobRuntime.GetRevision().GetVersion() {
 		return nil, jobmgrcommon.UnexpectedVersionError
@@ -995,7 +1003,9 @@ func (j *job) Update(ctx context.Context, jobInfo *pbjob.JobInfo, configAddOn *m
 	if jobInfo.GetRuntime() != nil {
 		updatedRuntime, err = j.getUpdatedJobRuntimeCache(ctx, jobInfo.GetRuntime(), req)
 		if err != nil {
-			j.invalidateCache()
+			if err != _updateDeleteJobErr {
+				j.invalidateCache()
+			}
 			return err
 		}
 		if updatedRuntime != nil {
@@ -1170,6 +1180,11 @@ func (j *job) getUpdatedJobRuntimeCache(
 
 	if j.runtime != nil {
 		newRuntime = j.validateAndMergeRuntime(runtime, req)
+		if j.runtime.GetGoalState() == pbjob.JobState_DELETED &&
+			newRuntime != nil &&
+			j.runtime.GetGoalState() != newRuntime.GetGoalState() {
+			return nil, _updateDeleteJobErr
+		}
 	}
 
 	return newRuntime, nil
@@ -1248,8 +1263,8 @@ func (j *job) mergeRuntime(newRuntime *pbjob.RuntimeInfo) *pbjob.RuntimeInfo {
 		runtime.TaskStats = newRuntime.GetTaskStats()
 	}
 
-	if len(newRuntime.GetTaskConfigVersionStats()) > 0 {
-		runtime.TaskConfigVersionStats = newRuntime.GetTaskConfigVersionStats()
+	if len(newRuntime.GetTaskStatsByConfigurationVersion()) > 0 {
+		runtime.TaskStatsByConfigurationVersion = newRuntime.GetTaskStatsByConfigurationVersion()
 	}
 
 	if len(newRuntime.GetResourceUsage()) > 0 {
@@ -1542,7 +1557,7 @@ func (j *job) CreateWorkflow(
 	j.workflows[updateID.GetValue()] = newWorkflow
 
 	// entity version is changed due to change in config version
-	newEntityVersion := jobutil.GetJobEntityVersion(
+	newEntityVersion := versionutil.GetJobEntityVersion(
 		j.runtime.GetConfigurationVersion(),
 		j.runtime.GetDesiredStateVersion(),
 		j.runtime.GetWorkflowVersion(),
@@ -1587,7 +1602,7 @@ func (j *job) PauseWorkflow(
 		return nil, nil, err
 	}
 
-	newEntityVersion := jobutil.GetJobEntityVersion(
+	newEntityVersion := versionutil.GetJobEntityVersion(
 		j.runtime.GetConfigurationVersion(),
 		j.runtime.GetDesiredStateVersion(),
 		j.runtime.GetWorkflowVersion(),
@@ -1624,7 +1639,7 @@ func (j *job) ResumeWorkflow(
 		return nil, nil, err
 	}
 
-	newEntityVersion := jobutil.GetJobEntityVersion(
+	newEntityVersion := versionutil.GetJobEntityVersion(
 		j.runtime.GetConfigurationVersion(),
 		j.runtime.GetDesiredStateVersion(),
 		j.runtime.GetWorkflowVersion(),
@@ -1661,7 +1676,7 @@ func (j *job) AbortWorkflow(
 		return nil, nil, err
 	}
 
-	newEntityVersion := jobutil.GetJobEntityVersion(
+	newEntityVersion := versionutil.GetJobEntityVersion(
 		j.runtime.GetConfigurationVersion(),
 		j.runtime.GetDesiredStateVersion(),
 		j.runtime.GetWorkflowVersion(),
@@ -1850,6 +1865,10 @@ func (j *job) updateJobRuntime(
 ) error {
 	if err := j.populateRuntime(ctx); err != nil {
 		return err
+	}
+
+	if j.runtime.GetGoalState() == pbjob.JobState_DELETED {
+		return _updateDeleteJobErr
 	}
 
 	if err := j.validateWorkflowOverwrite(
@@ -2110,7 +2129,7 @@ func (j *job) ValidateEntityVersion(
 		return err
 	}
 
-	curEntityVersion := jobutil.GetJobEntityVersion(
+	curEntityVersion := versionutil.GetJobEntityVersion(
 		j.runtime.GetConfigurationVersion(),
 		j.runtime.GetDesiredStateVersion(),
 		j.runtime.GetWorkflowVersion())
@@ -2130,7 +2149,7 @@ func (j *job) updateWorkflowVersion(
 	if err := j.ValidateEntityVersion(ctx, version); err != nil {
 		return err
 	}
-	_, _, workflowVersion, err := jobutil.ParseJobEntityVersion(version)
+	_, _, workflowVersion, err := versionutil.ParseJobEntityVersion(version)
 	if err != nil {
 		return err
 	}

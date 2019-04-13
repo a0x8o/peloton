@@ -33,9 +33,10 @@ import (
 	"github.com/uber/peloton/.gen/peloton/private/models"
 
 	"github.com/uber/peloton/pkg/common/util"
-	jobutil "github.com/uber/peloton/pkg/jobmgr/util/job"
+	versionutil "github.com/uber/peloton/pkg/common/util/entityversion"
 
 	"github.com/golang/protobuf/ptypes/timestamp"
+	"github.com/pborman/uuid"
 	"github.com/stretchr/testify/suite"
 )
 
@@ -194,8 +195,8 @@ func (suite *apiConverterTestSuite) TestConvertTaskRuntimeToPodStatus() {
 		VolumeId: &v1alphapeloton.VolumeID{
 			Value: volume,
 		},
-		Version:        jobutil.GetPodEntityVersion(version),
-		DesiredVersion: jobutil.GetPodEntityVersion(version),
+		Version:        versionutil.GetPodEntityVersion(version),
+		DesiredVersion: versionutil.GetPodEntityVersion(version),
 		AgentId: &mesos.AgentID{
 			Value: &testAgentID,
 		},
@@ -234,6 +235,8 @@ func (suite *apiConverterTestSuite) TestConvertTaskConfigToPodSpecAndViceVersa()
 	executorID := mesos.ExecutorID{
 		Value: &executorIDValue,
 	}
+	jobID := uuid.New()
+	instanceID := uint32(0)
 
 	taskConfig := &task.TaskConfig{
 		Name:   taskName,
@@ -296,7 +299,7 @@ func (suite *apiConverterTestSuite) TestConvertTaskConfigToPodSpecAndViceVersa()
 
 	podSpec := &pod.PodSpec{
 		PodName: &v1alphapeloton.PodName{
-			Value: taskName,
+			Value: util.CreatePelotonTaskID(jobID, instanceID),
 		},
 		Labels: []*v1alphapeloton.Label{
 			{
@@ -361,11 +364,35 @@ func (suite *apiConverterTestSuite) TestConvertTaskConfigToPodSpecAndViceVersa()
 		Revocable:              false,
 	}
 
-	suite.Equal(podSpec, ConvertTaskConfigToPodSpec(taskConfig))
+	suite.Equal(podSpec, ConvertTaskConfigToPodSpec(taskConfig, jobID, instanceID))
 
 	convertedTaskConfig, err := ConvertPodSpecToTaskConfig(podSpec)
 	suite.NoError(err)
 	suite.Equal(taskConfig, convertedTaskConfig)
+}
+
+// TestConvertTaskConfigToPodSpecOnlyLabels tests the
+// conversion of task config containing only labels to pod spec
+func (suite *apiConverterTestSuite) TestConvertTaskConfigToPodSpecOnlyLabels() {
+	label := &peloton.Label{
+		Key:   "test-key",
+		Value: "test-value",
+	}
+
+	taskConfig := &task.TaskConfig{
+		Labels: []*peloton.Label{label},
+	}
+
+	podSpec := &pod.PodSpec{
+		Labels: []*v1alphapeloton.Label{
+			{
+				Key:   label.GetKey(),
+				Value: label.GetValue(),
+			},
+		},
+	}
+
+	suite.Equal(podSpec, ConvertTaskConfigToPodSpec(taskConfig, "", 0))
 }
 
 // TestConvertPodSpecToTaskConfigNoContainers tests the conversion from
@@ -471,6 +498,13 @@ func (suite *apiConverterTestSuite) TestConvertTaskConstraintsToPodConstraintsAn
 	}
 	taskConstraints := []*task.Constraint{
 		{
+			// make sure the nil fields are preserved
+			Type: task.Constraint_LABEL_CONSTRAINT,
+			LabelConstraint: &task.LabelConstraint{
+				Kind: task.LabelConstraint_HOST,
+			},
+		},
+		{
 			Type: task.Constraint_LABEL_CONSTRAINT,
 			LabelConstraint: &task.LabelConstraint{
 				Kind: task.LabelConstraint_HOST,
@@ -543,6 +577,12 @@ func (suite *apiConverterTestSuite) TestConvertTaskConstraintsToPodConstraintsAn
 	}
 
 	podConstraints := []*pod.Constraint{
+		{
+			Type: pod.Constraint_CONSTRAINT_TYPE_LABEL,
+			LabelConstraint: &pod.LabelConstraint{
+				Kind: pod.LabelConstraint_LABEL_CONSTRAINT_KIND_HOST,
+			},
+		},
 		{
 			Type: pod.Constraint_CONSTRAINT_TYPE_LABEL,
 			LabelConstraint: &pod.LabelConstraint{
@@ -790,7 +830,8 @@ func (suite *apiConverterTestSuite) TestConvertJobConfigToJobSpec() {
 	suite.Equal(jobConfig.GetInstanceCount(), jobSpec.GetInstanceCount())
 	suite.Equal(jobConfig.GetSLA().GetPreemptible(), jobSpec.GetSla().GetPreemptible())
 	suite.Equal(jobConfig.GetSLA().GetRevocable(), jobSpec.GetSla().GetRevocable())
-	suite.Equal(jobConfig.GetDefaultConfig().GetName(), jobSpec.GetDefaultSpec().GetPodName().GetValue())
+	suite.Equal(jobConfig.GetDefaultConfig().GetName(), jobSpec.GetDefaultSpec().GetContainers()[0].GetName())
+	suite.Empty(jobSpec.GetDefaultSpec().GetPodName())
 	suite.Equal(jobConfig.GetDefaultConfig().GetCommand().GetValue(), jobSpec.GetDefaultSpec().GetContainers()[0].GetCommand().GetValue())
 	suite.Equal(jobConfig.GetDefaultConfig().GetController(), jobSpec.GetDefaultSpec().GetController())
 
@@ -888,7 +929,7 @@ func (suite *apiConverterTestSuite) TestConvertJobSpecToJobConfig() {
 	suite.Equal(jobSpec.GetInstanceCount(), jobConfig.GetInstanceCount())
 	suite.Equal(jobSpec.GetSla().GetPreemptible(), jobConfig.GetSLA().GetPreemptible())
 	suite.Equal(jobSpec.GetSla().GetRevocable(), jobConfig.GetSLA().GetRevocable())
-	suite.Equal(jobSpec.GetDefaultSpec().GetPodName().GetValue(), jobConfig.GetDefaultConfig().GetName())
+	suite.Equal(jobSpec.GetDefaultSpec().GetContainers()[0].GetName(), jobConfig.GetDefaultConfig().GetName())
 	suite.Equal(jobSpec.GetDefaultSpec().GetContainers()[0].GetCommand().GetValue(), jobConfig.GetDefaultConfig().GetCommand().GetValue())
 	suite.Equal(jobSpec.GetDefaultSpec().GetController(), jobConfig.GetDefaultConfig().GetController())
 
@@ -934,8 +975,8 @@ func (suite *apiConverterTestSuite) TestConvertUpdateModelToWorkflowStatus() {
 		NumInstancesCompleted: updateModel.GetInstancesDone(),
 		NumInstancesRemaining: updateModel.GetInstancesTotal() - updateModel.GetInstancesDone() - updateModel.GetInstancesFailed(),
 		NumInstancesFailed:    updateModel.GetInstancesFailed(),
-		Version:               jobutil.GetJobEntityVersion(jobConfigVersion, _desiredStateVersion, _workflowVersion),
-		PrevVersion:           jobutil.GetJobEntityVersion(prevJobConfigVersion, _desiredStateVersion, _workflowVersion),
+		Version:               versionutil.GetJobEntityVersion(jobConfigVersion, _desiredStateVersion, _workflowVersion),
+		PrevVersion:           versionutil.GetJobEntityVersion(prevJobConfigVersion, _desiredStateVersion, _workflowVersion),
 		CreationTime:          "2019-01-30T21:25:23Z",
 		UpdateTime:            "2019-01-30T21:35:23Z",
 	}
@@ -954,8 +995,13 @@ func (suite *apiConverterTestSuite) TestConvertRuntimeInfoToJobStatus() {
 	podStats["POD_STATE_FAILED"] = 2
 	creationTime := "now"
 	entityVersion := "2-2-2"
-	taskConfigStates := make(map[uint64]uint32)
-	taskConfigStates[_configVersion] = 5
+	taskConfigStateStats := make(map[uint64]*job.RuntimeInfo_TaskStateStats)
+	taskConfigStateStats[_configVersion] = &job.RuntimeInfo_TaskStateStats{
+		StateStats: map[string]uint32{
+			task.TaskState_RUNNING.String(): 1,
+			task.TaskState_PENDING.String(): 2,
+		},
+	}
 
 	runtime := &job.RuntimeInfo{
 		State:        job.JobState_RUNNING,
@@ -966,12 +1012,12 @@ func (suite *apiConverterTestSuite) TestConvertRuntimeInfoToJobStatus() {
 			UpdatedAt: 3,
 			UpdatedBy: "peloton",
 		},
-		TaskStats:              taskStats,
-		GoalState:              job.JobState_RUNNING,
-		ConfigurationVersion:   _configVersion,
-		WorkflowVersion:        _workflowVersion,
-		DesiredStateVersion:    _desiredStateVersion,
-		TaskConfigVersionStats: taskConfigStates,
+		TaskStats:                       taskStats,
+		GoalState:                       job.JobState_RUNNING,
+		ConfigurationVersion:            _configVersion,
+		WorkflowVersion:                 _workflowVersion,
+		DesiredStateVersion:             _desiredStateVersion,
+		TaskStatsByConfigurationVersion: taskConfigStateStats,
 	}
 
 	jobConfigVersion := uint64(3)
@@ -994,8 +1040,8 @@ func (suite *apiConverterTestSuite) TestConvertRuntimeInfoToJobStatus() {
 		NumInstancesCompleted: updateModel.GetInstancesDone(),
 		NumInstancesRemaining: updateModel.GetInstancesTotal() - updateModel.GetInstancesDone() - updateModel.GetInstancesFailed(),
 		NumInstancesFailed:    updateModel.GetInstancesFailed(),
-		Version:               jobutil.GetJobEntityVersion(jobConfigVersion, _desiredStateVersion, _workflowVersion),
-		PrevVersion:           jobutil.GetJobEntityVersion(prevJobConfigVersion, _desiredStateVersion, _workflowVersion),
+		Version:               versionutil.GetJobEntityVersion(jobConfigVersion, _desiredStateVersion, _workflowVersion),
+		PrevVersion:           versionutil.GetJobEntityVersion(prevJobConfigVersion, _desiredStateVersion, _workflowVersion),
 	}
 
 	jobStatus := ConvertRuntimeInfoToJobStatus(runtime, updateModel)
@@ -1005,8 +1051,10 @@ func (suite *apiConverterTestSuite) TestConvertRuntimeInfoToJobStatus() {
 	suite.Equal(podStats, jobStatus.GetPodStats())
 	suite.Equal(stateless.JobState_JOB_STATE_RUNNING, jobStatus.GetDesiredState())
 	suite.Equal(entityVersion, jobStatus.GetVersion().GetValue())
-	suite.Equal(1, len(jobStatus.GetPodConfigurationVersionStats()))
-	suite.Equal(uint32(5), jobStatus.GetPodConfigurationVersionStats()[entityVersion])
+	suite.Equal(1, len(jobStatus.GetPodStatsByConfigurationVersion()))
+	stateStats := jobStatus.GetPodStatsByConfigurationVersion()[versionutil.GetPodEntityVersion(_configVersion).GetValue()].GetStateStats()
+	suite.Equal(uint32(1), stateStats[pod.PodState_POD_STATE_RUNNING.String()])
+	suite.Equal(uint32(2), stateStats[pod.PodState_POD_STATE_PENDING.String()])
 	suite.Equal(workflowStatus, jobStatus.GetWorkflowStatus())
 }
 
@@ -1022,7 +1070,7 @@ func (suite *apiConverterTestSuite) TestConvertJobSummary() {
 
 	creationTime := "now"
 	entityVersion := "2-2-2"
-	taskConfigStats := make(map[string]uint32)
+	podConfigStateStats := make(map[string]*stateless.JobStatus_PodStateStats)
 
 	runtime := &job.RuntimeInfo{
 		State:        job.JobState_RUNNING,
@@ -1060,8 +1108,8 @@ func (suite *apiConverterTestSuite) TestConvertJobSummary() {
 		NumInstancesCompleted: updateModel.GetInstancesDone(),
 		NumInstancesRemaining: updateModel.GetInstancesTotal() - updateModel.GetInstancesDone() - updateModel.GetInstancesFailed(),
 		NumInstancesFailed:    updateModel.GetInstancesFailed(),
-		Version:               jobutil.GetJobEntityVersion(jobConfigVersion, _desiredStateVersion, _workflowVersion),
-		PrevVersion:           jobutil.GetJobEntityVersion(prevJobConfigVersion, _desiredStateVersion, _workflowVersion),
+		Version:               versionutil.GetJobEntityVersion(jobConfigVersion, _desiredStateVersion, _workflowVersion),
+		PrevVersion:           versionutil.GetJobEntityVersion(prevJobConfigVersion, _desiredStateVersion, _workflowVersion),
 	}
 
 	jobStatus := &stateless.JobStatus{
@@ -1071,13 +1119,13 @@ func (suite *apiConverterTestSuite) TestConvertJobSummary() {
 			UpdatedAt: runtime.GetRevision().GetUpdatedAt(),
 			UpdatedBy: runtime.GetRevision().GetUpdatedBy(),
 		},
-		State:                        stateless.JobState(runtime.GetState()),
-		CreationTime:                 runtime.GetCreationTime(),
-		PodStats:                     podStats,
-		PodConfigurationVersionStats: taskConfigStats,
-		DesiredState:                 stateless.JobState(runtime.GetGoalState()),
-		Version:                      &v1alphapeloton.EntityVersion{Value: entityVersion},
-		WorkflowStatus:               workflowStatus,
+		State:                          stateless.JobState(runtime.GetState()),
+		CreationTime:                   runtime.GetCreationTime(),
+		PodStats:                       podStats,
+		PodStatsByConfigurationVersion: podConfigStateStats,
+		DesiredState:                   stateless.JobState(runtime.GetGoalState()),
+		Version:                        &v1alphapeloton.EntityVersion{Value: entityVersion},
+		WorkflowStatus:                 workflowStatus,
 	}
 
 	summary := &job.JobSummary{
@@ -1140,8 +1188,8 @@ func (suite *apiConverterTestSuite) TestConvertUpdateModelToWorkflowInfo() {
 		NumInstancesCompleted: updateModel.GetInstancesDone(),
 		NumInstancesRemaining: updateModel.GetInstancesTotal() - updateModel.GetInstancesDone() - updateModel.GetInstancesFailed(),
 		NumInstancesFailed:    updateModel.GetInstancesFailed(),
-		Version:               jobutil.GetJobEntityVersion(jobConfigVersion, _desiredStateVersion, _workflowVersion),
-		PrevVersion:           jobutil.GetJobEntityVersion(prevJobConfigVersion, _desiredStateVersion, _workflowVersion),
+		Version:               versionutil.GetJobEntityVersion(jobConfigVersion, _desiredStateVersion, _workflowVersion),
+		PrevVersion:           versionutil.GetJobEntityVersion(prevJobConfigVersion, _desiredStateVersion, _workflowVersion),
 	}
 
 	workflowInfo := ConvertUpdateModelToWorkflowInfo(runtime, updateModel, nil, nil)
@@ -1185,8 +1233,8 @@ func (suite *apiConverterTestSuite) TestConvertUpdateModelToWorkflowInfoRestart(
 		NumInstancesCompleted: updateModel.GetInstancesDone(),
 		NumInstancesRemaining: updateModel.GetInstancesTotal() - updateModel.GetInstancesDone() - updateModel.GetInstancesFailed(),
 		NumInstancesFailed:    updateModel.GetInstancesFailed(),
-		Version:               jobutil.GetJobEntityVersion(jobConfigVersion, _desiredStateVersion, _workflowVersion),
-		PrevVersion:           jobutil.GetJobEntityVersion(prevJobConfigVersion, _desiredStateVersion, _workflowVersion),
+		Version:               versionutil.GetJobEntityVersion(jobConfigVersion, _desiredStateVersion, _workflowVersion),
+		PrevVersion:           versionutil.GetJobEntityVersion(prevJobConfigVersion, _desiredStateVersion, _workflowVersion),
 	}
 
 	workflowInfo := ConvertUpdateModelToWorkflowInfo(runtime, updateModel, nil, nil)
@@ -1426,19 +1474,18 @@ func (suite *apiConverterTestSuite) TestConvertTaskInfosToPodInfos() {
 
 	for _, taskInfo := range taskInfos {
 		podInfo := &pod.PodInfo{
-			Spec:   ConvertTaskConfigToPodSpec(taskInfo.GetConfig()),
-			Status: ConvertTaskRuntimeToPodStatus(taskInfo.GetRuntime()),
-		}
-		podInfo.Spec.PodName = &v1alphapeloton.PodName{
-			Value: util.CreatePelotonTaskID(
+			Spec: ConvertTaskConfigToPodSpec(
+				taskInfo.GetConfig(),
 				taskInfo.GetJobId().GetValue(),
 				taskInfo.GetInstanceId(),
 			),
+			Status: ConvertTaskRuntimeToPodStatus(taskInfo.GetRuntime()),
 		}
 		podInfos = append(podInfos, podInfo)
 	}
 
-	suite.Equal(podInfos, ConvertTaskInfosToPodInfos(taskInfos))
+	converted := ConvertTaskInfosToPodInfos(taskInfos)
+	suite.Equal(podInfos, converted)
 }
 
 // TestConvertTerminationStatusReason verifies that all TerminationStatus
@@ -1451,6 +1498,8 @@ func (suite *apiConverterTestSuite) TestConvertTerminationStatusReason() {
 		task.TerminationStatus_TERMINATION_STATUS_REASON_KILLED_HOST_MAINTENANCE:   pod.TerminationStatus_TERMINATION_STATUS_REASON_KILLED_HOST_MAINTENANCE,
 		task.TerminationStatus_TERMINATION_STATUS_REASON_PREEMPTED_RESOURCES:       pod.TerminationStatus_TERMINATION_STATUS_REASON_PREEMPTED_RESOURCES,
 		task.TerminationStatus_TERMINATION_STATUS_REASON_DEADLINE_TIMEOUT_EXCEEDED: pod.TerminationStatus_TERMINATION_STATUS_REASON_DEADLINE_TIMEOUT_EXCEEDED,
+		task.TerminationStatus_TERMINATION_STATUS_REASON_KILLED_FOR_RESTART:        pod.TerminationStatus_TERMINATION_STATUS_REASON_KILLED_FOR_RESTART,
+		task.TerminationStatus_TERMINATION_STATUS_REASON_KILLED_FOR_UPDATE:         pod.TerminationStatus_TERMINATION_STATUS_REASON_KILLED_FOR_UPDATE,
 	}
 	// ensure that we have a test-case for every legal value of v0 reason
 	suite.Equal(len(task.TerminationStatus_Reason_name), len(expmap))
@@ -1479,6 +1528,93 @@ func (suite *apiConverterTestSuite) TestConvertV1InstanceRangeToV0() {
 	suite.Equal(len(v0Range), 1)
 	suite.Equal(v0Range[0].From, from)
 	suite.Equal(v0Range[0].To, to)
+}
+
+func (suite *apiConverterTestSuite) TestConvertTaskEventsToPodEvents() {
+	taskState := "RUNNING"
+	desiredTaskState := "SUCCEEDED"
+	podState := "POD_STATE_RUNNING"
+	desiredPodState := "POD_STATE_SUCCEEDED"
+
+	taskEvents := []*task.PodEvent{
+		{
+			TaskId: &mesos.TaskID{
+				Value: &testMesosTaskID,
+			},
+			DesriedTaskId: &mesos.TaskID{
+				Value: &testMesosTaskID,
+			},
+			ConfigVersion:        1,
+			DesiredConfigVersion: 1,
+			AgentID:              testAgentID,
+			Hostname:             "test-host",
+			Message:              "test-message",
+			Reason:               "test-reason",
+			Healthy:              "HEALTHY",
+			PrevTaskId: &mesos.TaskID{
+				Value: &testPrevMesosTaskID,
+			},
+			ActualState: taskState,
+			GoalState:   desiredTaskState,
+			Timestamp:   "now",
+		},
+	}
+
+	expectedPodEvents := []*pod.PodEvent{
+		{
+			PodId: &v1alphapeloton.PodID{
+				Value: testMesosTaskID,
+			},
+			DesiredPodId: &v1alphapeloton.PodID{
+				Value: testMesosTaskID,
+			},
+			Version: &v1alphapeloton.EntityVersion{
+				Value: "1-0-0",
+			},
+			DesiredVersion: &v1alphapeloton.EntityVersion{
+				Value: "1-0-0",
+			},
+			AgentId:  testAgentID,
+			Hostname: "test-host",
+			Message:  "test-message",
+			Reason:   "test-reason",
+			Healthy:  "HEALTH_STATE_HEALTHY",
+			PrevPodId: &v1alphapeloton.PodID{
+				Value: testPrevMesosTaskID,
+			},
+			ActualState:  podState,
+			DesiredState: desiredPodState,
+			Timestamp:    "now",
+		},
+	}
+
+	podEvents := ConvertTaskEventsToPodEvents(taskEvents)
+	suite.Equal(expectedPodEvents, podEvents)
+}
+
+// TestConvertTaskStatsToPodStats tests conversion
+// from v0 task stats to v1alpha pod stats
+func (suite *apiConverterTestSuite) TestConvertTaskStatsToPodStats() {
+	taskStats := make(map[string]uint32)
+	taskStats["SUCCEEDED"] = 1
+	taskStats["RUNNING"] = 3
+	taskStats["FAILED"] = 2
+	taskStats["INITIALIZED"] = 1
+	taskStats["PENDING"] = 2
+	taskStats["LAUNCHING"] = 6
+	taskStats["LAUNCHED"] = 15
+	taskStats["STARTING"] = 7
+	taskStats["LOST"] = 11
+	taskStats["PREEMPTING"] = 12
+	taskStats["KILLED"] = 14
+	taskStats["KILLING"] = 17
+	taskStats["DELETED"] = 16
+
+	podStatePrefix := "POD_STATE_"
+	podStats := ConvertTaskStatsToPodStats(taskStats)
+	for k, v := range taskStats {
+		suite.Equal(v, podStats[podStatePrefix+k])
+	}
 }
 
 func TestAPIConverter(t *testing.T) {
