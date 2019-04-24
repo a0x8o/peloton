@@ -176,8 +176,9 @@ define vendor_mockgen
 endef
 
 mockgens: build-mockgen gens $(GOMOCK)
-	$(call local_mockgen,pkg/auth, SecurityManager;User)
 	$(call local_mockgen,pkg/aurorabridge,RespoolLoader;EventPublisher)
+	$(call local_mockgen,pkg/aurorabridge/common,Random)
+	$(call local_mockgen,pkg/auth, SecurityManager;SecurityClient;User)
 	$(call local_mockgen,pkg/common/concurrency,Mapper)
 	$(call local_mockgen,pkg/common/background,Manager)
 	$(call local_mockgen,pkg/common/constraints,Evaluator)
@@ -216,7 +217,7 @@ mockgens: build-mockgen gens $(GOMOCK)
 	$(call local_mockgen,pkg/storage,JobStore;TaskStore;UpdateStore;FrameworkInfoStore;ResourcePoolStore;PersistentVolumeStore)
 	$(call local_mockgen,pkg/storage/cassandra/api,DataStore)
 	$(call local_mockgen,pkg/storage/objects,JobIndexOps;JobNameToIDOps;JobConfigOps;SecretInfoOps)
-	$(call local_mockgen,pkg/storage/orm,Client;Connector)
+	$(call local_mockgen,pkg/storage/orm,Client;Connector;Iterator)
 	$(call local_mockgen,.gen/peloton/api/v0/host/svc,HostServiceYARPCClient)
 	$(call local_mockgen,.gen/peloton/api/v0/job,JobManagerYARPCClient)
 	$(call local_mockgen,.gen/peloton/api/v0/respool,ResourceManagerYARPCClient)
@@ -248,6 +249,10 @@ unit-test: $(GOCOV) $(GENS) mockgens
 integ-test: get-gokind
 	ls -la $(shell pwd)/bin
 	PATH="$(PATH):$(shell pwd)/bin" ./tests/run-integration-tests.sh
+
+aurorabridge-integ-test: get-gokind
+	ls -la $(shell pwd)/bin
+	PATH="$(PATH):$(shell pwd)/bin" ./tests/run-aurorabridge-integration-tests.sh
 
 # launch peloton with PELOTON={any value}, default to none
 minicluster: $(GOKIND)

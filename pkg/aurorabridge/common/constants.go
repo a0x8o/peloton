@@ -42,8 +42,15 @@ var BridgePodLabel = &peloton.Label{
 	Value: "com.uber.peloton.internal.aurorabridge_pod",
 }
 
+// BridgeUpdateLabelKey is the Peloton pod level label key for triggering
+// a forced PodSpec change.
+const BridgeUpdateLabelKey = "aurora_bridge_update"
+
 // QueryJobsLimit specifies Limit parameter passed to QueryJobs request
 const QueryJobsLimit = 1000
 
 // InstanceEventsLimit specifies the limit on number of events per instance
 const InstanceEventsLimit = 100
+
+// UpdatesLimit specifies the limit on number of updates to include per job
+const UpdatesLimit = 10

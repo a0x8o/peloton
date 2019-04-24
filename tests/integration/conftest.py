@@ -6,7 +6,9 @@ import grpc
 import requests
 
 from docker import Client
-from tools.minicluster.main import setup, teardown
+from tools.minicluster.main import setup, teardown, config as mc_config
+from tools.minicluster.minicluster import run_mesos_agent, \
+    teardown_mesos_agent
 from job import Job
 from job import query_jobs as batch_query_jobs
 from job import kill_jobs as batch_kill_jobs
@@ -170,8 +172,12 @@ def teardown_minicluster(dump_logs=False):
         # dump logs only if tests have failed in the current module
         if dump_logs:
             try:
+                # TODO (varung): enable PE and mesos-master logs if needed
                 cli = Client(base_url='unix://var/run/docker.sock')
                 log.info(cli.logs('peloton-jobmgr0'))
+                log.info(cli.logs('peloton-resmgr0'))
+                log.info(cli.logs('peloton-hostmgr0'))
+                log.info(cli.logs('peloton-aurorabridge0'))
             except Exception as e:
                 log.info(e)
 
@@ -407,3 +413,25 @@ def task_test_fixture(request):
     request.addfinalizer(stop_job)
 
     return job.job_id
+
+
+"""
+Setup/cleanup fixture that replaces a regular Mesos agent with
+another one that has "peloton/exclusive" attribute. Cleanup does
+the exact opposite.
+"""
+
+
+@pytest.fixture
+def exclusive_host(request):
+    def clean_up():
+        teardown_mesos_agent(mc_config, 0, is_exclusive=True)
+        run_mesos_agent(mc_config, 0, 0)
+        time.sleep(5)
+
+    # Remove agent #0 and instead create exclusive agent #0
+    teardown_mesos_agent(mc_config, 0)
+    run_mesos_agent(mc_config, 0, 3, is_exclusive=True,
+                    exclusive_label_value='exclusive-test-label')
+    time.sleep(5)
+    request.addfinalizer(clean_up)

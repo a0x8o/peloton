@@ -5,14 +5,17 @@ import pytest
 from tests.integration.aurorabridge_test.client import api
 from tests.integration.aurorabridge_test.util import (
     assert_keys_equal,
+    expand_instance_range,
+    get_job_update_request,
+    get_running_tasks,
     remove_duplicate_keys,
     start_job_update,
     wait_for_killed,
+    wait_for_rolled_forward,
 )
 
 pytestmark = [pytest.mark.default,
-              pytest.mark.aurorabridge,
-              pytest.mark.random_order(disabled=True)]
+              pytest.mark.aurorabridge]
 
 
 def test__get_jobs__get_job_summary(client):
@@ -245,3 +248,161 @@ def test__get_tasks_without_configs_task_queries(client):
             remove_duplicate_keys(t.assignedTask.task.job for t in res.tasks),
             expected_job_keys,
             message=message)
+
+
+def test__get_config_summary__with_pinned_instances(client):
+    """
+    test pinned instance update which divides instances to two sets of
+    configs, and verify getConfigSummary endpoint returns the correct
+    result.
+    """
+    all_instances = set(range(10))
+
+    # start a regular update
+    job_key = start_job_update(
+        client,
+        'test_dc_labrat_large_job.yaml',
+        'start job update test/dc/labrat_large_job')
+
+    tasks = get_running_tasks(client, job_key)
+    assert len(tasks) == 10
+
+    # start a update with updateOnlyTheseInstances parameter
+    update_instances = set([0, 2, 3, 7, 9])
+    pinned_req = get_job_update_request('test_dc_labrat_large_job_diff_labels.yaml')
+    pinned_req.settings.updateOnlyTheseInstances = set([api.Range(first=i, last=i) for i in update_instances])
+
+    res = client.start_job_update(
+        pinned_req,
+        'start job update test/dc/labrat_large_job with pinned instances')
+    wait_for_rolled_forward(client, res.key)
+    job_key = res.key.job
+
+    tasks = get_running_tasks(client, job_key)
+    assert len(tasks) == 10
+
+    res = client.get_config_summary(job_key)
+    assert len(res.summary.groups) == 2
+    for group in res.summary.groups:
+        instances = set(expand_instance_range(group.instances))
+
+        if instances == update_instances:
+            # instances updated in the second update
+            assert len(group.config.metadata) == 2
+            for m in group.config.metadata:
+                if m.key == 'test_key_11':
+                    assert m.value == 'test_value_11'
+                elif m.key == 'test_key_22':
+                    assert m.value == 'test_value_22'
+                else:
+                    assert False, 'unexpected metadata %s' % m
+
+        elif instances == all_instances - update_instances:
+            # instances updated from the first update
+            assert len(group.config.metadata) == 2
+            for m in group.config.metadata:
+                if m.key == 'test_key_1':
+                    assert m.value == 'test_value_1'
+                elif m.key == 'test_key_2':
+                    assert m.value == 'test_value_2'
+                else:
+                    assert False, 'unexpected metadata %s' % m
+
+        else:
+            assert False, 'unexpected instance range: %s' % group.instances
+
+
+def test__get_tasks_without_configs__previous_run(client):
+    """
+    test getTasksWithoutConfigs endpoint for tasks from previous runs:
+    1. start a regular update (version 1) on all instances
+    2. start a another update (version 2) on all instances
+    """
+    req1 = get_job_update_request('test_dc_labrat_large_job.yaml')
+    req1.settings.updateGroupSize = 10
+
+    req2 = get_job_update_request('test_dc_labrat_large_job_diff_labels.yaml')
+    req2.settings.updateGroupSize = 10
+
+    # start a regular update
+    job_key = start_job_update(
+        client,
+        req1,
+        'start job update test/dc/labrat_large_job')
+
+    res = client.get_tasks_without_configs(api.TaskQuery(jobKeys={job_key}))
+    assert len(res.tasks) == 10
+    for t in res.tasks:
+        _, _, run_id = t.assignedTask.taskId.rsplit('-', 2)
+        assert run_id == '1'
+        assert len(t.assignedTask.task.metadata) == 2
+        for m in t.assignedTask.task.metadata:
+            if m.key == 'test_key_1':
+                assert m.value == 'test_value_1'
+            elif m.key == 'test_key_2':
+                assert m.value == 'test_value_2'
+            else:
+                assert False, 'unexpected metadata %s' % m
+
+    # start 6 new updates (assuming pod_runs_depth is 6), expect run id 1
+    # to be excluded
+    start_job_update(
+        client,
+        req2,
+        'start job update test/dc/labrat_large_job')
+    start_job_update(
+        client,
+        req1,
+        'start job update test/dc/labrat_large_job')
+    start_job_update(
+        client,
+        req2,
+        'start job update test/dc/labrat_large_job')
+    start_job_update(
+        client,
+        req1,
+        'start job update test/dc/labrat_large_job')
+    start_job_update(
+        client,
+        req2,
+        'start job update test/dc/labrat_large_job')
+    start_job_update(
+        client,
+        req1,
+        'start job update test/dc/labrat_large_job')
+
+    res = client.get_tasks_without_configs(api.TaskQuery(jobKeys={job_key}))
+    assert len(res.tasks) == 10 * 6
+    for t in res.tasks:
+        _, _, run_id = t.assignedTask.taskId.rsplit('-', 2)
+        assert len(t.assignedTask.task.metadata) == 2
+
+        if run_id in ('7'):
+            assert t.status == api.ScheduleStatus.RUNNING
+            for m in t.assignedTask.task.metadata:
+                if m.key == 'test_key_1':
+                    assert m.value == 'test_value_1'
+                elif m.key == 'test_key_2':
+                    assert m.value == 'test_value_2'
+                else:
+                    assert False, 'unexpected metadata %s' % m
+        elif run_id in ('6', '4', '2'):
+            assert t.status == api.ScheduleStatus.KILLED
+            for m in t.assignedTask.task.metadata:
+                if m.key == 'test_key_11':
+                    assert m.value == 'test_value_11'
+                elif m.key == 'test_key_22':
+                    assert m.value == 'test_value_22'
+                else:
+                    assert False, 'unexpected metadata %s' % m
+        elif run_id in ('5', '3'):
+            assert t.status == api.ScheduleStatus.KILLED
+            for m in t.assignedTask.task.metadata:
+                if m.key == 'test_key_1':
+                    assert m.value == 'test_value_1'
+                elif m.key == 'test_key_2':
+                    assert m.value == 'test_value_2'
+                else:
+                    assert False, 'unexpected metadata %s' % m
+        else:
+            assert False, 'unexpected run id: %d' % run_id

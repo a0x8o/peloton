@@ -481,25 +481,6 @@ func (s *Store) GetMaxJobConfigVersion(
 	return 0, nil
 }
 
-// UpdateJobConfig updates a job with the job id and the config value
-// TODO(zhixin): consider remove the function signature
-func (s *Store) UpdateJobConfig(
-	ctx context.Context,
-	id *peloton.JobID,
-	jobConfig *job.JobConfig,
-	configAddOn *models.ConfigAddOn) error {
-	if err := s.CreateJobConfig(
-		ctx,
-		id,
-		jobConfig,
-		configAddOn,
-		jobConfig.GetChangeLog().GetVersion(),
-		"<missing owner>"); err != nil {
-		return err
-	}
-	return nil
-}
-
 // GetJobConfig returns a job config given the job id
 // TODO(zhixin): GetJobConfig takes version as param when write through cache is implemented
 func (s *Store) GetJobConfig(
@@ -3284,9 +3265,13 @@ func (s *Store) ModifyUpdate(
 		Set("instances_total", updateInfo.GetInstancesTotal()).
 		Set("job_config_version", updateInfo.GetJobConfigVersion()).
 		Set("job_config_prev_version", updateInfo.GetPrevJobConfigVersion()).
-		Set("update_time", time.Now().UTC()).
-		Where(qb.Eq{"update_id": updateInfo.GetUpdateID().GetValue()})
+		Set("update_time", time.Now().UTC())
 
+	if updateInfo.GetOpaqueData() != nil {
+		stmt = stmt.Set("opaque_data", updateInfo.GetOpaqueData().GetData())
+	}
+
+	stmt = stmt.Where(qb.Eq{"update_id": updateInfo.GetUpdateID().GetValue()})
 	if err := s.applyStatement(
 		ctx,
 		stmt,

@@ -49,8 +49,10 @@ func JobUntrack(ctx context.Context, entity goalstate.Entity) error {
 			return err
 		}
 	} else if jobConfig.GetType() == job.JobType_SERVICE {
-		// service jobs are always active and never untracked
-		return nil
+		// service jobs are always active and never untracked.
+		// Call runtime updater, because job runtime can change
+		// when an update is running on the job.
+		return JobRuntimeUpdater(ctx, entity)
 	}
 
 	// First clean from goal state
@@ -109,6 +111,14 @@ func JobRecover(ctx context.Context, entity goalstate.Entity) error {
 		// runtime may already be removed, ignore not found
 		// error here
 		if err != nil && !yarpcerrors.IsNotFound(err) {
+			return err
+		}
+
+		// delete from job_index
+		if err := goalStateDriver.jobIndexOps.Delete(
+			ctx,
+			cachedJob.ID(),
+		); err != nil {
 			return err
 		}
 
@@ -298,7 +308,9 @@ func JobReloadRuntime(
 
 	jobRuntime, err := goalStateDriver.jobStore.GetJobRuntime(ctx, jobEnt.GetID())
 	if yarpcerrors.IsNotFound(err) {
-		return JobUntrack(ctx, entity)
+		// runtime is not created, see if config is created and the job is
+		// recoverable.
+		return JobRecover(ctx, entity)
 	}
 
 	err = cachedJob.Update(
@@ -392,6 +404,36 @@ func JobKillAndDelete(
 		"job_id": cachedJob.ID(),
 		"state":  jobState.String(),
 	}).Info("some tasks are not killed, waiting to kill before deleting")
+
+	return nil
+}
+
+// JobKillAndUntrack kills all of the pods in the job, makes sure they would
+// not start again and untrack the job if possible
+func JobKillAndUntrack(ctx context.Context, entity goalstate.Entity) error {
+	jobEnt := entity.(*jobEntity)
+	goalStateDriver := entity.(*jobEntity).driver
+
+	cachedJob := goalStateDriver.jobFactory.GetJob(jobEnt.id)
+	if cachedJob == nil {
+		return nil
+	}
+
+	runtimeDiffNonTerminatedTasks, err :=
+		stopTasks(ctx, cachedJob, goalStateDriver)
+	if err != nil {
+		return err
+	}
+
+	if len(runtimeDiffNonTerminatedTasks) == 0 {
+		log.WithField("job_id", cachedJob.ID()).
+			Info("all tasks are killed, untrack the job")
+		return JobUntrack(ctx, entity)
+	}
+
+	log.WithFields(log.Fields{
+		"job_id": cachedJob.ID(),
+	}).Info("some tasks are not killed, waiting to kill before untracking")
 
 	return nil
 }

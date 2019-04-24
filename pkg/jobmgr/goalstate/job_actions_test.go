@@ -16,6 +16,7 @@ package goalstate
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"testing"
 
@@ -31,6 +32,7 @@ import (
 	goalstatemocks "github.com/uber/peloton/pkg/common/goalstate/mocks"
 	cachedmocks "github.com/uber/peloton/pkg/jobmgr/cached/mocks"
 	storemocks "github.com/uber/peloton/pkg/storage/mocks"
+	ormmocks "github.com/uber/peloton/pkg/storage/objects/mocks"
 
 	"github.com/golang/mock/gomock"
 	"github.com/pborman/uuid"
@@ -55,6 +57,7 @@ type jobActionsTestSuite struct {
 	cachedTask            *cachedmocks.MockTask
 	jobStore              *storemocks.MockJobStore
 	updateStore           *storemocks.MockUpdateStore
+	jobIndexOps           *ormmocks.MockJobIndexOps
 }
 
 func (suite *jobActionsTestSuite) SetupTest() {
@@ -66,6 +69,7 @@ func (suite *jobActionsTestSuite) SetupTest() {
 	suite.jobStore = storemocks.NewMockJobStore(suite.ctrl)
 	suite.updateStore = storemocks.NewMockUpdateStore(suite.ctrl)
 	suite.updateGoalStateEngine = goalstatemocks.NewMockEngine(suite.ctrl)
+	suite.jobIndexOps = ormmocks.NewMockJobIndexOps(suite.ctrl)
 
 	suite.goalStateDriver = &driver{
 		updateStore:  suite.updateStore,
@@ -74,6 +78,7 @@ func (suite *jobActionsTestSuite) SetupTest() {
 		jobEngine:    suite.jobGoalStateEngine,
 		taskEngine:   suite.taskGoalStateEngine,
 		jobFactory:   suite.jobFactory,
+		jobIndexOps:  suite.jobIndexOps,
 		mtx:          NewMetrics(tally.NoopScope),
 		cfg:          &Config{},
 	}
@@ -137,8 +142,24 @@ func (suite *jobActionsTestSuite) TestUntrackJobStateless() {
 			Type: job.JobType_SERVICE,
 		}, nil)
 
+	suite.jobFactory.EXPECT().
+		AddJob(suite.jobID).
+		Return(suite.cachedJob)
+
+	suite.cachedJob.EXPECT().
+		GetRuntime(gomock.Any()).
+		Return(&job.RuntimeInfo{
+			State:     job.JobState_KILLED,
+			GoalState: job.JobState_KILLED,
+		}, nil)
+
+	// enough call to verify JobUntrack calls JobRuntimeUpdater
+	suite.cachedJob.EXPECT().
+		GetConfig(gomock.Any()).
+		Return(nil, errors.New("test error"))
+
 	err := JobUntrack(context.Background(), suite.jobEnt)
-	suite.NoError(err)
+	suite.Error(err)
 }
 
 // Test JobStateInvalid workflow is as expected
@@ -246,6 +267,10 @@ func (suite *jobActionsTestSuite) TestJobRecoverActionFailToRecover() {
 
 	suite.jobStore.EXPECT().
 		DeleteJob(gomock.Any(), suite.jobID.GetValue()).
+		Return(nil)
+
+	suite.jobIndexOps.EXPECT().
+		Delete(gomock.Any(), suite.jobID).
 		Return(nil)
 
 	suite.jobStore.EXPECT().
@@ -649,27 +674,25 @@ func (suite *jobActionsTestSuite) TestJobReloadRuntimeJobNotFound() {
 			Return(nil, yarpcerrors.NotFoundErrorf("test error")),
 
 		suite.jobFactory.EXPECT().
-			GetJob(suite.jobID).
+			AddJob(suite.jobID).
 			Return(suite.cachedJob),
 
 		suite.cachedJob.EXPECT().
 			GetConfig(gomock.Any()).
 			Return(&job.JobConfig{
-				Type: job.JobType_BATCH,
+				Type: job.JobType_SERVICE,
 			}, nil),
 
 		suite.cachedJob.EXPECT().
-			GetAllTasks().
-			Return(taskMap),
-
-		suite.taskGoalStateEngine.EXPECT().
-			Delete(gomock.Any()),
+			Update(
+				gomock.Any(),
+				&job.JobInfo{Runtime: &job.RuntimeInfo{State: job.JobState_PENDING}},
+				nil,
+				cached.UpdateCacheAndDB).
+			Return(nil),
 
 		suite.jobGoalStateEngine.EXPECT().
-			Delete(gomock.Any()),
-
-		suite.jobFactory.EXPECT().
-			ClearJob(suite.jobID),
+			Enqueue(gomock.Any(), gomock.Any()),
 	)
 
 	suite.NoError(JobReloadRuntime(context.Background(), suite.jobEnt))
@@ -940,4 +963,71 @@ func (suite *jobActionsTestSuite) TestJobKillAndDeleteTerminatedJobWithRunningTa
 
 	err := JobKillAndDelete(context.Background(), suite.jobEnt)
 	suite.NoError(err)
+}
+
+// TestJobKillAndUntrackTerminatedJobWithNonTerminatedTasks tests untracks
+// a terminated job with tasks that may still be started
+func (suite *jobActionsTestSuite) TestJobKillAndUntrackTerminatedJobWithNonTerminatedTasks() {
+	instanceCount := uint32(2)
+	cachedTasks := make(map[uint32]cached.Task)
+	mockTasks := make(map[uint32]*cachedmocks.MockTask)
+	for i := uint32(0); i < instanceCount; i++ {
+		cachedTask := cachedmocks.NewMockTask(suite.ctrl)
+		mockTasks[i] = cachedTask
+		cachedTasks[i] = cachedTask
+	}
+
+	runtimes := make(map[uint32]*task.RuntimeInfo)
+	runtimes[0] = &task.RuntimeInfo{
+		State:     task.TaskState_FAILED,
+		GoalState: task.TaskState_RUNNING,
+	}
+	runtimes[1] = &task.RuntimeInfo{
+		State:     task.TaskState_FAILED,
+		GoalState: task.TaskState_RUNNING,
+	}
+
+	suite.jobFactory.EXPECT().
+		GetJob(suite.jobID).
+		Return(suite.cachedJob).
+		AnyTimes()
+
+	suite.cachedJob.EXPECT().
+		ID().
+		Return(suite.jobID).
+		AnyTimes()
+
+	suite.cachedJob.EXPECT().
+		GetAllTasks().
+		Return(cachedTasks).
+		AnyTimes()
+
+	for i := uint32(0); i < instanceCount; i++ {
+		mockTasks[i].EXPECT().
+			GetRuntime(gomock.Any()).
+			Return(runtimes[i], nil).
+			AnyTimes()
+	}
+
+	suite.cachedJob.EXPECT().
+		PatchTasks(gomock.Any(), gomock.Any()).
+		Return(nil)
+
+	suite.cachedJob.EXPECT().
+		GetConfig(gomock.Any()).
+		Return(&job.JobConfig{
+			Type: job.JobType_SERVICE,
+		}, nil)
+
+	// enough to verity JobRuntimeUpdater is called
+	suite.jobFactory.EXPECT().
+		AddJob(suite.jobID).
+		Return(suite.cachedJob)
+
+	suite.cachedJob.EXPECT().
+		GetRuntime(gomock.Any()).
+		Return(nil, errors.New("test error"))
+
+	err := JobKillAndUntrack(context.Background(), suite.jobEnt)
+	suite.Error(err)
 }

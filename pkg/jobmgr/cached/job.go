@@ -30,6 +30,7 @@ import (
 
 	"github.com/uber/peloton/pkg/common"
 	"github.com/uber/peloton/pkg/common/taskconfig"
+	"github.com/uber/peloton/pkg/common/util"
 	versionutil "github.com/uber/peloton/pkg/common/util/entityversion"
 	stringsutil "github.com/uber/peloton/pkg/common/util/strings"
 	jobmgrcommon "github.com/uber/peloton/pkg/jobmgr/common"
@@ -100,7 +101,11 @@ type Job interface {
 	// Create will be used to create the job configuration and runtime in DB.
 	// Create and Update need to be different functions as the backing
 	// storage calls are different.
-	Create(ctx context.Context, config *pbjob.JobConfig, configAddOn *models.ConfigAddOn, createBy string) error
+	Create(
+		ctx context.Context,
+		config *pbjob.JobConfig,
+		configAddOn *models.ConfigAddOn,
+	) error
 
 	// RollingCreate is used to create the job configuration and runtime in DB.
 	// It would create a workflow to manage the job creation, therefore the creation
@@ -111,7 +116,6 @@ type Job interface {
 		configAddOn *models.ConfigAddOn,
 		updateConfig *pbupdate.UpdateConfig,
 		opaqueData *peloton.OpaqueData,
-		createBy string,
 	) error
 
 	// Update updates job with the new runtime and config. If the request is to update
@@ -336,9 +340,9 @@ func (j *job) populateCurrentJobConfig(ctx context.Context) error {
 	if j.config == nil ||
 		j.config.GetChangeLog().GetVersion() !=
 			j.runtime.GetConfigurationVersion() {
-		config, _, err := j.jobFactory.jobStore.GetJobConfigWithVersion(
+		config, _, err := j.jobFactory.jobConfigOps.Get(
 			ctx,
-			j.ID().GetValue(),
+			j.ID(),
 			j.runtime.GetConfigurationVersion(),
 		)
 		if err != nil {
@@ -557,7 +561,11 @@ func (j *job) GetAllTasks() map[uint32]Task {
 	return taskMap
 }
 
-func (j *job) Create(ctx context.Context, config *pbjob.JobConfig, configAddOn *models.ConfigAddOn, createBy string) error {
+func (j *job) Create(
+	ctx context.Context,
+	config *pbjob.JobConfig,
+	configAddOn *models.ConfigAddOn,
+) error {
 	var runtimeCopy *pbjob.RuntimeInfo
 	var jobType pbjob.JobType
 	// notify listeners after dropping the lock
@@ -603,8 +611,7 @@ func (j *job) Create(ctx context.Context, config *pbjob.JobConfig, configAddOn *
 	}
 
 	// create job config
-	err := j.createJobConfig(ctx, config, configAddOn, createBy)
-	if err != nil {
+	if err := j.createJobConfig(ctx, config, configAddOn); err != nil {
 		j.invalidateCache()
 		return err
 	}
@@ -640,7 +647,6 @@ func (j *job) RollingCreate(
 	configAddOn *models.ConfigAddOn,
 	updateConfig *pbupdate.UpdateConfig,
 	opaqueData *peloton.OpaqueData,
-	createBy string,
 ) error {
 	var runtimeCopy *pbjob.RuntimeInfo
 	var jobType pbjob.JobType
@@ -729,7 +735,8 @@ func (j *job) RollingCreate(
 
 	// create the dummy config in db, it is possible that the dummy config already
 	// exists in db when doing error retry. So ignore already exist error here
-	if err := j.createJobConfig(ctx, dummyConfig, configAddOn, createBy); err != nil && yarpcerrors.IsAlreadyExists(errors.Cause(err)) {
+	if err := j.createJobConfig(ctx, dummyConfig, configAddOn); err != nil &&
+		!yarpcerrors.IsAlreadyExists(errors.Cause(err)) {
 		j.invalidateCache()
 		return err
 	}
@@ -739,7 +746,7 @@ func (j *job) RollingCreate(
 	// as created successfully, and should be able to recover from
 	// rest of the error. Calling RollingCreate after this call succeeds again,
 	// would result in AlreadyExist error
-	if err := j.createJobConfig(ctx, config, configAddOn, createBy); err != nil {
+	if err := j.createJobConfig(ctx, config, configAddOn); err != nil {
 		j.invalidateCache()
 		return err
 	}
@@ -783,8 +790,18 @@ func populateConfigChangeLog(config *pbjob.JobConfig) *pbjob.JobConfig {
 }
 
 // createJobConfig creates job config in db and cache
-func (j *job) createJobConfig(ctx context.Context, config *pbjob.JobConfig, configAddOn *models.ConfigAddOn, createBy string) error {
-	if err := j.jobFactory.jobStore.CreateJobConfig(ctx, j.id, config, configAddOn, config.ChangeLog.Version, createBy); err != nil {
+func (j *job) createJobConfig(
+	ctx context.Context,
+	config *pbjob.JobConfig,
+	configAddOn *models.ConfigAddOn,
+) error {
+	if err := j.jobFactory.jobConfigOps.Create(
+		ctx,
+		j.ID(),
+		config,
+		configAddOn,
+		config.ChangeLog.Version,
+	); err != nil {
 		return err
 	}
 	j.populateJobConfigCache(config)
@@ -930,8 +947,13 @@ func (j *job) compareAndSetConfig(ctx context.Context, config *pbjob.JobConfig, 
 	}
 
 	// write the config into DB
-	if err := j.jobFactory.jobStore.
-		UpdateJobConfig(ctx, j.ID(), updatedConfig, configAddOn); err != nil {
+	if err := j.jobFactory.jobConfigOps.Create(
+		ctx,
+		j.ID(),
+		updatedConfig,
+		configAddOn,
+		updatedConfig.GetChangeLog().GetVersion(),
+	); err != nil {
 		j.invalidateCache()
 		return nil, err
 	}
@@ -992,7 +1014,6 @@ func (j *job) Update(ctx context.Context, jobInfo *pbjob.JobInfo, configAddOn *m
 				}
 				return err
 			}
-
 			if updatedConfig != nil {
 				j.populateJobConfigCache(updatedConfig)
 			}
@@ -1019,8 +1040,15 @@ func (j *job) Update(ctx context.Context, jobInfo *pbjob.JobInfo, configAddOn *m
 		// config. If we update the runtime first successfully, and update
 		// config with failure, job would try to access a non-existent config.
 		if updatedConfig != nil {
-			err := j.jobFactory.jobStore.UpdateJobConfig(ctx, j.ID(), updatedConfig, configAddOn)
-			if err != nil {
+			// Create a new versioned, entry for job_config, so this is not
+			// an Update
+			if err := j.jobFactory.jobConfigOps.Create(
+				ctx,
+				j.ID(),
+				updatedConfig,
+				configAddOn,
+				updatedConfig.GetChangeLog().GetVersion(),
+			); err != nil {
 				j.invalidateCache()
 				return err
 			}
@@ -1061,7 +1089,18 @@ func (j *job) getUpdatedJobConfigCache(
 	req UpdateRequest) (*pbjob.JobConfig, error) {
 	if req == UpdateCacheAndDB {
 		if j.config == nil {
-			config, _, err := j.jobFactory.jobStore.GetJobConfig(ctx, j.ID().GetValue())
+			runtime, err := j.jobFactory.jobStore.GetJobRuntime(
+				ctx,
+				j.ID().GetValue(),
+			)
+			if err != nil {
+				return nil, err
+			}
+			config, _, err := j.jobFactory.jobConfigOps.Get(
+				ctx,
+				j.ID(),
+				runtime.GetConfigurationVersion(),
+			)
 			if err != nil {
 				return nil, err
 			}
@@ -1099,6 +1138,10 @@ func (j *job) validateAndMergeConfig(
 	}
 
 	newConfig := *config
+
+	// GetMaxJobConfigVersion should still go through legacy jobStore interface
+	// since ORM does not intend to support this. Once we remove CAS writes,
+	// this sort of concurrency control is not required
 	maxVersion, err := j.jobFactory.jobStore.GetMaxJobConfigVersion(ctx, j.id.GetValue())
 	if err != nil {
 		return nil, err
@@ -1263,7 +1306,7 @@ func (j *job) mergeRuntime(newRuntime *pbjob.RuntimeInfo) *pbjob.RuntimeInfo {
 		runtime.TaskStats = newRuntime.GetTaskStats()
 	}
 
-	if len(newRuntime.GetTaskStatsByConfigurationVersion()) > 0 {
+	if newRuntime.GetTaskStatsByConfigurationVersion() != nil {
 		runtime.TaskStatsByConfigurationVersion = newRuntime.GetTaskStatsByConfigurationVersion()
 	}
 
@@ -1503,9 +1546,65 @@ func (j *job) CreateWorkflow(
 		return nil, nil, err
 	}
 
+	if util.IsPelotonJobStateTerminal(j.runtime.GetGoalState()) &&
+		!util.IsPelotonJobStateTerminal(j.runtime.GetState()) &&
+		updateConfig.GetStartTasks() {
+		return nil,
+			nil,
+			yarpcerrors.AbortedErrorf("job is being terminated, cannot update with start_pods set now")
+	}
+
+	var currentUpdate *models.UpdateModel
+	var err error
+	if currentUpdate, err = j.getCurrentUpdate(ctx); err != nil {
+		return nil, nil, err
+	}
+
 	opts := &workflowOpts{}
 	for _, option := range options {
 		option.apply(opts)
+	}
+
+	if j.isWorkflowNoop(
+		ctx,
+		opts.prevJobConfig,
+		opts.jobConfig,
+		updateConfig,
+		workflowType,
+		currentUpdate,
+	) {
+		if opts.opaqueData.GetData() != currentUpdate.GetOpaqueData().GetData() {
+			// update workflow version first, so the change to opaque data would cause
+			// an entity version change.
+			// This is needed as user behavior may depend on opaque data, peloton needs to
+			// make sure user takes the correct action based on update-to-date opaque data.
+			j.runtime.WorkflowVersion++
+			newRuntime := j.mergeRuntime(&pbjob.RuntimeInfo{WorkflowVersion: j.runtime.GetWorkflowVersion()})
+			if err := j.jobFactory.jobStore.UpdateJobRuntime(ctx, j.id, newRuntime); err != nil {
+				j.invalidateCache()
+				return currentUpdate.GetUpdateID(),
+					nil,
+					errors.Wrap(err, "fail to update job runtime when create workflow")
+			}
+
+			// TODO: move this under update cache object
+			currentUpdate.OpaqueData = &peloton.OpaqueData{Data: opts.opaqueData.GetData()}
+			if err := j.
+				jobFactory.
+				updateStore.
+				ModifyUpdate(ctx, currentUpdate); err != nil {
+				return nil, nil, errors.Wrap(err, "fail to modify update opaque data")
+			}
+		}
+
+		// nothing changed, directly return
+		return currentUpdate.GetUpdateID(),
+			versionutil.GetJobEntityVersion(
+				j.runtime.GetConfigurationVersion(),
+				j.runtime.GetDesiredStateVersion(),
+				j.runtime.GetWorkflowVersion(),
+			),
+			nil
 	}
 
 	newConfig, err := j.compareAndSetConfig(ctx, opts.jobConfig, opts.configAddOn)
@@ -1572,6 +1671,97 @@ func (j *job) CreateWorkflow(
 		Debug("workflow is created")
 
 	return updateID, newEntityVersion, err
+}
+
+func (j *job) getCurrentUpdate(ctx context.Context) (*models.UpdateModel, error) {
+	if err := j.populateRuntime(ctx); err != nil {
+		return nil, err
+	}
+
+	if len(j.runtime.GetUpdateID().GetValue()) == 0 {
+		return nil, nil
+	}
+
+	return j.jobFactory.updateStore.GetUpdate(ctx, j.runtime.GetUpdateID())
+}
+
+// isWorkflowNoop checks if the new workflow to be created
+// is a noop and can be safely ignored.
+// The function checks if there is an active update
+// with the same job config and update config.
+func (j *job) isWorkflowNoop(
+	ctx context.Context,
+	prevJobConfig *pbjob.JobConfig,
+	targetJobConfig *pbjob.JobConfig,
+	updateConfig *pbupdate.UpdateConfig,
+	workflowType models.WorkflowType,
+	currentUpdate *models.UpdateModel,
+) bool {
+	if currentUpdate == nil {
+		return false
+	}
+
+	// only check for active update
+	if !IsUpdateStateActive(currentUpdate.GetState()) {
+		return false
+	}
+
+	if currentUpdate.GetType() != workflowType {
+		return false
+	}
+
+	if !isJobConfigEqual(prevJobConfig, targetJobConfig) {
+		return false
+	}
+
+	if !isUpdateConfigEqual(currentUpdate.GetUpdateConfig(), updateConfig) {
+		return false
+	}
+
+	return true
+}
+
+func isJobConfigEqual(
+	prevJobConfig *pbjob.JobConfig,
+	targetJobConfig *pbjob.JobConfig,
+) bool {
+	if prevJobConfig.GetInstanceCount() != targetJobConfig.GetInstanceCount() {
+		return false
+	}
+
+	if taskconfig.HasPelotonLabelsChanged(prevJobConfig.GetLabels(), targetJobConfig.GetLabels()) {
+		return false
+	}
+
+	for i := uint32(0); i < prevJobConfig.GetInstanceCount(); i++ {
+		prevTaskConfig := taskconfig.Merge(
+			prevJobConfig.GetDefaultConfig(),
+			prevJobConfig.GetInstanceConfig()[i])
+		targetTaskConfig := taskconfig.Merge(
+			targetJobConfig.GetDefaultConfig(),
+			targetJobConfig.GetInstanceConfig()[i])
+		if taskconfig.HasTaskConfigChanged(prevTaskConfig, targetTaskConfig) {
+			return false
+		}
+	}
+
+	prevJobConfigCopy := *prevJobConfig
+	targetJobConfigCopy := *targetJobConfig
+
+	prevJobConfigCopy.ChangeLog = nil
+	targetJobConfigCopy.ChangeLog = nil
+
+	prevJobConfigCopy.Labels = nil
+	targetJobConfigCopy.Labels = nil
+
+	return proto.Equal(&prevJobConfigCopy, &targetJobConfigCopy)
+}
+
+func isUpdateConfigEqual(
+	prevUpdateConfig *pbupdate.UpdateConfig,
+	targetUpdateConfig *pbupdate.UpdateConfig,
+) bool {
+	return proto.Equal(prevUpdateConfig, targetUpdateConfig)
 }
 
 func (j *job) PauseWorkflow(
@@ -1729,8 +1919,11 @@ func (j *job) RollbackWorkflow(ctx context.Context) error {
 	}
 
 	// get the old job config before the workflow is run
-	prevJobConfig, configAddOn, err := j.jobFactory.jobStore.
-		GetJobConfigWithVersion(ctx, j.id.GetValue(), currentWorkflow.GetState().JobVersion)
+	prevJobConfig, configAddOn, err := j.jobFactory.jobConfigOps.Get(
+		ctx,
+		j.ID(),
+		currentWorkflow.GetState().JobVersion,
+	)
 	if err != nil {
 		return errors.Wrap(err,
 			"failed to get job config to copy for workflow rolling back")
@@ -1745,8 +1938,11 @@ func (j *job) RollbackWorkflow(ctx context.Context) error {
 	}
 
 	// get the job config the workflow is targeted at before rollback
-	currentConfig, _, err := j.jobFactory.jobStore.
-		GetJobConfigWithVersion(ctx, j.id.GetValue(), currentWorkflow.GetGoalState().JobVersion)
+	currentConfig, _, err := j.jobFactory.jobConfigOps.Get(
+		ctx,
+		j.ID(),
+		currentWorkflow.GetGoalState().JobVersion,
+	)
 	if err != nil {
 		return errors.Wrap(err,
 			"failed to get current job config for workflow rolling back")
@@ -2180,17 +2376,22 @@ func (j *job) Delete(ctx context.Context) error {
 	// It is possible to receive a timeout error although the delete was
 	// successful. Hence, invalidate the cache irrespective of whether an error
 	// occurred or not
-	defer j.invalidateCache()
+	defer func() {
+		j.Lock()
+		defer j.Unlock()
+
+		j.invalidateCache()
+	}()
+
+	// delete from job_index
+	if err := j.jobFactory.jobIndexOps.Delete(ctx, j.ID()); err != nil {
+		return err
+	}
 
 	if err := j.jobFactory.jobStore.DeleteJob(
 		ctx,
 		j.ID().GetValue(),
 	); err != nil {
-		return err
-	}
-
-	// delete from job_index
-	if err := j.jobFactory.jobIndexOps.Delete(ctx, j.ID()); err != nil {
 		return err
 	}
 

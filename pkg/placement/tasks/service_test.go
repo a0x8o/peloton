@@ -23,6 +23,7 @@ import (
 	"github.com/golang/mock/gomock"
 	"github.com/stretchr/testify/assert"
 	"github.com/uber-go/tally"
+	"github.com/uber/peloton/.gen/mesos/v1"
 	"github.com/uber/peloton/.gen/peloton/api/v0/peloton"
 	"github.com/uber/peloton/.gen/peloton/private/resmgr"
 	"github.com/uber/peloton/.gen/peloton/private/resmgrsvc"
@@ -147,9 +148,10 @@ func TestTaskService_SetPlacements(t *testing.T) {
 	placements := []*resmgr.Placement{
 		{
 			Hostname: "hostname",
-			Tasks: []*peloton.TaskID{
+			TaskIDs: []*resmgr.Placement_Task{
 				{
-					Value: "taskid",
+					PelotonTaskID: &peloton.TaskID{Value: "taskid"},
+					MesosTaskID:   &mesos_v1.TaskID{Value: &[]string{"mesostaskid"}[0]},
 				},
 			},
 		},

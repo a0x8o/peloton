@@ -32,6 +32,7 @@ import (
 	"github.com/uber/peloton/pkg/jobmgr/cached"
 	"github.com/uber/peloton/pkg/jobmgr/task/launcher"
 	"github.com/uber/peloton/pkg/storage"
+	ormobjects "github.com/uber/peloton/pkg/storage/objects"
 
 	log "github.com/sirupsen/logrus"
 	"github.com/uber-go/tally"
@@ -139,6 +140,7 @@ func NewDriver(
 	taskStore storage.TaskStore,
 	volumeStore storage.PersistentVolumeStore,
 	updateStore storage.UpdateStore,
+	ormStore *ormobjects.Store,
 	jobFactory cached.JobFactory,
 	taskLauncher launcher.Launcher,
 	jobType job.JobType,
@@ -174,6 +176,8 @@ func NewDriver(
 		taskStore:                     taskStore,
 		volumeStore:                   volumeStore,
 		updateStore:                   updateStore,
+		jobConfigOps:                  ormobjects.NewJobConfigOps(ormStore),
+		jobIndexOps:                   ormobjects.NewJobIndexOps(ormStore),
 		jobFactory:                    jobFactory,
 		taskLauncher:                  taskLauncher,
 		mtx:                           NewMetrics(scope),
@@ -221,10 +225,12 @@ type driver struct {
 	resmgrClient  resmgrsvc.ResourceManagerServiceYARPCClient
 
 	// jobStore, taskStore and volumeStore are the objects to the storage interface.
-	jobStore    storage.JobStore
-	taskStore   storage.TaskStore
-	volumeStore storage.PersistentVolumeStore
-	updateStore storage.UpdateStore
+	jobStore     storage.JobStore
+	taskStore    storage.TaskStore
+	volumeStore  storage.PersistentVolumeStore
+	updateStore  storage.UpdateStore
+	jobConfigOps ormobjects.JobConfigOps // DB ops for job_config table
+	jobIndexOps  ormobjects.JobIndexOps  // DB ops for job_index table
 
 	// jobFactory is the in-memory cache object fpr jobs and tasks
 	jobFactory cached.JobFactory

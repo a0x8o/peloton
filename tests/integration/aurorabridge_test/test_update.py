@@ -6,13 +6,12 @@ from tests.integration.aurorabridge_test.util import (
     get_job_update_request,
     get_update_status,
     start_job_update,
-    wait_for_update_status,
     wait_for_rolled_forward,
+    wait_for_update_status,
 )
 
 pytestmark = [pytest.mark.default,
-              pytest.mark.aurorabridge,
-              pytest.mark.random_order(disabled=True)]
+              pytest.mark.aurorabridge]
 
 
 def test__start_job_update_with_pulse(client):
@@ -36,7 +35,7 @@ def test__start_job_update_revocable_job(client):
     """
     Given 12 non-revocable cpus, and 12 revocable cpus
     Create a non-revocable of 3 instance, with 3 CPU per instance
-    Create a revocable job of 2 instance, with 2 CPU per instance
+    Create a revocable job of 1 instance, with 4 CPU per instance
     """
     non_revocable_job = start_job_update(
         client,
@@ -51,19 +50,19 @@ def test__start_job_update_revocable_job(client):
     # Add some wait time for lucene index to build
     time.sleep(10)
 
+    # validate 1 revocable tasks are running
+    res = client.get_tasks_without_configs(api.TaskQuery(
+        jobKeys={revocable_job},
+        statuses={api.ScheduleStatus.RUNNING}
+    ))
+    assert len(res.tasks) == 1
+
     # validate 3 non-revocable tasks are running
     res = client.get_tasks_without_configs(api.TaskQuery(
         jobKeys={non_revocable_job},
         statuses={api.ScheduleStatus.RUNNING}
     ))
     assert len(res.tasks) == 3
-
-    # validate 2 revocable tasks are running
-    res = client.get_tasks_without_configs(api.TaskQuery(
-        jobKeys={revocable_job},
-        statuses={api.ScheduleStatus.RUNNING}
-    ))
-    assert len(res.tasks) == 2
 
 
 def test__failed_update(client):
@@ -178,3 +177,40 @@ def test__simple_update_with_diff(client):
     res = client.get_job_update_details(None, api.JobUpdateQuery(key=res.key))
     assert len(res.detailsList[0].updateEvents) > 0
     assert res.detailsList[0].instanceEvents is None
+
+
+@pytest.mark.skip("mesos task events are not acked correctly")
+def test__simple_update_with_restart_component(
+        client,
+        jobmgr,
+        resmgr,
+        hostmgr,
+        mesos_master):
+    """
+    Start an update, and restart jobmgr, resmgr, hostmgr & mesos master.
+    """
+    res = client.start_job_update(
+        get_job_update_request('test_dc_labrat_large_job.yaml'),
+        'start job update test/dc/labrat_large_job')
+
+    # wait for sometime for jobmgr goal state engine to kick-in
+    time.sleep(5)
+    jobmgr.restart()
+
+    # wait for sometime to enqueue gangs
+    time.sleep(5)
+
+    # clear any admission and queues
+    resmgr.restart()
+
+    # wait for sometime to acquire host lock
+    time.sleep(10)
+
+    # clear host `placing` lock
+    hostmgr.restart()
+    time.sleep(5)
+
+    # restart mesos master to jumble up host manager state
+    mesos_master.restart()
+
+    wait_for_rolled_forward(client, res.key)

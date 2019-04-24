@@ -5,18 +5,19 @@ from tests.integration.aurorabridge_test.client import api
 from tests.integration.aurorabridge_test.util import (
     get_job_update_request,
     start_job_update,
+    wait_for_auto_rolling_back,
     wait_for_rolled_back,
+    wait_for_rolled_forward,
+    wait_for_update_status,
     verify_events_sorted,
     verify_first_and_last_job_update_status,
     verify_task_config,
 )
 
 pytestmark = [pytest.mark.default,
-              pytest.mark.aurorabridge,
-              pytest.mark.random_order(disabled=True)]
+              pytest.mark.aurorabridge]
 
 
-@pytest.mark.skip(reason="pending host to task map fix at resmgr")
 def test__simple_auto_rolled_back(client):
     """
     Create a job, then issue a bad config update and validate
@@ -33,7 +34,7 @@ def test__simple_auto_rolled_back(client):
     res = client.start_job_update(
         get_job_update_request('test_dc_labrat_bad_config.yaml'),
         'rollout bad config')
-    wait_for_rolled_back(client, res.key)
+    wait_for_rolled_back(client, res.key, timeout_secs=150)
 
     # validate job is rolled back to previous config
     res = client.get_tasks_without_configs(api.TaskQuery(
@@ -52,11 +53,12 @@ def test__simple_auto_rolled_back(client):
                 assert r.ramMb == 128
             elif r.diskMb > 0:
                 assert r.diskMb == 128
+            elif r.namedPort:
+                assert r.namedPort in ["grpc", "http"]
             else:
                 assert False, 'unexpected resource {}'.format(r)
 
 
-@pytest.mark.skip(reason="succeeded job is not deleted")
 def test__job_create_manual_rollback(client):
     """
     Start a job update, and half-way to a manual rollback
@@ -142,3 +144,59 @@ def test__simple_manual_rollback(client):
     verify_task_config(client, job_key, {
         "test_key_1": "test_value_1",
         "test_key_2": "test_value_2"})  # rolled back to previous task config
+
+
+def test__abort_auto_rollback_and_update(client):
+    """
+    1. Create a job
+    2. Start a bad update, wait for auto-rollback to kick-in
+    3. Once auto-rollback starts, abort an update.
+    4. Do a new good update and all the instances should converge to the new config.
+    """
+    start_job_update(
+        client,
+        'test_dc_labrat_large_job.yaml',
+        'start job update test/dc/labrat_large_job')
+
+    # Add some wait time for lucene index to build
+    time.sleep(10)
+
+    res = client.start_job_update(
+        get_job_update_request('test_dc_labrat_large_job_bad_config.yaml'),
+        'rollout bad config',
+    )
+
+    # wait for auto-rollback to kick-in
+    wait_for_auto_rolling_back(client, res.key)
+
+    client.abort_job_update(res.key, 'abort update')
+    wait_for_update_status(
+        client,
+        res.key,
+        {api.JobUpdateStatus.ROLLING_BACK},
+        api.JobUpdateStatus.ABORTED,
+    )
+
+    new_config = get_job_update_request('test_dc_labrat_large_job_new_config.yaml')
+    res = client.start_job_update(
+        new_config,
+        'rollout good config',
+    )
+    # Sleep for a while so that update gets triggered.
+    time.sleep(5)
+    wait_for_rolled_forward(client, res.key)
+
+    res = client.get_tasks_without_configs(api.TaskQuery(
+        jobKeys={res.key.job},
+        statuses={api.ScheduleStatus.RUNNING}
+    ))
+    assert len(res.tasks) == 10
+
+    for t in res.tasks:
+        assert len(t.assignedTask.task.metadata) == 1
+        assert list(t.assignedTask.task.metadata)[0].key == \
+            list(new_config.taskConfig.metadata)[0].key
+        assert list(t.assignedTask.task.metadata)[0].value == \
+            list(new_config.taskConfig.metadata)[0].value
+
+        assert t.ancestorId
