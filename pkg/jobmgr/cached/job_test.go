@@ -3295,6 +3295,7 @@ func (suite *JobTestSuite) TestAbortWorkflowSuccess() {
 			Do(func(ctx context.Context, updateInfo *models.UpdateModel) {
 				suite.Equal(updateInfo.GetState(), pbupdate.State_ABORTED)
 				suite.Equal(updateInfo.GetOpaqueData().GetData(), opaque)
+				suite.NotEmpty(updateInfo.GetCompletionTime())
 			}).
 			Return(nil),
 	)
@@ -3397,6 +3398,7 @@ func (suite *JobTestSuite) TestAbortWorkflowNotExistInCacheSuccess() {
 			WriteUpdateProgress(gomock.Any(), gomock.Any()).
 			Do(func(ctx context.Context, updateInfo *models.UpdateModel) {
 				suite.Equal(updateInfo.GetState(), pbupdate.State_ABORTED)
+				suite.NotEmpty(updateInfo.GetCompletionTime())
 			}).
 			Return(nil),
 	)
@@ -4593,6 +4595,7 @@ func (suite *JobTestSuite) TestGetStateCount() {
 			State:     pbtask.TaskState_PENDING,
 			GoalState: pbtask.TaskState_SUCCEEDED,
 			Revision:  &peloton.ChangeLog{Version: 1},
+			Message:   "default",
 		},
 	}
 	taskInfos[1] = &pbtask.TaskInfo{
@@ -4600,26 +4603,32 @@ func (suite *JobTestSuite) TestGetStateCount() {
 			State:     pbtask.TaskState_PENDING,
 			GoalState: pbtask.TaskState_SUCCEEDED,
 			Revision:  &peloton.ChangeLog{Version: 1},
+			Message:   "default",
 		},
 	}
 
 	taskInfos[2] = &pbtask.TaskInfo{
 		Runtime: &pbtask.RuntimeInfo{
-			State:     pbtask.TaskState_INITIALIZED,
+			State:     pbtask.TaskState_KILLED,
 			GoalState: pbtask.TaskState_DELETED,
 			Revision:  &peloton.ChangeLog{Version: 1},
+			Message:   common.TaskThrottleMessage,
 		},
 	}
 
 	suite.job.ReplaceTasks(taskInfos, true)
+	suite.job.config = &cachedConfig{
+		jobType: pbjob.JobType_SERVICE,
+	}
 
-	stateCount := suite.job.GetStateCount()
+	stateCount, throttledTasks := suite.job.GetStateCount()
 	suite.Equal(
 		stateCount[pbtask.TaskState_PENDING][pbtask.TaskState_SUCCEEDED],
 		2)
 	suite.Equal(
-		stateCount[pbtask.TaskState_INITIALIZED][pbtask.TaskState_DELETED],
+		stateCount[pbtask.TaskState_KILLED][pbtask.TaskState_DELETED],
 		1)
+	suite.Equal(throttledTasks, 1)
 }
 
 // TestJobRollingCreateSuccess tests job

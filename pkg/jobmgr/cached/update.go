@@ -17,6 +17,7 @@ package cached
 import (
 	"context"
 	"sync"
+	"time"
 
 	pbjob "github.com/uber/peloton/.gen/peloton/api/v0/job"
 	"github.com/uber/peloton/.gen/peloton/api/v0/peloton"
@@ -477,17 +478,31 @@ func (u *update) writeProgress(
 		}
 	}
 
-	if err := u.jobFactory.updateStore.WriteUpdateProgress(
-		ctx,
-		&models.UpdateModel{
-			UpdateID:         u.id,
-			PrevState:        prevState,
-			State:            state,
-			InstancesDone:    uint32(len(instancesDone)),
-			InstancesFailed:  uint32(len(instancesFailed)),
-			InstancesCurrent: instancesCurrent,
-			OpaqueData:       opaqueData,
-		}); err != nil {
+	// no change in state, skip the update
+	if !u.updateStateChanged(
+		state,
+		prevState,
+		instancesDone,
+		instancesFailed,
+		instancesCurrent,
+	) {
+		return nil
+	}
+
+	updateModel := &models.UpdateModel{
+		UpdateID:         u.id,
+		PrevState:        prevState,
+		State:            state,
+		InstancesDone:    uint32(len(instancesDone)),
+		InstancesFailed:  uint32(len(instancesFailed)),
+		InstancesCurrent: instancesCurrent,
+		OpaqueData:       opaqueData,
+	}
+
+	if IsUpdateStateTerminal(state) {
+		updateModel.CompletionTime = time.Now().Format(time.RFC3339)
+	}
+	if err := u.jobFactory.updateStore.WriteUpdateProgress(ctx, updateModel); err != nil {
 		// clear the cache on DB error to avoid cache inconsistency
 		u.clearCache()
 		return err
@@ -510,6 +525,40 @@ func (u *update) writeProgress(
 	u.state = state
 	u.instancesDone = instancesDone
 	return nil
+}
+
+// returns if the new state changes compared with the in-memory state.
+// it is used to decide if update progress in db need to be updated,
+// so when in doubt, it would return true.
+func (u *update) updateStateChanged(
+	state pbupdate.State,
+	prevState pbupdate.State,
+	instancesDone []uint32,
+	instancesFailed []uint32,
+	instancesCurrent []uint32,
+) bool {
+	// cache is invalidated, when in doubt assume the state changed.
+	if u.state == pbupdate.State_INVALID {
+		return true
+	}
+
+	return state != u.state ||
+		prevState != u.prevState ||
+		!equalInstances(instancesCurrent, u.instancesCurrent) ||
+		!equalInstances(instancesDone, u.instancesDone) ||
+		!equalInstances(instancesFailed, u.instancesFailed)
+}
+
+// returns if the two lists of instances are the same
+func equalInstances(instances1 []uint32, instances2 []uint32) bool {
+	if len(instances1) != len(instances2) {
+		return false
+	}
+
+	// if the two instance list are equal, length of intersection
+	// should be the same as length of original list
+	intersect := util.IntersectSlice(instances1, instances2)
+	return len(intersect) == len(instances1)
 }
 
 func (u *update) Recover(ctx context.Context) error {

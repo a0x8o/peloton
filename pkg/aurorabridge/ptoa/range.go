@@ -21,18 +21,13 @@ import (
 )
 
 // NewRange converts peloton's instance id list to aurora's range
-func NewRange(
-	instanceIDRange []*pod.InstanceIDRange,
-) []*api.Range {
-
-	var ranges []*api.Range
-
+func NewRange(instanceIDRange []*pod.InstanceIDRange) []*api.Range {
+	ranges := make([]*api.Range, 0, len(instanceIDRange))
 	for _, instanceRange := range instanceIDRange {
 		ranges = append(ranges, &api.Range{
 			First: ptr.Int32(int32(instanceRange.GetFrom())),
 			Last:  ptr.Int32(int32(instanceRange.GetTo())),
 		})
 	}
-
 	return ranges
 }

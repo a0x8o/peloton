@@ -7,15 +7,16 @@ import os
 from filelock import FileLock
 
 from tests.integration.canary_test.util import (
-  setup_canary_cluster,
-  patch_job,
-  dump_job_stats,
-  read_job_spec,
-  RESPOOL_FILE_NAME,
-  MAX_RETRY_ATTEMPTS,
+    setup_canary_cluster,
+    patch_job,
+    dump_job_stats,
+    read_job_spec,
+    RESPOOL_FILE_NAME,
+    MAX_RETRY_ATTEMPTS,
 )
 from tests.integration.common import IntegrationTestConfig
 from tests.integration.stateless_job import StatelessJob
+
 log = logging.getLogger(__name__)
 
 # TEST_JOB_MAP_FILE contains the a map of which jobs are executed for this test.
@@ -30,7 +31,7 @@ JOB_IN_USE_FILE = "job_in_use.json"
 JOBS = "jobs.json"
 
 # FILE_LOCK is to syncronize multiple test runner processes for job distribution
-FILE_LOCK = FileLock('file.lock', timeout=600)
+FILE_LOCK = FileLock("file.lock", timeout=600)
 
 # jobs (dic):: job_name -> job_id
 pytest.jobs = {}
@@ -61,25 +62,18 @@ def canary_tester(request):
     # cleanup metadata files
     FILE_LOCK.acquire()
     try:
-        if os.path.exists(JOB_IN_USE_FILE) and \
-           len(read_from_file(JOB_IN_USE_FILE)) == 0:
+        if (
+            os.path.exists(JOB_IN_USE_FILE)
+            and len(read_from_file(JOB_IN_USE_FILE)) == 0
+        ):
             os.remove(TEST_JOB_MAP_FILE)
             os.remove(JOB_IN_USE_FILE)
             os.remove(JOBS)
             log.info("removed metadata")
-    except OSError as e:
-        log.info("clean up for metadata files failed: %s", e)
-        pass
+    except Exception as e:
+        log.info("error on canary setup cleanup: %s", e)
     finally:
         FILE_LOCK.release()
-
-
-@pytest.hookimpl(hookwrapper=True)
-def pytest_runtest_makereport(item, call):
-    global collect_metrics
-    outcome = yield
-    rep = outcome.get_result()
-    setattr(item, "rep_" + rep.when, rep)
 
 
 @pytest.fixture
@@ -94,20 +88,29 @@ def canary_job(request):
 
     FILE_LOCK.acquire()
     try:
-        # Test failed, dump job stats
-        if request.node.rep_call.failed:
-            log.info("failed test: %s", request.node.name)
-            dump_job_stats(job)
-
         pytest.job_in_use = read_from_file(JOB_IN_USE_FILE)
         del pytest.job_in_use[job_name]
         write_to_file(JOB_IN_USE_FILE, pytest.job_in_use)
 
-        log.info('restore job: %s, job_id: %s, after test: %s',
-                 job_name, job.job_id, request.node.name)
-        patch_job(job, read_job_spec(job_name+'.yaml'))
+        # Test failed, dump job stats
+        if request.node.rep_call.failed:
+            log.info("failed test: %s", request.node.name)
+            dump_job_stats(job)
+        else:
+            log.info('restore job: %s, job_id: %s, after test: %s',
+                     job_name, job.job_id, request.node.name)
+            patch_job(job, read_job_spec(job_name+'.yaml'))
     finally:
         FILE_LOCK.release()
+
+
+def pytest_runtest_setup(item):
+    """
+    fail subsequent tests if previous test failed
+    """
+    previousfailed = getattr(item.parent, "_previousfailed", None)
+    if previousfailed is not None:
+        pytest.xfail("previous test failed (%s)" % previousfailed.name)
 
 
 def get_unique_job(request):
@@ -127,26 +130,32 @@ def get_unique_job(request):
 
             for j in job_list:
                 test_name = request.node.name
-                id = test_name.split("[")[0] + '_' + j
+                id = test_name.split("[")[0] + "_" + j
 
                 # check if test && job are already matched
                 if id in pytest.test_job_map or j in pytest.job_in_use:
                     continue
 
-                pytest.test_job_map[id] = ''
-                pytest.job_in_use[j] = ''
+                pytest.test_job_map[id] = ""
+                pytest.job_in_use[j] = ""
 
                 write_to_file(TEST_JOB_MAP_FILE, pytest.test_job_map)
                 write_to_file(JOB_IN_USE_FILE, pytest.job_in_use)
 
-                log.info("test_job_mapping:: test_name: %s, map_id: %s", test_name, id)
+                log.info(
+                    "test_job_mapping:: test_name: %s, map_id: %s",
+                    test_name,
+                    id,
+                )
 
                 # create deep copy for job
                 job = StatelessJob(
                     job_id=pytest.jobs[j],
                     config=IntegrationTestConfig(
                         pool_file=RESPOOL_FILE_NAME,
-                        max_retry_attempts=MAX_RETRY_ATTEMPTS))
+                        max_retry_attempts=MAX_RETRY_ATTEMPTS,
+                    ),
+                )
                 break
         finally:
             FILE_LOCK.release()
@@ -165,7 +174,7 @@ def read_from_file(file_name):
     """
     FILE_LOCK.acquire()
     try:
-        with open(file_name, 'r') as file:
+        with open(file_name, "r") as file:
             return json.load(file)
     except (IOError, ValueError):
         return {}
@@ -180,12 +189,17 @@ def write_to_file(file_name, data):
     """
     FILE_LOCK.acquire()
     try:
-        with open(file_name, 'w+') as file:
+        with open(file_name, "w+") as file:
             try:
                 file.write(json.dumps(data))
             except ValueError as e:
-                log.info("error occurred on writing to file: %s, data: %s, \
-                         error: %s", file_name, data, e)
+                log.info(
+                    "error occurred on writing to file: %s, data: %s, \
+                         error: %s",
+                    file_name,
+                    data,
+                    e,
+                )
                 raise
     finally:
         FILE_LOCK.release()

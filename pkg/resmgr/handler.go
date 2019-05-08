@@ -594,6 +594,7 @@ func (h *ServiceHandler) returnFailedPlacement(
 		if err := rmTask.RequeueUnPlaced(reason); err != nil {
 			errs = multierror.Append(errs, err)
 		}
+		h.metrics.PlacementFailed.Inc(1)
 	}
 	return errs.ErrorOrNil()
 }
@@ -824,10 +825,11 @@ func (h *ServiceHandler) fillTaskEntry(task *rmtask.RMTask,
 ) *resmgrsvc.GetActiveTasksResponse_TaskEntry {
 	rmTaskState := task.GetCurrentState()
 	taskEntry := &resmgrsvc.GetActiveTasksResponse_TaskEntry{
-		TaskID:         task.Task().GetId().GetValue(),
+		TaskID:         task.Task().GetTaskId().GetValue(),
 		TaskState:      rmTaskState.State.String(),
 		Reason:         rmTaskState.Reason,
 		LastUpdateTime: rmTaskState.LastUpdateTime.String(),
+		Hostname:       task.Task().GetHostname(),
 	}
 	return taskEntry
 }

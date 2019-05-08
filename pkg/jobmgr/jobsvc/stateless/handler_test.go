@@ -131,6 +131,8 @@ func (suite *statelessHandlerTestSuite) SetupTest() {
 	suite.respoolClient = respoolmocks.NewMockResourceManagerYARPCClient(suite.ctrl)
 	suite.listJobsServer = statelesssvcmocks.NewMockJobServiceServiceListJobsYARPCServer(suite.ctrl)
 	suite.listPodsServer = statelesssvcmocks.NewMockJobServiceServiceListPodsYARPCServer(suite.ctrl)
+	suite.listJobsServer.EXPECT().Context().Return(context.Background()).AnyTimes()
+	suite.listPodsServer.EXPECT().Context().Return(context.Background()).AnyTimes()
 	suite.activeRMTasks = activermtaskmocks.NewMockActiveRMTasks(suite.ctrl)
 	suite.handler = &serviceHandler{
 		jobFactory:      suite.jobFactory,
@@ -1739,6 +1741,8 @@ func (suite *statelessHandlerTestSuite) TestListPodsSuccess() {
 			suite.Equal(task.GetStatus().GetPodId().GetValue(), tasks[1].MesosTaskId.GetValue())
 		}).Return(nil)
 
+	suite.listJobsServer.EXPECT().Context().Return(context.Background()).AnyTimes()
+
 	err := suite.handler.ListPods(
 		&statelesssvc.ListPodsRequest{
 			JobId: &v1alphapeloton.JobID{Value: testJobID},
@@ -1756,6 +1760,8 @@ func (suite *statelessHandlerTestSuite) TestListPodsTaskGetError() {
 			gomock.Any(),
 		).
 		Return(nil, fmt.Errorf("fake db error"))
+
+	suite.listJobsServer.EXPECT().Context().Return(context.Background()).AnyTimes()
 
 	err := suite.handler.ListPods(
 		&statelesssvc.ListPodsRequest{
@@ -1788,6 +1794,8 @@ func (suite *statelessHandlerTestSuite) TestListPodsSendError() {
 	suite.listPodsServer.EXPECT().
 		Send(gomock.Any()).
 		Return(fmt.Errorf("fake db error"))
+
+	suite.listJobsServer.EXPECT().Context().Return(context.Background()).AnyTimes()
 
 	err := suite.handler.ListPods(
 		&statelesssvc.ListPodsRequest{
@@ -1836,6 +1844,8 @@ func (suite *statelessHandlerTestSuite) TestListJobsSuccess() {
 		}).
 		Return(nil)
 
+	suite.listJobsServer.EXPECT().Context().Return(context.Background()).AnyTimes()
+
 	err := suite.handler.ListJobs(
 		&statelesssvc.ListJobsRequest{},
 		suite.listJobsServer,
@@ -1849,6 +1859,8 @@ func (suite *statelessHandlerTestSuite) TestListJobsGetSummaryDBError() {
 	suite.jobStore.EXPECT().
 		GetAllJobsInJobIndex(gomock.Any()).
 		Return(nil, fmt.Errorf("fake db error"))
+
+	suite.listJobsServer.EXPECT().Context().Return(context.Background()).AnyTimes()
 
 	err := suite.handler.ListJobs(
 		&statelesssvc.ListJobsRequest{},
@@ -1879,11 +1891,26 @@ func (suite *statelessHandlerTestSuite) TestListJobsGetUpdateError() {
 		GetUpdate(gomock.Any(), &peloton.UpdateID{Value: testUpdateID}).
 		Return(nil, fmt.Errorf("fake db error"))
 
+	suite.listJobsServer.EXPECT().
+		Send(gomock.Any()).
+		Do(func(resp *statelesssvc.ListJobsResponse) {
+			suite.Equal(1, len(resp.GetJobs()))
+			job := resp.GetJobs()[0]
+			suite.Equal("testjob", job.GetName())
+			suite.Equal(stateless.JobState_JOB_STATE_RUNNING, job.GetStatus().GetState())
+			suite.Equal(
+				stateless.WorkflowState_WORKFLOW_STATE_INVALID,
+				job.GetStatus().GetWorkflowStatus().GetState(),
+			)
+		}).
+		Return(nil)
+	suite.listJobsServer.EXPECT().Context().Return(context.Background()).AnyTimes()
+
 	err := suite.handler.ListJobs(
 		&statelesssvc.ListJobsRequest{},
 		suite.listJobsServer,
 	)
-	suite.Error(err)
+	suite.NoError(err)
 }
 
 // TestListJobsSendError tests getting an error during Send to
@@ -1914,6 +1941,8 @@ func (suite *statelessHandlerTestSuite) TestListJobsSendError() {
 	suite.listJobsServer.EXPECT().
 		Send(gomock.Any()).
 		Return(fmt.Errorf("fake db error"))
+
+	suite.listJobsServer.EXPECT().Context().Return(context.Background()).AnyTimes()
 
 	err := suite.handler.ListJobs(
 		&statelesssvc.ListJobsRequest{},

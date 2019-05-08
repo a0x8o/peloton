@@ -64,7 +64,6 @@ const (
 	// DB table names
 	activeJobsTable        = "active_jobs"
 	jobConfigTable         = "job_config"
-	jobNameToIDTable       = "job_name_to_id"
 	jobRuntimeTable        = "job_runtime"
 	jobIndexTable          = "job_index"
 	taskConfigTable        = "task_config"
@@ -105,6 +104,10 @@ const (
 	// _defaultPodEventsLimit is default number of pod events
 	// to read if not provided for jobID + instanceID
 	_defaultPodEventsLimit = 100
+
+	// Default context timeout for the method to cleanup old
+	// job updates from the storage
+	_jobUpdatesCleanupTimeout = 120 * time.Second
 )
 
 // Config is the config for cassandra Store
@@ -2789,8 +2792,14 @@ func (s *Store) CreateUpdate(
 
 	// best effort to clean up previous updates for the job
 	go func() {
-		if err := s.cleanupPreviousUpdatesForJob(
+		cleanupCtx, cleanupCancel := context.WithTimeout(
 			ctx,
+			_jobUpdatesCleanupTimeout,
+		)
+		defer cleanupCancel()
+
+		if err := s.cleanupPreviousUpdatesForJob(
+			cleanupCtx,
 			updateInfo.GetJobID()); err != nil {
 			log.WithError(err).
 				WithField("job_id", updateInfo.GetJobID().GetValue()).
@@ -3112,7 +3121,9 @@ func (s *Store) GetUpdate(ctx context.Context, id *peloton.UpdateID) (
 			CreationTime:         record.CreationTime.Format(time.RFC3339Nano),
 			UpdateTime:           record.UpdateTime.Format(time.RFC3339Nano),
 			OpaqueData:           &peloton.OpaqueData{Data: record.OpaqueData},
+			CompletionTime:       record.CompletionTime,
 		}
+
 		s.metrics.UpdateMetrics.UpdateGet.Inc(1)
 		return updateInfo, nil
 	}
@@ -3210,7 +3221,6 @@ func (s *Store) deleteJobConfigVersion(
 func (s *Store) WriteUpdateProgress(
 	ctx context.Context,
 	updateInfo *models.UpdateModel) error {
-
 	queryBuilder := s.DataStore.NewQuery()
 	stmt := queryBuilder.Update(updatesTable).
 		Set("update_state", updateInfo.GetState().String()).
@@ -3222,6 +3232,10 @@ func (s *Store) WriteUpdateProgress(
 
 	if updateInfo.GetOpaqueData() != nil {
 		stmt = stmt.Set("opaque_data", updateInfo.GetOpaqueData().GetData())
+	}
+
+	if len(updateInfo.GetCompletionTime()) != 0 {
+		stmt = stmt.Set("completion_time", updateInfo.GetCompletionTime())
 	}
 
 	stmt = stmt.Where(qb.Eq{"update_id": updateInfo.GetUpdateID().GetValue()})
@@ -3326,6 +3340,7 @@ func (s *Store) GetUpdateProgress(ctx context.Context, id *peloton.UpdateID) (
 			InstancesFailed:  uint32(record.InstancesFailed),
 			InstancesCurrent: record.GetProcessingInstances(),
 			UpdateTime:       record.UpdateTime.Format(time.RFC3339Nano),
+			CompletionTime:   record.CompletionTime,
 		}
 
 		s.metrics.UpdateMetrics.UpdateGetProgess.Inc(1)
@@ -3444,27 +3459,6 @@ func (s *Store) getJobSummaryFromResultMap(
 		}
 		summary.Id = &peloton.JobID{Value: id.String()}
 		if name, ok := value["name"].(string); ok {
-			if name == "" {
-				// In case of an older job, the "name" column is not populated
-				// in jobIndexTable. This is a rudimentary assumption,
-				// unfortunately because jobIndexTable doesn't have versioning.
-				// In this case, get summary from jobconfig
-				// and move on to the next job entry.
-				// TODO (adityacb): remove this code block when we
-				// start archiving older jobs and no longer hit this case.
-				summary, err := s.getJobSummaryFromConfig(ctx, summary.Id)
-				if err != nil {
-					// no need to throw error here, continue with the rest of
-					// the entries. This is most likely a partially created job
-					// that will be cleaned up by goalstate engine
-					log.WithError(err).
-						WithField("jobID", id.String()).
-						Info("failed to get summary from config")
-				} else {
-					summaryResults = append(summaryResults, summary)
-				}
-				continue
-			}
 			summary.Name = name
 		}
 		if runtimeInfo, ok := value["runtime_info"].(string); ok {
