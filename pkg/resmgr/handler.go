@@ -30,7 +30,6 @@ import (
 
 	"github.com/uber/peloton/pkg/common"
 	"github.com/uber/peloton/pkg/common/eventstream"
-	"github.com/uber/peloton/pkg/common/lifecycle"
 	"github.com/uber/peloton/pkg/common/queue"
 	"github.com/uber/peloton/pkg/common/statemachine"
 	"github.com/uber/peloton/pkg/common/util"
@@ -65,10 +64,6 @@ const _eventStreamBufferSize = 1000
 
 // ServiceHandler implements peloton.private.resmgr.ResourceManagerService
 type ServiceHandler struct {
-	// lifecycle manager
-	lifeCycle  lifecycle.LifeCycle
-	dispatcher *yarpc.Dispatcher
-
 	// the handler config
 	config Config
 
@@ -104,7 +99,6 @@ func NewServiceHandler(
 
 	var maxOffset uint64
 	handler := &ServiceHandler{
-		lifeCycle:   lifecycle.NewLifeCycle(),
 		metrics:     NewMetrics(parent.SubScope("resmgr")),
 		resPoolTree: tree,
 		placements: queue.NewQueue(
@@ -117,7 +111,6 @@ func NewServiceHandler(
 		maxOffset:       &maxOffset,
 		config:          conf,
 		scope:           parent,
-		dispatcher:      d,
 		eventStreamHandler: initEventStreamHandler(
 			d,
 			_eventStreamBufferSize,
@@ -125,29 +118,9 @@ func NewServiceHandler(
 		hostmgrClient: hostmgrClient,
 	}
 
+	d.Register(resmgrsvc.BuildResourceManagerServiceYARPCProcedures(handler))
+
 	return handler
-}
-
-// Start will start resource manager service handler.
-func (h *ServiceHandler) Start() error {
-	if !h.lifeCycle.Start() {
-		log.Warn("Resource manager handler is already started, no" +
-			" action will be performed")
-		return nil
-	}
-
-	log.Info("Registering the resource manager procedures")
-
-	h.dispatcher.Register(
-		resmgrsvc.BuildResourceManagerServiceYARPCProcedures(h),
-	)
-	return nil
-}
-
-// Stop will stop resource manager.
-func (h *ServiceHandler) Stop() error {
-	log.Debug("stop is no-op for resource manager handler")
-	return nil
 }
 
 func initEventStreamHandler(d *yarpc.Dispatcher, bufferSize int, parentScope tally.Scope) *eventstream.Handler {
@@ -400,15 +373,13 @@ func (h *ServiceHandler) requeueTask(
 	}
 	currentTaskState := rmTask.GetCurrentState().State
 
-	// If state is Launching, Launched or Running
+	// If state is Launched or Running
 	// replace the task in the tracker and requeue
 	if h.isTaskInTransitRunning(currentTaskState) {
 		return h.addTask(requeuedTask, respool)
 	}
 
-	// TASK should not be in any other state other then
-	// LAUNCHING, RUNNING or LAUNCHED
-	// Logging error if this happens.
+	// TASK should not be in any other state other than RUNNING or LAUNCHED
 	log.WithFields(log.Fields{
 		"task":              rmTask.Task().Id.Value,
 		"current_state":     currentTaskState.String(),
@@ -425,10 +396,9 @@ func (h *ServiceHandler) requeueTask(
 }
 
 // isTaskInTransitRunning return TRUE if the task state is in
-// LAUNCHING, RUNNING or LAUNCHED state else it returns FALSE
+// RUNNING or LAUNCHED state else it returns FALSE
 func (h *ServiceHandler) isTaskInTransitRunning(state t.TaskState) bool {
-	if state == t.TaskState_LAUNCHING ||
-		state == t.TaskState_LAUNCHED ||
+	if state == t.TaskState_LAUNCHED ||
 		state == t.TaskState_RUNNING {
 		return true
 	}
@@ -460,16 +430,22 @@ func (h *ServiceHandler) DequeueGangs(
 		for _, task := range gang.GetTasks() {
 			h.metrics.DequeueGangSuccess.Inc(1)
 
-			// Moving task to Placing state
+			// Moving task to Placing state or Reserved state
 			if h.rmTracker.GetTask(task.Id) != nil {
-				// Checking if placement backoff is enabled if yes add the
-				// backoff otherwise just dot he transition
-				if h.config.RmTaskConfig.EnablePlacementBackoff {
-					//Adding backoff
-					h.rmTracker.GetTask(task.Id).AddBackoff()
+				if task.ReadyForHostReservation {
+					err = h.rmTracker.GetTask(task.Id).TransitTo(
+						t.TaskState_RESERVED.String())
+				} else {
+					// Checking if placement backoff is enabled if yes add the
+					// backoff otherwise just do the transition
+					if h.config.RmTaskConfig.EnablePlacementBackoff {
+						//Adding backoff
+						h.rmTracker.GetTask(task.Id).AddBackoff()
+					}
+					err = h.rmTracker.GetTask(task.Id).TransitTo(
+						t.TaskState_PLACING.String())
 				}
-				err = h.rmTracker.GetTask(task.Id).TransitTo(
-					t.TaskState_PLACING.String())
+
 				if err != nil {
 					log.WithError(err).WithField(
 						"task_id", task.Id.Value).
@@ -521,7 +497,10 @@ func (h *ServiceHandler) SetPlacements(
 	for _, placement := range req.GetPlacements() {
 		newPlacement := h.transitTasksInPlacement(
 			placement,
-			t.TaskState_PLACING,
+			[]t.TaskState{
+				t.TaskState_PLACING,
+				t.TaskState_RESERVED,
+			},
 			t.TaskState_PLACED,
 			_reasonPlacementReceived)
 		h.rmTracker.SetPlacement(newPlacement)
@@ -673,7 +652,9 @@ func (h *ServiceHandler) GetPlacements(
 		}
 		placement := item.(*resmgr.Placement)
 		newPlacement := h.transitTasksInPlacement(placement,
-			t.TaskState_PLACED,
+			[]t.TaskState{
+				t.TaskState_PLACED,
+			},
 			t.TaskState_LAUNCHING,
 			_reasonDequeuedForLaunch)
 		placements = append(placements, newPlacement)
@@ -688,11 +669,11 @@ func (h *ServiceHandler) GetPlacements(
 }
 
 // transitTasksInPlacement transitions tasks to new state if the current state
-// matches the expected state. Those tasks which couldn't be transitioned are
+// matches the expected states. Those tasks which couldn't be transitioned are
 // removed from the placement. The will tried to place again in the next cycle.
 func (h *ServiceHandler) transitTasksInPlacement(
 	placement *resmgr.Placement,
-	expectedState t.TaskState,
+	expectedStates []t.TaskState,
 	newState t.TaskState,
 	reason string) *resmgr.Placement {
 	invalidTasks := make(map[string]*peloton.TaskID)
@@ -703,11 +684,12 @@ func (h *ServiceHandler) transitTasksInPlacement(
 			continue
 		}
 		state := rmTask.GetCurrentState().State
-		if state != expectedState {
+		if !util.ContainsTaskState(expectedStates, state) {
 			log.WithFields(log.Fields{
 				"task_id":        task.GetPelotonTaskID().GetValue(),
-				"expected_state": expectedState.String(),
+				"expected_state": expectedStates,
 				"actual_state":   state.String(),
+				"new_state":      newState.String(),
 			}).Error("Failed to transit tasks in placement: " +
 				"task is not in expected state")
 			invalidTasks[task.GetPelotonTaskID().GetValue()] = task.GetPelotonTaskID()
@@ -755,12 +737,14 @@ func (h *ServiceHandler) handleEvent(event *pb_eventstream.Event) {
 		return
 	}
 
+	mesosTask := event.GetMesosTaskStatus().GetTaskId().GetValue()
 	ptID, err := util.ParseTaskIDFromMesosTaskID(
-		*(event.MesosTaskStatus.TaskId.Value))
+		mesosTask,
+	)
 	if err != nil {
 		log.WithFields(log.Fields{
 			"event":         event,
-			"mesos_task_id": *(event.MesosTaskStatus.TaskId.Value),
+			"mesos_task_id": mesosTask,
 		}).Error("Could not parse mesos task ID")
 		return
 	}
@@ -769,19 +753,14 @@ func (h *ServiceHandler) handleEvent(event *pb_eventstream.Event) {
 		Value: ptID,
 	}
 	rmTask := h.rmTracker.GetTask(taskID)
-	if rmTask == nil {
-		return
+
+	if rmTask == nil ||
+		(rmTask.Task().GetTaskId().GetValue() != mesosTask) {
+		// It might be an orphan task event
+		rmTask = h.rmTracker.GetOrphanTask(mesosTask)
 	}
 
-	if *(rmTask.Task().TaskId.Value) !=
-		*(event.MesosTaskStatus.TaskId.Value) {
-		err = h.rmTracker.MarkItDone(taskID, event.GetMesosTaskStatus().GetTaskId().GetValue())
-		if err != nil {
-			log.WithField("event", event).WithError(err).Error(
-				"Error while marking task as done in tracker")
-			return
-		}
-
+	if rmTask == nil {
 		return
 	}
 

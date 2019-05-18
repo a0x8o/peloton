@@ -2061,7 +2061,7 @@ func (suite *CassandraStoreTestSuite) TestJobRuntime() {
 	suite.NoError(err)
 	idFound := false
 	for _, id := range jobIds {
-		if id == jobID {
+		if id.GetValue() == jobID.GetValue() {
 			idFound = true
 		}
 	}
@@ -2334,6 +2334,8 @@ func (suite *CassandraStoreTestSuite) TestUpdate() {
 			InstancesAdded:       instancesAdded,
 			Type:                 models.WorkflowType_UPDATE,
 			OpaqueData:           &peloton.OpaqueData{Data: opaque},
+			CreationTime:         time.Now().Format(time.RFC3339Nano),
+			UpdateTime:           time.Now().Format(time.RFC3339Nano),
 		},
 	))
 
@@ -2379,6 +2381,8 @@ func (suite *CassandraStoreTestSuite) TestUpdate() {
 			InstancesAdded:       instancesAdded,
 			Type:                 models.WorkflowType_UPDATE,
 			OpaqueData:           &peloton.OpaqueData{Data: opaque},
+			CreationTime:         time.Now().Format(time.RFC3339Nano),
+			UpdateTime:           time.Now().Format(time.RFC3339Nano),
 		},
 	)
 	suite.Error(err)
@@ -2443,6 +2447,7 @@ func (suite *CassandraStoreTestSuite) TestUpdate() {
 			InstancesFailed:  instancesFailed,
 			InstancesCurrent: instanceCurrent,
 			OpaqueData:       &peloton.OpaqueData{Data: opaqueNew},
+			UpdateTime:       time.Now().Format(time.RFC3339Nano),
 		},
 	)
 	suite.NoError(err)
@@ -2485,6 +2490,23 @@ func (suite *CassandraStoreTestSuite) TestUpdate() {
 	suite.Equal(updateInfo.GetInstancesDone(), instancesDone)
 	suite.Equal(updateInfo.GetInstancesFailed(), instancesFailed)
 	suite.Equal(updateInfo.GetInstancesCurrent(), instanceCurrent)
+
+	workflowEvents, err = store.GetWorkflowEvents(
+		context.Background(),
+		updateID,
+		0,
+		0,
+	)
+	suite.NoError(err)
+	suite.Equal(2, len(workflowEvents))
+
+	// Add ROLLING_FORWARD event again which will be dedupe
+	suite.NoError(store.AddWorkflowEvent(
+		context.Background(),
+		updateID,
+		0,
+		models.WorkflowType_UPDATE,
+		update.State_ROLLING_FORWARD))
 
 	workflowEvents, err = store.GetWorkflowEvents(
 		context.Background(),
@@ -2538,6 +2560,8 @@ func (suite *CassandraStoreTestSuite) TestUpdate() {
 				PrevJobConfigVersion: jobPrevVersion,
 				State:                state,
 				InstancesTotal:       instancesTotal,
+				CreationTime:         time.Now().Format(time.RFC3339Nano),
+				UpdateTime:           time.Now().Format(time.RFC3339Nano),
 			},
 		))
 	}
@@ -2566,6 +2590,8 @@ func (suite *CassandraStoreTestSuite) TestUpdate() {
 			InstancesTotal:       instancesTotal,
 			InstancesAdded:       instancesAdded,
 			Type:                 models.WorkflowType_UPDATE,
+			CreationTime:         time.Now().Format(time.RFC3339Nano),
+			UpdateTime:           time.Now().Format(time.RFC3339Nano),
 		},
 	))
 
@@ -2606,6 +2632,8 @@ func (suite *CassandraStoreTestSuite) TestUpdate() {
 			InstancesTotal:       instancesTotal,
 			InstancesRemoved:     instancesRemoved,
 			Type:                 models.WorkflowType_UPDATE,
+			CreationTime:         time.Now().Format(time.RFC3339Nano),
+			UpdateTime:           time.Now().Format(time.RFC3339Nano),
 		},
 	))
 
@@ -2713,6 +2741,8 @@ func (suite *CassandraStoreTestSuite) TestModifyUpdate() {
 			InstancesUpdated:     instancesUpdated,
 			InstancesAdded:       instancesAdded,
 			Type:                 models.WorkflowType_UPDATE,
+			CreationTime:         time.Now().Format(time.RFC3339Nano),
+			UpdateTime:           time.Now().Format(time.RFC3339Nano),
 		},
 	))
 
@@ -2738,6 +2768,7 @@ func (suite *CassandraStoreTestSuite) TestModifyUpdate() {
 			InstancesRemoved:     instancesAdded,
 			State:                update.State_ROLLING_BACKWARD,
 			PrevState:            state,
+			UpdateTime:           time.Now().Format(time.RFC3339Nano),
 		},
 	),
 	)
@@ -2762,6 +2793,21 @@ func (suite *CassandraStoreTestSuite) TestModifyUpdate() {
 		jobUpdateEvents[0].GetState())
 	suite.Equal(stateless.WorkflowState_WORKFLOW_STATE_INITIALIZED,
 		jobUpdateEvents[1].GetState())
+
+	// Add ROLLING_BACKWARD job update event again,
+	// which will be dedupe
+	suite.NoError(store.AddJobUpdateEvent(
+		context.Background(),
+		updateID,
+		models.WorkflowType_UPDATE,
+		update.State_ROLLING_BACKWARD,
+	))
+
+	jobUpdateEvents, err = store.GetJobUpdateEvents(
+		context.Background(),
+		updateID)
+	suite.NoError(err)
+	suite.Equal(2, len(jobUpdateEvents))
 
 	// delete update
 	suite.NoError(store.DeleteUpdate(
@@ -3073,7 +3119,7 @@ func (suite *CassandraStoreTestSuite) TestQueryTasks() {
 	// testing sorting by state
 	tasks, _, err = taskStore.QueryTasks(context.Background(), &jobID, &task.QuerySpec{
 		Pagination: &query.PaginationSpec{
-			Limit: 17,
+			Limit: jobConfig.InstanceCount,
 			OrderBy: []*query.OrderBy{
 				{
 					Order: query.OrderBy_DESC,
@@ -3092,7 +3138,7 @@ func (suite *CassandraStoreTestSuite) TestQueryTasks() {
 	// testing sorting by time
 	tasks, _, err = taskStore.QueryTasks(context.Background(), &jobID, &task.QuerySpec{
 		Pagination: &query.PaginationSpec{
-			Limit: 17,
+			Limit: jobConfig.InstanceCount,
 			OrderBy: []*query.OrderBy{
 				{
 					Order: query.OrderBy_DESC,

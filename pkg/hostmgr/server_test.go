@@ -29,6 +29,7 @@ import (
 	"github.com/uber/peloton/pkg/hostmgr/offer"
 	offer_mocks "github.com/uber/peloton/pkg/hostmgr/offer/mocks"
 	reconciler_mocks "github.com/uber/peloton/pkg/hostmgr/reconcile/mocks"
+	reserver_mocks "github.com/uber/peloton/pkg/hostmgr/reserver/mocks"
 
 	"github.com/golang/mock/gomock"
 	log "github.com/sirupsen/logrus"
@@ -63,8 +64,8 @@ type ServerTestSuite struct {
 
 	reconciler *reconciler_mocks.MockTaskReconciler
 	drainer    *host_mocks.MockDrainer
-
-	server *Server
+	reserver   *reserver_mocks.MockReserver
+	server     *Server
 }
 
 func (suite *ServerTestSuite) SetupTest() {
@@ -77,6 +78,7 @@ func (suite *ServerTestSuite) SetupTest() {
 	suite.reconciler = reconciler_mocks.NewMockTaskReconciler(suite.ctrl)
 	suite.recoveryHandler = recovery_mocks.NewMockRecoveryHandler(suite.ctrl)
 	suite.drainer = host_mocks.NewMockDrainer(suite.ctrl)
+	suite.reserver = reserver_mocks.NewMockReserver(suite.ctrl)
 
 	suite.server = &Server{
 		ID:   _ID,
@@ -92,6 +94,7 @@ func (suite *ServerTestSuite) SetupTest() {
 		mesosInbound:    suite.mInbound,
 		recoveryHandler: suite.recoveryHandler,
 		drainer:         suite.drainer,
+		reserver:        suite.reserver,
 		// Add outbound when we need it.
 
 		reconciler: suite.reconciler,
@@ -122,6 +125,7 @@ func (suite *ServerTestSuite) TestNewServer() {
 		suite.reconciler,
 		suite.recoveryHandler,
 		suite.drainer,
+		suite.reserver,
 	)
 	suite.ctrl.Finish()
 	suite.NotNil(s)
@@ -162,11 +166,13 @@ func (suite *ServerTestSuite) TestUnelectedNoOp() {
 func (suite *ServerTestSuite) TestUnelectedStopConnection() {
 	suite.server.elected.Store(false)
 	suite.server.handlersRunning.Store(false)
+
 	gomock.InOrder(
-		suite.mInbound.EXPECT().IsRunning().Return(true),
+		suite.mInbound.EXPECT().IsRunning().Return(true).AnyTimes(),
 		suite.mInbound.EXPECT().Stop(),
-		suite.mInbound.EXPECT().IsRunning().Return(false),
+		suite.mInbound.EXPECT().IsRunning().Return(false).AnyTimes(),
 	)
+
 	suite.server.ensureStateRound()
 	suite.ctrl.Finish()
 	suite.Zero(suite.server.currentBackoffNano.Load())
@@ -186,14 +192,16 @@ func (suite *ServerTestSuite) TestMesosDetectorHostPortError() {
 func (suite *ServerTestSuite) TestUnelectedStopHandler() {
 	suite.server.elected.Store(false)
 	suite.server.handlersRunning.Store(true)
+
 	gomock.InOrder(
-		suite.mInbound.EXPECT().IsRunning().Return(false),
+		suite.mInbound.EXPECT().IsRunning().Return(false).AnyTimes(),
 		suite.backgroundManager.EXPECT().Stop(),
 		suite.eventHandler.EXPECT().Stop(),
 		suite.recoveryHandler.EXPECT().Stop(),
 		suite.drainer.EXPECT().Stop(),
-		suite.mInbound.EXPECT().IsRunning().Return(false),
+		suite.reserver.EXPECT().Stop(),
 	)
+
 	suite.server.ensureStateRound()
 	suite.ctrl.Finish()
 	suite.Zero(suite.server.currentBackoffNano.Load())
@@ -205,15 +213,18 @@ func (suite *ServerTestSuite) TestUnelectedStopHandler() {
 func (suite *ServerTestSuite) TestUnelectedStopConnectionAndHandler() {
 	suite.server.elected.Store(false)
 	suite.server.handlersRunning.Store(true)
+
 	gomock.InOrder(
-		suite.mInbound.EXPECT().IsRunning().Return(true),
+		suite.mInbound.EXPECT().IsRunning().Return(true).AnyTimes(),
 		suite.mInbound.EXPECT().Stop(),
 		suite.backgroundManager.EXPECT().Stop(),
 		suite.eventHandler.EXPECT().Stop(),
 		suite.recoveryHandler.EXPECT().Stop(),
 		suite.drainer.EXPECT().Stop(),
-		suite.mInbound.EXPECT().IsRunning().Return(false),
+		suite.reserver.EXPECT().Stop(),
+		suite.mInbound.EXPECT().IsRunning().Return(false).AnyTimes(),
 	)
+
 	suite.server.ensureStateRound()
 	suite.ctrl.Finish()
 	suite.Zero(suite.server.currentBackoffNano.Load())
@@ -241,13 +252,14 @@ func (suite *ServerTestSuite) TestElectedRestartConnection() {
 	suite.server.handlersRunning.Store(true)
 	gomock.InOrder(
 		// Initial check for Mesos connection.
-		suite.mInbound.EXPECT().IsRunning().Return(false),
+		suite.mInbound.EXPECT().IsRunning().Return(false).AnyTimes(),
 
 		// Stop handlers.
 		suite.backgroundManager.EXPECT().Stop(),
 		suite.eventHandler.EXPECT().Stop(),
 		suite.recoveryHandler.EXPECT().Stop(),
 		suite.drainer.EXPECT().Stop(),
+		suite.reserver.EXPECT().Stop(),
 
 		// Detect leader and start loop successfully.
 		suite.detector.EXPECT().HostPort().Return(_hostPort),
@@ -258,15 +270,14 @@ func (suite *ServerTestSuite) TestElectedRestartConnection() {
 
 		// Connected, now start handlers.
 		suite.mInbound.EXPECT().IsRunning().Return(true),
+
 		// Triggers Explicit Reconciliation on Mesos Master re-election
 		suite.reconciler.EXPECT().SetExplicitReconcileTurn(true).Times(1),
 		suite.backgroundManager.EXPECT().Start(),
 		suite.eventHandler.EXPECT().Start(),
 		suite.recoveryHandler.EXPECT().Start(),
 		suite.drainer.EXPECT().Start(),
-
-		// Last check for connected, used in gauge reporting.
-		suite.mInbound.EXPECT().IsRunning().Return(true),
+		suite.reserver.EXPECT().Start(),
 	)
 	suite.server.ensureStateRound()
 	suite.ctrl.Finish()
@@ -279,15 +290,17 @@ func (suite *ServerTestSuite) TestElectedRestartConnection() {
 func (suite *ServerTestSuite) TestElectedRestartHandlers() {
 	suite.server.elected.Store(true)
 	suite.server.handlersRunning.Store(false)
+
 	gomock.InOrder(
-		suite.mInbound.EXPECT().IsRunning().Return(true).Times(2),
+		suite.mInbound.EXPECT().IsRunning().Return(true).Times(3),
 		suite.reconciler.EXPECT().SetExplicitReconcileTurn(true).Times(1),
 		suite.backgroundManager.EXPECT().Start(),
 		suite.eventHandler.EXPECT().Start(),
 		suite.recoveryHandler.EXPECT().Start(),
 		suite.drainer.EXPECT().Start(),
-		suite.mInbound.EXPECT().IsRunning().Return(true),
+		suite.reserver.EXPECT().Start(),
 	)
+
 	suite.server.ensureStateRound()
 	suite.ctrl.Finish()
 	suite.Zero(suite.server.currentBackoffNano.Load())
@@ -300,9 +313,10 @@ func (suite *ServerTestSuite) TestElectedRestartHandlers() {
 func (suite *ServerTestSuite) TestElectedRestartConnectionAndHandler() {
 	suite.server.elected.Store(true)
 	suite.server.handlersRunning.Store(false)
+
 	gomock.InOrder(
 		// Initial check for Mesos connection.
-		suite.mInbound.EXPECT().IsRunning().Return(false),
+		suite.mInbound.EXPECT().IsRunning().Return(false).AnyTimes(),
 
 		// Detect leader and start loop successfully.
 		suite.detector.EXPECT().HostPort().Return(_hostPort),
@@ -319,9 +333,7 @@ func (suite *ServerTestSuite) TestElectedRestartConnectionAndHandler() {
 		suite.eventHandler.EXPECT().Start(),
 		suite.recoveryHandler.EXPECT().Start(),
 		suite.drainer.EXPECT().Start(),
-
-		// Last check for connected, used in gauge reporting.
-		suite.mInbound.EXPECT().IsRunning().Return(true),
+		suite.reserver.EXPECT().Start(),
 	)
 	suite.server.ensureStateRound()
 	suite.ctrl.Finish()
@@ -338,32 +350,31 @@ func (suite *ServerTestSuite) TestBackoffOnMesosConnectFailure() {
 	lower := time.Now()
 	upper := lower.Add(suite.server.minBackoff * 2)
 
-	gomock.InOrder(
-		// Initial check for Mesos connection.
-		suite.mInbound.
-			EXPECT().
-			IsRunning().
-			Return(false),
+	// For stats gathering.
+	suite.mInbound.
+		EXPECT().
+		IsRunning().
+		Return(false).
+		Times(2)
 
-		// Detector returns a real host.
-		suite.detector.
-			EXPECT().
-			HostPort().
-			Return(_hostPort),
+	// Initial check for Mesos connection.
+	suite.mInbound.
+		EXPECT().
+		IsRunning().
+		Return(false)
 
-		// StartMesosLoop returns an error.
-		suite.mInbound.
-			EXPECT().
-			StartMesosLoop(context.Background(), gomock.Eq(_hostPort)).
-			Return(nil, errFoo),
+	// Detector returns a real host.
+	suite.detector.
+		EXPECT().
+		HostPort().
+		Return(_hostPort)
 
-		// For stats gathering.
-		suite.mInbound.
-			EXPECT().
-			IsRunning().
-			Return(false).
-			Times(2),
-	)
+	// StartMesosLoop returns an error.
+	suite.mInbound.
+		EXPECT().
+		StartMesosLoop(context.Background(), gomock.Eq(_hostPort)).
+		Return(nil, errFoo)
+
 	suite.server.ensureStateRound()
 	suite.ctrl.Finish()
 	suite.Equal(
@@ -385,32 +396,30 @@ func (suite *ServerTestSuite) TestDoubleBackoff() {
 		suite.server.minBackoff.Nanoseconds())
 	suite.server.backoffUntilNano.Store(now.UnixNano())
 
-	gomock.InOrder(
-		// Initial check for Mesos connection.
-		suite.mInbound.
-			EXPECT().
-			IsRunning().
-			Return(false),
+	// Initial check for Mesos connection.
+	suite.mInbound.
+		EXPECT().
+		IsRunning().
+		Return(false)
 
-		// Detector returns a real host.
-		suite.detector.
-			EXPECT().
-			HostPort().
-			Return(_hostPort),
+	// Detector returns a real host.
+	suite.detector.
+		EXPECT().
+		HostPort().
+		Return(_hostPort)
 
-		// StartMesosLoop returns an error.
-		suite.mInbound.
-			EXPECT().
-			StartMesosLoop(context.Background(), gomock.Eq(_hostPort)).
-			Return(nil, errFoo),
+	// StartMesosLoop returns an error.
+	suite.mInbound.
+		EXPECT().
+		StartMesosLoop(context.Background(), gomock.Eq(_hostPort)).
+		Return(nil, errFoo)
 
-		// For stats gathering.
-		suite.mInbound.
-			EXPECT().
-			IsRunning().
-			Return(false).
-			Times(2),
-	)
+	// For stats gathering.
+	suite.mInbound.
+		EXPECT().
+		IsRunning().
+		Return(false).
+		Times(2)
 	suite.server.ensureStateRound()
 	suite.ctrl.Finish()
 	suite.Equal(
@@ -432,32 +441,31 @@ func (suite *ServerTestSuite) TestMaxBackoff() {
 		suite.server.maxBackoff.Nanoseconds() - 1)
 	suite.server.backoffUntilNano.Store(now.UnixNano())
 
-	gomock.InOrder(
-		// Initial check for Mesos connection.
-		suite.mInbound.
-			EXPECT().
-			IsRunning().
-			Return(false),
+	// Initial check for Mesos connection.
+	suite.mInbound.
+		EXPECT().
+		IsRunning().
+		Return(false)
 
-		// Detector returns a real host.
-		suite.detector.
-			EXPECT().
-			HostPort().
-			Return(_hostPort),
+	// Detector returns a real host.
+	suite.detector.
+		EXPECT().
+		HostPort().
+		Return(_hostPort)
 
-		// StartMesosLoop returns an error.
-		suite.mInbound.
-			EXPECT().
-			StartMesosLoop(context.Background(), gomock.Eq(_hostPort)).
-			Return(nil, errFoo),
+	// StartMesosLoop returns an error.
+	suite.mInbound.
+		EXPECT().
+		StartMesosLoop(context.Background(), gomock.Eq(_hostPort)).
+		Return(nil, errFoo)
 
-		// For stats gathering.
-		suite.mInbound.
-			EXPECT().
-			IsRunning().
-			Return(false).
-			Times(2),
-	)
+	// For stats gathering.
+	suite.mInbound.
+		EXPECT().
+		IsRunning().
+		Return(false).
+		Times(2)
+
 	suite.server.ensureStateRound()
 	suite.ctrl.Finish()
 	suite.Equal(

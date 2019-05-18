@@ -29,6 +29,7 @@ import (
 	v1alphapod "github.com/uber/peloton/.gen/peloton/api/v1alpha/pod"
 	v1alphaquery "github.com/uber/peloton/.gen/peloton/api/v1alpha/query"
 	v1alpharespool "github.com/uber/peloton/.gen/peloton/api/v1alpha/respool"
+	"github.com/uber/peloton/.gen/peloton/private/jobmgrsvc"
 
 	jobmgrtask "github.com/uber/peloton/pkg/jobmgr/task"
 
@@ -60,9 +61,9 @@ const (
 
 // StatelessGetCacheAction get cache of stateless job
 func (c *Client) StatelessGetCacheAction(jobID string) error {
-	resp, err := c.statelessClient.GetJobCache(
+	resp, err := c.jobmgrClient.GetJobCache(
 		c.ctx,
-		&statelesssvc.GetJobCacheRequest{
+		&jobmgrsvc.GetJobCacheRequest{
 			JobId: &v1alphapeloton.JobID{Value: jobID},
 		})
 	if err != nil {
@@ -80,9 +81,9 @@ func (c *Client) StatelessGetCacheAction(jobID string) error {
 
 // StatelessRefreshAction refreshes a job
 func (c *Client) StatelessRefreshAction(jobID string) error {
-	resp, err := c.statelessClient.RefreshJob(
+	resp, err := c.jobmgrClient.RefreshJob(
 		c.ctx,
-		&statelesssvc.RefreshJobRequest{
+		&jobmgrsvc.RefreshJobRequest{
 			JobId: &v1alphapeloton.JobID{Value: jobID},
 		})
 	if err != nil {
@@ -285,8 +286,6 @@ func (c *Client) StatelessReplaceJobAction(
 	inPlace bool,
 	startPods bool,
 ) error {
-	// TODO: implement cli override check and get entity version
-	// form job after stateless.Get is ready
 	var jobSpec stateless.JobSpec
 
 	// read the job configuration
@@ -306,6 +305,29 @@ func (c *Client) StatelessReplaceJobAction(
 	if respoolID == nil {
 		return fmt.Errorf("unable to find resource pool ID for "+
 			":%s", respoolPath)
+	}
+
+	// Get the entity version if not provided as input.
+	// The assumption is that the customer has ensured that
+	// there is no other ongoing write API request going on.
+	// In case the entityversion changes between Get and Replace,
+	// then let the Replace request fail.
+	if len(entityVersion) == 0 {
+		getRequest := statelesssvc.GetJobRequest{
+			JobId: &v1alphapeloton.JobID{
+				Value: jobID,
+			},
+			SummaryOnly: true,
+		}
+
+		getResponse, err := c.statelessClient.GetJob(
+			c.ctx,
+			&getRequest)
+		if err != nil {
+			return err
+		}
+
+		entityVersion = getResponse.GetSummary().GetStatus().GetVersion().GetValue()
 	}
 
 	// set the resource pool id

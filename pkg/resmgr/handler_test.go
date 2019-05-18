@@ -200,6 +200,27 @@ func (s *HandlerTestSuite) TestEnqueueDequeueGangsOneResPool() {
 	s.assertTasksAdmitted(gangs)
 }
 
+func (s *HandlerTestSuite) TestDequeueGangsOnReservedTasks() {
+	gangs := make([]*resmgrsvc.Gang, 3)
+	gangs[0] = s.pendingGang0()
+	gangs[1] = s.reservingGang0()
+	gangs[2] = s.reservingGang1()
+
+	enqReq := &resmgrsvc.EnqueueGangsRequest{
+		ResPool: &peloton.ResourcePoolID{Value: "respool3"},
+		Gangs:   gangs,
+	}
+	node, err := s.resTree.Get(&peloton.ResourcePoolID{Value: "respool3"})
+	s.NoError(err)
+	node.SetNonSlackEntitlement(s.getEntitlement())
+	enqResp, err := s.handler.EnqueueGangs(s.context, enqReq)
+
+	s.NoError(err)
+	s.Nil(enqResp.GetError())
+
+	s.assertTasksAdmitted(gangs)
+}
+
 func (s *HandlerTestSuite) TestReEnqueueGangThatFailedPlacement() {
 	gangs := s.pendingGangs()
 	enqReq := &resmgrsvc.EnqueueGangsRequest{
@@ -253,7 +274,7 @@ func (s *HandlerTestSuite) TestReEnqueueGangThatFailedPlacementManyTimes() {
 	for _, gang := range gangs {
 		// we only have 1 task per gang
 		rmTask := s.handler.rmTracker.GetTask(gang.Tasks[0].Id)
-		s.EqualValues(rmTask.GetCurrentState().State, task.TaskState_PENDING)
+		s.EqualValues(task.TaskState_PENDING, rmTask.GetCurrentState().State)
 	}
 }
 
@@ -282,7 +303,8 @@ func (s *HandlerTestSuite) TestRequeue() {
 		task.TaskState_READY,
 		task.TaskState_PLACING,
 		task.TaskState_PLACED,
-		task.TaskState_LAUNCHING})
+		task.TaskState_LAUNCHING,
+		task.TaskState_LAUNCHED})
 
 	// Testing to see if we can send same task in the enqueue
 	// request then it should error out
@@ -294,8 +316,7 @@ func (s *HandlerTestSuite) TestRequeue() {
 		resmgrsvc.EnqueueGangsFailure_ENQUEUE_GANGS_FAILURE_ERROR_CODE_ALREADY_EXIST)
 
 	// Testing to see if we can send different Mesos taskID
-	// in the enqueue request then it should move task to
-	// ready state and ready queue
+	// in the enqueue request
 	uuidStr := "uuidstr-2"
 	jobID := "job1"
 	instance := 1
@@ -309,8 +330,6 @@ func (s *HandlerTestSuite) TestRequeue() {
 	s.NoError(err)
 	s.Nil(enqResp.GetError())
 	s.Nil(enqResp.GetError().GetFailure().GetFailed())
-
-	s.assertTasksAdmitted(gangs)
 }
 
 // TestRequeueTaskNotPresent tests the requeue but if the task is been
@@ -438,6 +457,7 @@ func (s *HandlerTestSuite) TestSetFailedPlacement() {
 	gang := s.pendingGang0()
 	gangs := []*resmgrsvc.Gang{gang}
 	ttask := gang.Tasks[0]
+	ttask.PlacementAttemptCount = 3 // Simulate all 3 placements fail in a cycle
 
 	// Add task to tracker and move to PLACED
 	s.rmTaskTracker.AddTask(
@@ -462,8 +482,8 @@ func (s *HandlerTestSuite) TestSetFailedPlacement() {
 		// we only have 1 task per gang
 		rmTask := s.handler.rmTracker.GetTask(gang.Tasks[0].Id)
 		s.EqualValues(
-			rmTask.GetCurrentState().State,
 			task.TaskState_PENDING,
+			rmTask.GetCurrentState().State,
 		)
 	}
 }
@@ -554,7 +574,9 @@ func (s *HandlerTestSuite) TestTransitTasksInPlacement() {
 	tracker.EXPECT().GetTask(gomock.Any()).Return(nil).Times(5)
 
 	p := s.handler.transitTasksInPlacement(placements[0],
-		task.TaskState_PLACED,
+		[]task.TaskState{
+			task.TaskState_PLACED,
+		},
 		task.TaskState_LAUNCHING,
 		"placement dequeued, waiting for launch")
 
@@ -594,7 +616,9 @@ func (s *HandlerTestSuite) TestTransitTasksInPlacement() {
 	tracker.EXPECT().GetTask(gomock.Any()).Return(rmTask).Times(5)
 	placements = s.getPlacements(10, 5)
 	p = s.handler.transitTasksInPlacement(placements[0],
-		task.TaskState_RUNNING,
+		[]task.TaskState{
+			task.TaskState_RUNNING,
+		},
 		task.TaskState_LAUNCHING,
 		"placement dequeued, waiting for launch")
 	s.EqualValues(len(p.Tasks), 0)
@@ -602,7 +626,9 @@ func (s *HandlerTestSuite) TestTransitTasksInPlacement() {
 	tracker.EXPECT().GetTask(gomock.Any()).Return(rmTask).Times(5)
 	placements = s.getPlacements(10, 5)
 	p = s.handler.transitTasksInPlacement(placements[0],
-		task.TaskState_PLACED,
+		[]task.TaskState{
+			task.TaskState_PLACED,
+		},
 		task.TaskState_RUNNING,
 		"placement dequeued, waiting for launch")
 	s.EqualValues(len(p.Tasks), 0)
@@ -934,6 +960,9 @@ func (s *HandlerTestSuite) TestHandleEventError() {
 	}
 
 	tracker.EXPECT().GetTask(gomock.Any()).Return(nil)
+	tracker.EXPECT().
+		GetOrphanTask(events[0].GetMesosTaskStatus().GetTaskId().GetValue()).
+		Return(nil)
 	response, _ = s.handler.NotifyTaskUpdates(context.Background(), req)
 
 	s.EqualValues(uint64(1000), response.PurgeOffset)
@@ -999,7 +1028,9 @@ func (s *HandlerTestSuite) TestHandleEventError() {
 	s.NoError(err)
 
 	tracker.EXPECT().GetTask(gomock.Any()).Return(wrmTask)
-	tracker.EXPECT().MarkItDone(gomock.Any(), gomock.Any()).Return(nil)
+	tracker.EXPECT().
+		GetOrphanTask(events[0].GetMesosTaskStatus().GetTaskId().GetValue()).
+		Return(nil)
 	response, _ = s.handler.NotifyTaskUpdates(context.Background(), req)
 	s.EqualValues(uint64(1000), response.PurgeOffset)
 	s.Nil(response.Error)
@@ -1656,6 +1687,68 @@ func (s *HandlerTestSuite) pendingGang2() *resmgrsvc.Gang {
 	return &gang
 }
 
+func (s *HandlerTestSuite) reservingGang0() *resmgrsvc.Gang {
+	var gang resmgrsvc.Gang
+	uuidStr := "uuidstr-10"
+	jobID := "job10"
+	instance := 1
+	mesosTaskID := fmt.Sprintf("%s-%d-%s", jobID, instance, uuidStr)
+	gang.Tasks = []*resmgr.Task{
+		{
+			Name:     "job10-1",
+			Priority: 0,
+			JobId:    &peloton.JobID{Value: "job10"},
+			Id:       &peloton.TaskID{Value: fmt.Sprintf("%s-%d", jobID, instance)},
+			Resource: &task.ResourceConfig{
+				CpuLimit:    1,
+				DiskLimitMb: 10,
+				GpuLimit:    0,
+				MemLimitMb:  100,
+			},
+			TaskId: &mesos_v1.TaskID{
+				Value: &mesosTaskID,
+			},
+			Preemptible:             true,
+			PlacementTimeoutSeconds: 60,
+			PlacementRetryCount:     3,
+			PlacementAttemptCount:   3,
+			ReadyForHostReservation: true,
+		},
+	}
+	return &gang
+}
+
+func (s *HandlerTestSuite) reservingGang1() *resmgrsvc.Gang {
+	var gang resmgrsvc.Gang
+	uuidStr := "uuidstr-11"
+	jobID := "job11"
+	instance := 1
+	mesosTaskID := fmt.Sprintf("%s-%d-%s", jobID, instance, uuidStr)
+	gang.Tasks = []*resmgr.Task{
+		{
+			Name:     "job11-1",
+			Priority: 0,
+			JobId:    &peloton.JobID{Value: "job11"},
+			Id:       &peloton.TaskID{Value: fmt.Sprintf("%s-%d", jobID, instance)},
+			Resource: &task.ResourceConfig{
+				CpuLimit:    1,
+				DiskLimitMb: 10,
+				GpuLimit:    0,
+				MemLimitMb:  100,
+			},
+			TaskId: &mesos_v1.TaskID{
+				Value: &mesosTaskID,
+			},
+			Preemptible:             true,
+			PlacementTimeoutSeconds: 60,
+			PlacementRetryCount:     3,
+			PlacementAttemptCount:   3,
+			ReadyForHostReservation: true,
+		},
+	}
+	return &gang
+}
+
 func (s *HandlerTestSuite) pendingGangWithoutPlacement() *resmgrsvc.Gang {
 	var gang resmgrsvc.Gang
 	uuidStr := "uuidstr-1"
@@ -1679,7 +1772,8 @@ func (s *HandlerTestSuite) pendingGangWithoutPlacement() *resmgrsvc.Gang {
 			},
 			Preemptible:             true,
 			PlacementTimeoutSeconds: 60,
-			PlacementRetryCount:     3,
+			PlacementRetryCount:     0,
+			PlacementAttemptCount:   2,
 		},
 	}
 	return &gang
@@ -1769,10 +1863,17 @@ func (s *HandlerTestSuite) assertTasksAdmitted(gangs []*resmgrsvc.Gang) {
 	for _, gang := range gangs {
 		// we only have 1 task per gang
 		rmTask := s.handler.rmTracker.GetTask(gang.Tasks[0].Id)
-		s.EqualValues(
-			rmTask.GetCurrentState().State,
-			task.TaskState_PLACING,
-		)
+		if rmTask.Task().ReadyForHostReservation {
+			s.EqualValues(
+				rmTask.GetCurrentState().State,
+				task.TaskState_RESERVED,
+			)
+		} else {
+			s.EqualValues(
+				rmTask.GetCurrentState().State,
+				task.TaskState_PLACING,
+			)
+		}
 	}
 }
 

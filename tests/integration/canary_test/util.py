@@ -4,7 +4,7 @@ import yaml
 import logging
 import pytest
 
-from tests.integration.stateless_job import query_jobs
+from tests.integration.stateless_job import get_job_from_job_name
 
 from google.protobuf import json_format
 from tests.integration.common import IntegrationTestConfig
@@ -28,8 +28,9 @@ def setup_canary_cluster():
     before test start.
     """
     log.info("boostrap canary tests")
-    active_jobs = get_active_jobs()
     desired_jobs = get_desired_jobs()
+    active_jobs = get_active_jobs(desired_jobs)
+
     log.info(
         "bootstraping canary tests:: active_jobs_count: %d, \
       desired_jobs_count: %s",
@@ -43,12 +44,16 @@ def setup_canary_cluster():
     return jobs
 
 
-def get_active_jobs():
+def get_active_jobs(desired_jobs):
     """
-    Queries active jobs in the cluster for provided resource pool.
+    Get active jobs in the cluster for provided resource pool.
     """
     jobs = {}
-    job_list = query_jobs(RESPOOL_PATH)
+    job_list = []
+    for job_name in desired_jobs.keys():
+        job = get_job_from_job_name(job_name)
+        if job is not None:
+            job_list.append(job)
 
     for j in job_list:
         jobs[j.get_spec().name] = j
@@ -82,7 +87,7 @@ def patch_jobs(active_jobs=None, desired_jobs=None):
 
             # failfast is not None then do not run canary test
             # until dirty jobs are restored manually.
-            if os.getenv('FAILFAST') is None:
+            if os.getenv("FAILFAST") == "NO":
                 # job exists -> update to desired state
                 patch_job(j, job_spec)
                 jobs[job_name] = j.get_job_id()

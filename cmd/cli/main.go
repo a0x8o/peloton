@@ -271,7 +271,7 @@ var (
 	statelessReplaceResPoolPath = statelessReplace.Arg("respool", "complete path of the "+
 		"resource pool starting from the root").Required().String()
 	statelessReplaceEntityVersion = statelessReplace.Arg("entityVersion",
-		"entity version for concurrency control").Required().String()
+		"entity version for concurrency control (uses the latest version if not provided)").String()
 	statelessReplaceOverride = statelessReplace.Flag("override",
 		"override the existing update").Default("false").Short('o').Bool()
 	statelessReplaceMaxInstanceRetries = statelessReplace.Flag(
@@ -477,6 +477,14 @@ var (
 	taskRestart               = task.Command("restart", "restart a task")
 	taskRestartJobName        = taskRestart.Arg("job", "job identifier").Required().String()
 	taskRestartInstanceRanges = taskRangeListFlag(taskRestart.Flag("range", "restart range of instances (specify multiple times) (from:to syntax, default ALL)").Default(":").Short('r'))
+
+	// Top level job manager state commmand
+	jobMgr              = app.Command("jobmgr", "fetch job manager state")
+	jobMgrThrottledPods = jobMgr.Command("throttled-pods", "(private only) fetch throttled pods in job manager cache")
+
+	jobMgrQueryJobCache       = jobMgr.Command("query-job-cache", "(private only) query jobs in cache")
+	jobMgrQueryJobCacheLabels = jobMgrQueryJobCache.Flag("labels", "labels").Default("").Short('l').String()
+	jobMgrQueryJobCacheName   = jobMgrQueryJobCache.Flag("name", "name of the job to return").Default("").Short('n').String()
 
 	// Top level resource manager state command
 	resMgr      = app.Command("resmgr", "fetch resource manager state")
@@ -829,6 +837,10 @@ func main() {
 		err = client.HostMaintenanceCompleteAction(*hostMaintenanceCompleteHostnames)
 	case hostQuery.FullCommand():
 		err = client.HostQueryAction(*hostQueryStates)
+	case jobMgrThrottledPods.FullCommand():
+		err = client.JobMgrGetThrottledPods()
+	case jobMgrQueryJobCache.FullCommand():
+		err = client.JobMgrQueryJobCache(*jobMgrQueryJobCacheLabels, *jobMgrQueryJobCacheName)
 	case resMgrActiveTasks.FullCommand():
 		err = client.ResMgrGetActiveTasks(*resMgrActiveTasksGetJobName, *resMgrActiveTasksGetRespoolID, *resMgrActiveTasksGetStates)
 	case resMgrPendingTasks.FullCommand():

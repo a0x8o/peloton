@@ -313,6 +313,7 @@ func main() {
 	}
 
 	authInboundMiddleware := inbound.NewAuthInboundMiddleware(securityManager)
+	yarpcMetricsMiddleware := &inbound.YAPRCMetricsInboundMiddleware{Scope: rootScope.SubScope("yarpc")}
 
 	securityClient, err := auth_impl.CreateNewSecurityClient(&cfg.Auth)
 	if err != nil {
@@ -321,6 +322,7 @@ func main() {
 	}
 
 	authOutboundMiddleware := outbound.NewAuthOutboundMiddleware(securityClient)
+	leaderCheckMiddleware := &inbound.LeaderCheckInboundMiddleware{}
 
 	dispatcher := yarpc.NewDispatcher(yarpc.Config{
 		Name:      common.PelotonResourceManager,
@@ -330,9 +332,9 @@ func main() {
 			Tally: rootScope,
 		},
 		InboundMiddleware: yarpc.InboundMiddleware{
-			Unary:  authInboundMiddleware,
-			Oneway: authInboundMiddleware,
-			Stream: authInboundMiddleware,
+			Unary:  yarpc.UnaryInboundMiddleware(authInboundMiddleware, leaderCheckMiddleware, yarpcMetricsMiddleware),
+			Oneway: yarpc.OnewayInboundMiddleware(authInboundMiddleware, leaderCheckMiddleware, yarpcMetricsMiddleware),
+			Stream: yarpc.StreamInboundMiddleware(authInboundMiddleware, leaderCheckMiddleware, yarpcMetricsMiddleware),
 		},
 		OutboundMiddleware: yarpc.OutboundMiddleware{
 			Unary:  authOutboundMiddleware,
@@ -355,7 +357,7 @@ func main() {
 		*cfg.ResManager.PreemptionConfig)
 
 	// Initialize resource pool service handlers
-	respoolHandler := respoolsvc.NewServiceHandler(
+	respoolsvc.InitServiceHandler(
 		dispatcher,
 		rootScope,
 		tree,
@@ -436,13 +438,13 @@ func main() {
 		cfg.ResManager.GRPCPort,
 		tree,
 		recoveryHandler,
-		serviceHandler,
-		respoolHandler,
 		calculator,
 		reconciler,
 		preemptor,
 		drainer,
 	)
+	// Set nomination for leader check middleware
+	leaderCheckMiddleware.SetNomination(server)
 
 	candidate, err := leader.NewCandidate(
 		cfg.Election,
@@ -464,6 +466,7 @@ func main() {
 	if err := dispatcher.Start(); err != nil {
 		log.Fatalf("Unable to start rpc server: %v", err)
 	}
+	defer dispatcher.Stop()
 
 	log.WithFields(log.Fields{
 		"http_port": cfg.ResManager.HTTPPort,

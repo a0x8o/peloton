@@ -95,6 +95,8 @@ const (
 	_defaultQueryLimit    uint32 = 10
 	_defaultQueryMaxLimit uint32 = 100
 
+	_defaultWorkflowEventsDedupeWarnLimit = 1000
+
 	_defaultActiveJobsShardID = 0
 
 	jobIndexTimeFormat        = "20060102150405"
@@ -2726,6 +2728,16 @@ func (s *Store) CreateUpdate(
 	ctx context.Context,
 	updateInfo *models.UpdateModel,
 ) error {
+	creationTime, err := time.Parse(time.RFC3339Nano, updateInfo.GetCreationTime())
+	if err != nil {
+		return errors.Wrap(yarpcerrors.InvalidArgumentErrorf(err.Error()), "fail to parse creationTime")
+	}
+
+	updateTime, err := time.Parse(time.RFC3339Nano, updateInfo.GetUpdateTime())
+	if err != nil {
+		return errors.Wrap(yarpcerrors.InvalidArgumentErrorf(err.Error()), "fail to parse updateTime")
+	}
+
 	updateConfigBuffer, err := proto.Marshal(updateInfo.GetUpdateConfig())
 	if err != nil {
 		log.WithError(err).
@@ -2757,7 +2769,8 @@ func (s *Store) CreateUpdate(
 			"job_config_version",
 			"job_config_prev_version",
 			"opaque_data",
-			"creation_time").
+			"creation_time",
+			"update_time").
 		Values(
 			updateInfo.GetUpdateID().GetValue(),
 			updateInfo.GetType().String(),
@@ -2775,7 +2788,8 @@ func (s *Store) CreateUpdate(
 			updateInfo.GetJobConfigVersion(),
 			updateInfo.GetPrevJobConfigVersion(),
 			updateInfo.GetOpaqueData().GetData(),
-			time.Now()).
+			creationTime.UTC(),
+			updateTime.UTC()).
 		IfNotExist()
 
 	if err := s.applyStatement(
@@ -2855,6 +2869,24 @@ func (s *Store) GetJobUpdateEvents(
 		return nil, err
 	}
 
+	workflowEvents := s.convertToWorkflowEvents(ctx, updateID, result)
+
+	s.metrics.UpdateMetrics.JobUpdateEventGet.Inc(1)
+	return workflowEvents, nil
+}
+
+// convertWorkflowEvents is a helper method to return workflow events slice
+// from Cassandra read result of workflow events.
+func (s *Store) convertToWorkflowEvents(
+	ctx context.Context,
+	updateID *peloton.UpdateID,
+	result []map[string]interface{},
+) []*stateless.WorkflowEvent {
+
+	var count int
+	var isLogged bool
+	prevWorkflowEvent := &stateless.WorkflowEvent{}
+
 	var workflowEvents []*stateless.WorkflowEvent
 	for _, value := range result {
 		workflowEvent := &stateless.WorkflowEvent{
@@ -2865,11 +2897,29 @@ func (s *Store) GetJobUpdateEvents(
 			Timestamp: value["create_time"].(qb.UUID).Time().Format(time.RFC3339),
 		}
 
-		workflowEvents = append(workflowEvents, workflowEvent)
+		if prevWorkflowEvent.GetState() != workflowEvent.GetState() {
+			workflowEvents = append(workflowEvents, workflowEvent)
+			count = 0
+			isLogged = false
+			prevWorkflowEvent = workflowEvent
+			continue
+		}
+
+		if prevWorkflowEvent.GetState() == workflowEvent.GetState() {
+			count++
+		}
+
+		if count > _defaultWorkflowEventsDedupeWarnLimit && !isLogged {
+			log.WithFields(log.Fields{
+				"workflow_state": workflowEvent.GetState().String(),
+				"workflow_type":  workflowEvent.GetType().String(),
+				"update_id":      updateID.GetValue(),
+			}).Warn("too many job workflow events in the same state")
+			isLogged = true
+		}
 	}
 
-	s.metrics.UpdateMetrics.JobUpdateEventGet.Inc(1)
-	return workflowEvents, nil
+	return workflowEvents
 }
 
 // deleteJobUpdateEvents deletes job update events for an update of a job
@@ -2944,18 +2994,7 @@ func (s *Store) GetWorkflowEvents(
 		return nil, err
 	}
 
-	var workflowEvents []*stateless.WorkflowEvent
-	for _, value := range result {
-		workflowEvent := &stateless.WorkflowEvent{
-			Type: stateless.WorkflowType(
-				models.WorkflowType_value[value["type"].(string)]),
-			State: stateless.WorkflowState(
-				update.State_value[value["state"].(string)]),
-			Timestamp: value["create_time"].(qb.UUID).Time().Format(time.RFC3339),
-		}
-
-		workflowEvents = append(workflowEvents, workflowEvent)
-	}
+	workflowEvents := s.convertToWorkflowEvents(ctx, updateID, result)
 
 	s.metrics.WorkflowMetrics.WorkflowEventsGet.Inc(1)
 	return workflowEvents, nil
@@ -3221,6 +3260,11 @@ func (s *Store) deleteJobConfigVersion(
 func (s *Store) WriteUpdateProgress(
 	ctx context.Context,
 	updateInfo *models.UpdateModel) error {
+	updateTime, err := time.Parse(time.RFC3339Nano, updateInfo.GetUpdateTime())
+	if err != nil {
+		return errors.Wrap(yarpcerrors.InvalidArgumentErrorf(err.Error()), "fail to parse updateTime")
+	}
+
 	queryBuilder := s.DataStore.NewQuery()
 	stmt := queryBuilder.Update(updatesTable).
 		Set("update_state", updateInfo.GetState().String()).
@@ -3228,7 +3272,7 @@ func (s *Store) WriteUpdateProgress(
 		Set("instances_done", updateInfo.GetInstancesDone()).
 		Set("instances_failed", updateInfo.GetInstancesFailed()).
 		Set("instances_current", updateInfo.GetInstancesCurrent()).
-		Set("update_time", time.Now().UTC())
+		Set("update_time", updateTime.UTC())
 
 	if updateInfo.GetOpaqueData() != nil {
 		stmt = stmt.Set("opaque_data", updateInfo.GetOpaqueData().GetData())
@@ -3265,6 +3309,10 @@ func (s *Store) WriteUpdateProgress(
 func (s *Store) ModifyUpdate(
 	ctx context.Context,
 	updateInfo *models.UpdateModel) error {
+	updateTime, err := time.Parse(time.RFC3339Nano, updateInfo.GetUpdateTime())
+	if err != nil {
+		return errors.Wrap(yarpcerrors.InvalidArgumentErrorf(err.Error()), "fail to parse updateTime")
+	}
 
 	queryBuilder := s.DataStore.NewQuery()
 	stmt := queryBuilder.Update(updatesTable).
@@ -3279,7 +3327,7 @@ func (s *Store) ModifyUpdate(
 		Set("instances_total", updateInfo.GetInstancesTotal()).
 		Set("job_config_version", updateInfo.GetJobConfigVersion()).
 		Set("job_config_prev_version", updateInfo.GetPrevJobConfigVersion()).
-		Set("update_time", time.Now().UTC())
+		Set("update_time", updateTime.UTC())
 
 	if updateInfo.GetOpaqueData() != nil {
 		stmt = stmt.Set("opaque_data", updateInfo.GetOpaqueData().GetData())

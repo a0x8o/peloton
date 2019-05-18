@@ -208,7 +208,6 @@ type HostMgrHandlerTestSuite struct {
 	handler                *ServiceHandler
 	frameworkID            *mesos.FrameworkID
 	mesosDetector          *hostmgr_mesos_mocks.MockMasterDetector
-	reserver               reserver.Reserver
 	maintenanceQueue       *qm.MockMaintenanceQueue
 	drainingMachines       []*mesos.MachineID
 	downMachines           []*mesos.MachineID
@@ -613,7 +612,7 @@ func (suite *HostMgrHandlerTestSuite) TestAcquireReleaseHostOffers() {
 		&hostsvc.AcquireHostOffersRequest{},
 	)
 
-	suite.NoError(err)
+	suite.Error(err)
 	suite.NotNil(acquiredResp.GetError().GetInvalidHostFilter())
 
 	suite.Equal(
@@ -635,6 +634,7 @@ func (suite *HostMgrHandlerTestSuite) TestAcquireReleaseHostOffers() {
 			},
 		},
 	}
+
 	acquiredResp, err = suite.handler.AcquireHostOffers(
 		rootCtx,
 		acquireReq,
@@ -743,7 +743,7 @@ func (suite *HostMgrHandlerTestSuite) TestAcquireAndLaunch() {
 		launchReq,
 	)
 
-	suite.NoError(err)
+	suite.Error(err)
 	suite.NotNil(launchResp.GetError().GetInvalidArgument())
 
 	suite.Equal(
@@ -1165,7 +1165,7 @@ func (suite *HostMgrHandlerTestSuite) TestShutdownExecutorsFailure() {
 		suite.Equal(len(shutdownReq.GetExecutors()), tt.numExecutors)
 
 		if !tt.shutdownCall {
-			suite.Equal(resp.GetError().GetInvalidExecutors().Message, tt.errMsg)
+			suite.Contains(resp.GetError().GetInvalidExecutors().Message, tt.errMsg)
 		} else if tt.shutdownCall && len(tt.errMsg) > 0 {
 			suite.NotNil(resp.GetError().GetShutdownFailure())
 			suite.Equal(
@@ -2078,7 +2078,7 @@ func (suite *HostMgrHandlerTestSuite) TestGetMesosMasterHostPort() {
 	suite.mesosDetector.EXPECT().HostPort().Return("")
 	mesosMasterHostPortResponse, err := suite.handler.GetMesosMasterHostPort(context.Background(), &hostsvc.MesosMasterHostPortRequest{})
 	suite.NotNil(err)
-	suite.Equal(err.Error(), "unable to fetch leader mesos master hostname & port")
+	suite.Contains(err.Error(), "unable to fetch leader mesos master hostname & port")
 
 	suite.mesosDetector.EXPECT().HostPort().Return("master:5050")
 	mesosMasterHostPortResponse, err = suite.handler.GetMesosMasterHostPort(context.Background(), &hostsvc.MesosMasterHostPortRequest{})
@@ -2425,7 +2425,7 @@ func (suite *HostMgrHandlerTestSuite) TestGetHostsInvalidFilters() {
 		rootCtx,
 		acquireReq,
 	)
-	suite.NoError(err)
+	suite.Error(err)
 	// It should return error
 	suite.NotNil(acquiredResp.GetError())
 	// Error message should be compared if that's the right error
@@ -2454,7 +2454,7 @@ func (suite *HostMgrHandlerTestSuite) TestGetHostsInvalidFilters() {
 		acquireReq,
 	)
 
-	suite.NoError(err)
+	suite.Error(err)
 	// It should return error
 	suite.NotNil(acquiredResp.GetError())
 	// Error message should be compared if that's the right error
@@ -2544,6 +2544,8 @@ func (suite *HostMgrHandlerTestSuite) TestGetCompletedReservations() {
 	reservations, err := handler.GetCompletedReservations(
 		context.Background(),
 		&hostsvc.GetCompletedReservationRequest{})
+
+	suite.Equal(mockReserver, handler.GetReserver())
 	suite.NoError(err)
 	suite.NotNil(reservations.CompletedReservations)
 	suite.Equal(len(reservations.CompletedReservations), 1)
@@ -2561,6 +2563,8 @@ func (suite *HostMgrHandlerTestSuite) TestGetCompletedReservationsError() {
 		Return(nil, errors.New("error"))
 	reservations, err := handler.GetCompletedReservations(context.Background(),
 		&hostsvc.GetCompletedReservationRequest{})
+
+	suite.Equal(mockReserver, handler.GetReserver())
 	suite.NoError(err)
 	suite.Nil(reservations.CompletedReservations)
 	suite.Equal(reservations.GetError().GetNotFound().Message, "error")
@@ -2696,7 +2700,7 @@ func (suite *HostMgrHandlerTestSuite) TestLaunchTasksInvalidOfferError() {
 			rootCtx,
 			t.req,
 		)
-		suite.NoError(err, t.test)
+		suite.Error(err, t.test)
 		suite.NotNil(launchResp.GetError().GetInvalidOffers(), t.test)
 		suite.Equal(
 			t.err.GetMessage(),
@@ -2765,11 +2769,12 @@ func (suite *HostMgrHandlerTestSuite) TestLaunchTasksInvalidArgError() {
 			rootCtx,
 			t.req,
 		)
-		suite.NoError(err, t.test)
+		suite.Error(err, t.test)
 		suite.NotNil(launchResp.GetError().GetInvalidArgument(), t.test)
-		suite.Equal(
+		suite.Contains(
+			launchResp.GetError().GetInvalidArgument().GetMessage(),
 			t.err.GetMessage(),
-			launchResp.GetError().GetInvalidArgument().GetMessage(), t.test)
+			t.test)
 	}
 }
 
@@ -2802,7 +2807,7 @@ func (suite *HostMgrHandlerTestSuite) TestLaunchTasksSchedulerError() {
 		},
 	)
 
-	suite.NoError(err)
+	suite.Error(err)
 	suite.NotNil(launchResp.GetError().GetLaunchFailure())
 	suite.Equal(
 		launchResp.GetError().GetLaunchFailure().GetMessage(),
@@ -2915,5 +2920,27 @@ func (suite *HostMgrHandlerTestSuite) TestGetMesosAgentInfo() {
 		} else {
 			suite.Equal(tc.err, resp.GetError(), tc.name)
 		}
+	}
+}
+
+// Test toHostStatus to convert HostStatus to string
+func (suite *HostMgrHandlerTestSuite) TestToHostStatus() {
+	statuses := []summary.HostStatus{
+		summary.ReadyHost,
+		summary.PlacingHost,
+		summary.ReservedHost,
+		summary.HeldHost,
+		100,
+	}
+	expectedStatuses := []string{
+		"ready",
+		"placing",
+		"reserved",
+		"held",
+		"unknown",
+	}
+
+	for i, status := range statuses {
+		suite.Equal(expectedStatuses[i], toHostStatus(status))
 	}
 }

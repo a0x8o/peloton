@@ -28,6 +28,7 @@ import (
 	"github.com/uber/peloton/pkg/hostmgr/metrics"
 	"github.com/uber/peloton/pkg/hostmgr/offer"
 	"github.com/uber/peloton/pkg/hostmgr/reconcile"
+	"github.com/uber/peloton/pkg/hostmgr/reserver"
 
 	log "github.com/sirupsen/logrus"
 	"github.com/uber-go/tally"
@@ -69,9 +70,14 @@ type Server struct {
 	elected         atomic.Bool
 	handlersRunning atomic.Bool
 
+	// isLeader is set once leadership callback completes
+	isLeader bool
+
 	recoveryHandler RecoveryHandler
 
 	drainer host.Drainer
+
+	reserver reserver.Reserver
 
 	metrics *metrics.Metrics
 
@@ -89,7 +95,8 @@ func NewServer(
 	mesosOutbound transport.Outbounds,
 	reconciler reconcile.TaskReconciler,
 	recoveryHandler RecoveryHandler,
-	drainer host.Drainer) *Server {
+	drainer host.Drainer,
+	reserver reserver.Reserver) *Server {
 
 	s := &Server{
 		ID:                   leader.NewID(httpPort, grpcPort),
@@ -104,6 +111,7 @@ func NewServer(
 		maxBackoff:           _maxBackoff,
 		recoveryHandler:      recoveryHandler,
 		drainer:              drainer,
+		reserver:             reserver,
 		metrics:              metrics.NewMetrics(parent),
 	}
 	log.Info("Hostmgr server started.")
@@ -124,23 +132,47 @@ func (s *Server) Stop() {
 // GainedLeadershipCallback is the callback when the current node
 // becomes the leader
 func (s *Server) GainedLeadershipCallback() error {
+	s.Lock()
+	defer s.Unlock()
+
 	log.WithFields(log.Fields{"role": s.role}).Info("Gained leadership")
 	s.elected.Store(true)
+	s.isLeader = true
+
 	return nil
 }
 
 // LostLeadershipCallback is the callback when the current node lost
 // leadership
 func (s *Server) LostLeadershipCallback() error {
+	s.Lock()
+	defer s.Unlock()
+
 	log.WithField("role", s.role).Info("Lost leadership")
 	s.elected.Store(false)
+	s.isLeader = false
+
 	return nil
+}
+
+// HasGainedLeadership returns true iff once GainedLeadershipCallback
+// completes
+func (s *Server) HasGainedLeadership() bool {
+	s.Lock()
+	defer s.Unlock()
+
+	return s.isLeader
 }
 
 // ShutDownCallback is the callback to shut down gracefully if possible.
 func (s *Server) ShutDownCallback() error {
+	s.Lock()
+	defer s.Unlock()
+
 	log.WithFields(log.Fields{"role": s.role}).Info("Quitting election")
 	s.elected.Store(false)
+	s.isLeader = false
+
 	return nil
 }
 
@@ -246,16 +278,16 @@ func (s *Server) ensureStopped() {
 // This function ensures desire states based on whether current
 // server is elected, and whether actively connected to Mesos.
 func (s *Server) ensureStateRound() {
+	// Update metrics
+	s.metrics.Elected.Update(btof(s.elected.Load()))
+	s.metrics.MesosConnected.Update(btof(s.mesosInbound.IsRunning()))
+	s.metrics.HandlersRunning.Update(btof(s.handlersRunning.Load()))
+
 	if !s.elected.Load() {
 		s.ensureStopped()
 	} else {
 		s.ensureRunning()
 	}
-
-	// Update metrics
-	s.metrics.Elected.Update(btof(s.elected.Load()))
-	s.metrics.MesosConnected.Update(btof(s.mesosInbound.IsRunning()))
-	s.metrics.HandlersRunning.Update(btof(s.handlersRunning.Load()))
 }
 
 func (s *Server) stopHandlers() {
@@ -269,6 +301,7 @@ func (s *Server) stopHandlers() {
 		s.getOfferEventHandler().Stop()
 		s.recoveryHandler.Stop()
 		s.drainer.Stop()
+		s.reserver.Stop()
 	}
 }
 
@@ -286,6 +319,7 @@ func (s *Server) startHandlers() {
 		s.getOfferEventHandler().Start()
 		s.recoveryHandler.Start()
 		s.drainer.Start()
+		s.reserver.Start()
 	}
 }
 

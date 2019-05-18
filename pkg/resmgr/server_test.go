@@ -70,33 +70,10 @@ func TestServer_GainedLeadershipCallback(t *testing.T) {
 		},
 		{
 			s: &Server{
-				role:            "testResMgr",
-				metrics:         NewMetrics(tally.NoopScope),
-				resTree:         &FakeServerProcess{nil},
-				recoveryHandler: &FakeServerProcess{nil},
-				resMgrHandler:   &FakeServerProcess{errFake},
-			},
-			wantErr: errFake,
-		},
-		{
-			s: &Server{
-				role:            "testResMgr",
-				metrics:         NewMetrics(tally.NoopScope),
-				resTree:         &FakeServerProcess{nil},
-				recoveryHandler: &FakeServerProcess{nil},
-				resMgrHandler:   &FakeServerProcess{nil},
-				resPoolHandler:  &FakeServerProcess{errFake},
-			},
-			wantErr: errFake,
-		},
-		{
-			s: &Server{
 				role:                  "testResMgr",
 				metrics:               NewMetrics(tally.NoopScope),
 				resTree:               &FakeServerProcess{nil},
 				recoveryHandler:       &FakeServerProcess{nil},
-				resMgrHandler:         &FakeServerProcess{nil},
-				resPoolHandler:        &FakeServerProcess{nil},
 				entitlementCalculator: &FakeServerProcess{errFake},
 			},
 			wantErr: errFake,
@@ -107,8 +84,6 @@ func TestServer_GainedLeadershipCallback(t *testing.T) {
 				metrics:               NewMetrics(tally.NoopScope),
 				resTree:               &FakeServerProcess{nil},
 				recoveryHandler:       &FakeServerProcess{nil},
-				resMgrHandler:         &FakeServerProcess{nil},
-				resPoolHandler:        &FakeServerProcess{nil},
 				entitlementCalculator: &FakeServerProcess{nil},
 				getTaskScheduler:      mockSchedulerWithErr(errFake, t),
 			},
@@ -120,8 +95,6 @@ func TestServer_GainedLeadershipCallback(t *testing.T) {
 				metrics:               NewMetrics(tally.NoopScope),
 				resTree:               &FakeServerProcess{nil},
 				recoveryHandler:       &FakeServerProcess{nil},
-				resMgrHandler:         &FakeServerProcess{nil},
-				resPoolHandler:        &FakeServerProcess{nil},
 				entitlementCalculator: &FakeServerProcess{nil},
 				getTaskScheduler:      mockSchedulerWithErr(nil, t),
 				reconciler:            &FakeServerProcess{errFake},
@@ -134,8 +107,6 @@ func TestServer_GainedLeadershipCallback(t *testing.T) {
 				metrics:               NewMetrics(tally.NoopScope),
 				resTree:               &FakeServerProcess{nil},
 				recoveryHandler:       &FakeServerProcess{nil},
-				resMgrHandler:         &FakeServerProcess{nil},
-				resPoolHandler:        &FakeServerProcess{nil},
 				entitlementCalculator: &FakeServerProcess{nil},
 				getTaskScheduler:      mockSchedulerWithErr(nil, t),
 				reconciler:            &FakeServerProcess{nil},
@@ -149,13 +120,11 @@ func TestServer_GainedLeadershipCallback(t *testing.T) {
 				metrics:               NewMetrics(tally.NoopScope),
 				resTree:               &FakeServerProcess{nil},
 				recoveryHandler:       &FakeServerProcess{nil},
-				resMgrHandler:         &FakeServerProcess{nil},
-				resPoolHandler:        &FakeServerProcess{nil},
-				entitlementCalculator: &FakeServerProcess{nil},
 				getTaskScheduler:      mockSchedulerWithErr(nil, t),
 				reconciler:            &FakeServerProcess{nil},
 				preemptor:             &FakeServerProcess{nil},
 				drainer:               &FakeServerProcess{errFake},
+				entitlementCalculator: &FakeServerProcess{nil},
 			},
 			wantErr: errFake,
 		},
@@ -165,8 +134,6 @@ func TestServer_GainedLeadershipCallback(t *testing.T) {
 				metrics:               NewMetrics(tally.NoopScope),
 				resTree:               &FakeServerProcess{nil},
 				recoveryHandler:       &FakeServerProcess{nil},
-				resMgrHandler:         &FakeServerProcess{nil},
-				resPoolHandler:        &FakeServerProcess{nil},
 				entitlementCalculator: &FakeServerProcess{nil},
 				getTaskScheduler:      mockSchedulerWithErr(nil, t),
 				reconciler:            &FakeServerProcess{nil},
@@ -180,9 +147,11 @@ func TestServer_GainedLeadershipCallback(t *testing.T) {
 	for _, test := range tt {
 		if test.wantErr == nil {
 			assert.NoError(t, test.s.GainedLeadershipCallback())
+			assert.True(t, test.s.HasGainedLeadership())
 			continue
 		}
 		assert.EqualError(t, test.wantErr, test.s.GainedLeadershipCallback().Error())
+		assert.False(t, test.s.HasGainedLeadership())
 	}
 }
 
@@ -262,40 +231,9 @@ func TestServer_LostLeadershipCallback(t *testing.T) {
 				drainer:               &FakeServerProcess{nil},
 				preemptor:             &FakeServerProcess{nil},
 				reconciler:            &FakeServerProcess{nil},
-				getTaskScheduler:      mockSchedulerWithErr(nil, t),
-				entitlementCalculator: &FakeServerProcess{nil},
-				recoveryHandler:       &FakeServerProcess{nil},
-				resPoolHandler:        &FakeServerProcess{errFake},
-			},
-			wantErr: errFake,
-		},
-		{
-			s: &Server{
-				role:                  "testResMgr",
-				metrics:               NewMetrics(tally.NoopScope),
-				drainer:               &FakeServerProcess{nil},
-				preemptor:             &FakeServerProcess{nil},
-				reconciler:            &FakeServerProcess{nil},
 				entitlementCalculator: &FakeServerProcess{nil},
 				getTaskScheduler:      mockSchedulerWithErr(nil, t),
 				recoveryHandler:       &FakeServerProcess{nil},
-				resPoolHandler:        &FakeServerProcess{nil},
-				resMgrHandler:         &FakeServerProcess{errFake},
-			},
-			wantErr: errFake,
-		},
-		{
-			s: &Server{
-				role:                  "testResMgr",
-				metrics:               NewMetrics(tally.NoopScope),
-				drainer:               &FakeServerProcess{nil},
-				preemptor:             &FakeServerProcess{nil},
-				reconciler:            &FakeServerProcess{nil},
-				entitlementCalculator: &FakeServerProcess{nil},
-				getTaskScheduler:      mockSchedulerWithErr(nil, t),
-				recoveryHandler:       &FakeServerProcess{nil},
-				resPoolHandler:        &FakeServerProcess{nil},
-				resMgrHandler:         &FakeServerProcess{nil},
 				resTree:               &FakeServerProcess{errFake},
 			},
 			wantErr: errFake,
@@ -310,8 +248,6 @@ func TestServer_LostLeadershipCallback(t *testing.T) {
 				entitlementCalculator: &FakeServerProcess{nil},
 				getTaskScheduler:      mockSchedulerWithErr(nil, t),
 				recoveryHandler:       &FakeServerProcess{nil},
-				resPoolHandler:        &FakeServerProcess{nil},
-				resMgrHandler:         &FakeServerProcess{nil},
 				resTree:               &FakeServerProcess{nil},
 			},
 			wantErr: nil,
@@ -324,6 +260,7 @@ func TestServer_LostLeadershipCallback(t *testing.T) {
 			continue
 		}
 		assert.EqualError(t, test.wantErr, test.s.LostLeadershipCallback().Error())
+		assert.False(t, test.s.HasGainedLeadership())
 	}
 }
 
@@ -332,8 +269,6 @@ func TestServer_GetID(t *testing.T) {
 		tally.NoopScope,
 		80,
 		5290,
-		&FakeServerProcess{nil},
-		&FakeServerProcess{nil},
 		&FakeServerProcess{nil},
 		&FakeServerProcess{nil},
 		&FakeServerProcess{nil},
@@ -364,9 +299,8 @@ func TestServer_ShutDownCallback(t *testing.T) {
 		&FakeServerProcess{nil},
 		&FakeServerProcess{nil},
 		&FakeServerProcess{nil},
-		&FakeServerProcess{nil},
-		&FakeServerProcess{nil},
 	)
 
 	assert.NoError(t, s.ShutDownCallback())
+	assert.False(t, s.HasGainedLeadership())
 }

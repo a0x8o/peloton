@@ -38,6 +38,7 @@ import (
 	"github.com/uber/peloton/pkg/jobmgr/cached"
 	"github.com/uber/peloton/pkg/jobmgr/goalstate"
 	"github.com/uber/peloton/pkg/jobmgr/jobsvc"
+	"github.com/uber/peloton/pkg/jobmgr/jobsvc/private"
 	"github.com/uber/peloton/pkg/jobmgr/jobsvc/stateless"
 	"github.com/uber/peloton/pkg/jobmgr/logmanager"
 	"github.com/uber/peloton/pkg/jobmgr/podsvc"
@@ -51,6 +52,7 @@ import (
 	"github.com/uber/peloton/pkg/jobmgr/updatesvc"
 	"github.com/uber/peloton/pkg/jobmgr/volumesvc"
 	"github.com/uber/peloton/pkg/jobmgr/watchsvc"
+	"github.com/uber/peloton/pkg/jobmgr/workflow/progress"
 	"github.com/uber/peloton/pkg/middleware/inbound"
 	"github.com/uber/peloton/pkg/middleware/outbound"
 	ormobjects "github.com/uber/peloton/pkg/storage/objects"
@@ -61,7 +63,7 @@ import (
 	_ "go.uber.org/automaxprocs"
 	"go.uber.org/yarpc"
 	"go.uber.org/yarpc/api/transport"
-	kingpin "gopkg.in/alecthomas/kingpin.v2"
+	"gopkg.in/alecthomas/kingpin.v2"
 )
 
 const (
@@ -395,6 +397,7 @@ func main() {
 	}
 
 	authInboundMiddleware := inbound.NewAuthInboundMiddleware(securityManager)
+	yarpcMetricsMiddleware := &inbound.YAPRCMetricsInboundMiddleware{Scope: rootScope.SubScope("yarpc")}
 
 	securityClient, err := auth_impl.CreateNewSecurityClient(&cfg.Auth)
 	if err != nil {
@@ -412,9 +415,9 @@ func main() {
 			Tally: rootScope,
 		},
 		InboundMiddleware: yarpc.InboundMiddleware{
-			Unary:  authInboundMiddleware,
-			Stream: authInboundMiddleware,
-			Oneway: authInboundMiddleware,
+			Unary:  yarpc.UnaryInboundMiddleware(authInboundMiddleware, yarpcMetricsMiddleware),
+			Stream: yarpc.StreamInboundMiddleware(authInboundMiddleware, yarpcMetricsMiddleware),
+			Oneway: yarpc.OnewayInboundMiddleware(authInboundMiddleware, yarpcMetricsMiddleware),
 		},
 		OutboundMiddleware: yarpc.OutboundMiddleware{
 			Unary:  authOutboundMiddleware,
@@ -438,7 +441,6 @@ func main() {
 			Period: time.Duration(cfg.JobManager.ActiveTaskUpdatePeriod),
 		},
 	)
-
 	watchProcessor := watchsvc.InitV1AlphaWatchServiceHandler(
 		dispatcher,
 		rootScope,
@@ -454,6 +456,17 @@ func main() {
 		rootScope,
 		[]cached.JobTaskListener{watchsvc.NewWatchListener(watchProcessor)},
 	)
+
+	// Register WorkflowProgressCheck
+	workflowCheck := &progress.WorkflowProgressCheck{
+		JobFactory: jobFactory,
+		Metrics:    progress.NewMetrics(rootScope),
+		Config:     &cfg.JobManager.WorkflowProgressCheck,
+	}
+	if err := workflowCheck.Register(backgroundManager); err != nil {
+		log.WithError(err).
+			Fatal("fail to register workflowCheck in backgroundManager")
+	}
 
 	// TODO: We need to cleanup the client names
 	launcher.InitTaskLauncher(
@@ -561,6 +574,17 @@ func main() {
 		candidate,
 		common.PelotonResourceManager, // TODO: to be removed
 		cfg.JobManager.JobSvcCfg,
+	)
+
+	private.InitPrivateJobServiceHandler(
+		dispatcher,
+		store,
+		store,
+		store,
+		ormStore,
+		jobFactory,
+		goalStateDriver,
+		candidate,
 	)
 
 	stateless.InitV1AlphaJobServiceHandler(
