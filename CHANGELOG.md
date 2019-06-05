@@ -1,7 +1,55 @@
 # Changelog for Peloton
 
-0.8.6 (unreleased)
+0.8.8 (unreleased)
 ------------------
+
+0.8.7
+------------------
+* 2019-05-29    Downgrade yarpc version to 1.37.0 and grpc version to 1.15                             varung@uber.com
+* 2019-05-30    Change watch stream buffer overflow error code to Aborted                              kevinxu@uber.com
+* 2019-05-17    Add integration test for host reservation feature                                      aihuaxu@uber.com
+* 2019-05-29    Add failure test for getJobUpdateDetails                                               kevinxu@uber.com
+* 2019-05-29    Small refactor of placement engine Assignment functionality                            pourchet@uber.com
+* 2019-05-29    Change bridge to filter of non-update workflows                                        kevinxu@uber.com
+* 2019-05-29    Fix job cache query nil pointer                                                        zhixin@uber.com
+* 2019-05-28    Change UpdateTime when a workflow is processed without state change                    zhixin@uber.com
+* 2019-05-28    Implement getJobUpdateDetails/Summary using QueryJobCache private api                  kevinxu@uber.com
+* 2019-05-22    Print TerminationStatus Reason for tasks                                               rihan@uber.com
+* 2019-05-23    [placement] Make placement period configurable                                         avyas@uber.com
+* 2019-05-22    Misc minicluster fixes                                                                 rihan@uber.com
+* 2019-04-16    Recover from active_jobs table                                                         adityacb@uber.com
+* 2019-05-23    Add changelog for release 0.8.6                                                        amitbose@uber.com
+* 2019-05-23    Add rate limit for task kill and executor shutdown in goal state engine                zhixin@uber.com
+* 2019-05-23    Fix race condition in asyncWorkerQueue                                                 zhixin@uber.com
+* 2019-05-23    [DB schema] Drop MVs for volumes from schema                                           adityacb@uber.com
+* 2019-05-22    Fix exponential backoff overflow                                                       zhixin@uber.com
+
+0.8.6
+------------------
+* 2019-05-23    Placement hints for batch jobs                                                         amitbose@uber.com
+* 2019-05-22    Skip recovery if job not present in job_config table                                   kevinxu@uber.com
+* 2019-05-21    Fix vcluster typo                                                                      zhixin@uber.com
+* 2019-05-21    Fix vcluster typo                                                                      zhixin@uber.com
+* 2019-05-21    Add auth support in peloton performance test                                           zhixin@uber.com
+* 2019-05-21    Implement limit in GetPod API request to fetch only a subset of the previous runs      apoorvaj@uber.com
+* 2019-05-21    Split up GetStateCount in job cache to GetTaskStateCount and GetWorkflowStateCount     apoorvaj@uber.com
+* 2019-05-20    Always retry terminated pod no matter workflow fails or not                            zhixin@uber.com
+* 2019-05-18    Add watch service to publish mesos task status update events                           arpit.goyal@uber.com
+* 2019-05-17    Publish workflow metrics                                                               apoorvaj@uber.com
+* 2019-05-16    Disable xdist parallelism at canary test framework                                     varung@uber.com
+* 2019-05-16    Workflow rollback record instance events for the last batch of instances               zhixin@uber.com
+* 2019-05-16    Collect yarpc error code metrics                                                       binz@uber.com
+* 2019-05-15    Add leadership middleware to check leadership callback is complete                     varung@uber.com
+* 2019-05-15    Fix canary test framework dedupe unique job issue                                      varung@uber.com
+* 2019-05-15    Add failure test for stateless jobs to ensure all peloton daemons are invulnerable to failures varung@uber.com
+* 2019-05-15    Add dedupe in read workflow events path                                                varung@uber.com
+* 2019-05-15    Disable starting state timeout for service job                                         zhixin@uber.com
+* 2019-05-14    Re-added kind with wget so it doesn't fail                                             pourchet@uber.com
+* 2019-05-14    Update yarpc and grpc version                                                          zhixin@uber.com
+* 2019-05-14    Fix QueryJobCache log level                                                            zhixin@uber.com
+* 2019-05-14    Make entity version argument optional in the job stateless replace CLI                 apoorvaj@uber.com
+* 2019-05-14    Implement the logic for host reservation in resource manager to mark tasks ready for host reservation and send tasks to placement. aihuaxu@uber.com
+* 2019-05-13    Add private QueryJobCache API                                                          zhixin@uber.com
 
 0.8.5
 ------------------

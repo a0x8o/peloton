@@ -397,10 +397,10 @@ var (
 	podStop        = pod.Command("stop", "stop a pod")
 	podStopPodName = podStop.Arg("name", "pod name").Required().String()
 
-	podGet            = pod.Command("get", "get pod info")
-	podGetPodName     = podGet.Arg("name", "pod name").Required().String()
-	podGetStatusOnly  = podGet.Flag("statusonly", "get pod status only(not spec)").Default("false").Bool()
-	podGetCurrentOnly = podGet.Flag("currentonly", "get pod info from current run only").Default("false").Bool()
+	podGet           = pod.Command("get", "get pod info")
+	podGetPodName    = podGet.Arg("name", "pod name").Required().String()
+	podGetStatusOnly = podGet.Flag("statusonly", "get pod status only(not spec)").Default("false").Bool()
+	podGetLimit      = podGet.Flag("limit", "get a subset of the previous pod runs (0 implies to get all the runs)").Default("0").Uint32()
 
 	podDeleteEvents        = pod.Command("delete-events", "delete pod events")
 	podDeleteEventsPodName = podDeleteEvents.Arg("name", "pod name").Required().String()
@@ -621,8 +621,8 @@ var (
 	getHostsCmpLess   = getHosts.Flag("less", "list hosts with resources less than cpu and/or gpu cores specified (default to greater than and equal to if not specified)").Short('l').Default("false").Bool()
 	getHostsHostnames = getHosts.Flag("hosts", "filter the hosts based on the comma separated hostnames provided").String()
 
-	// command for list status update events present in the event stream
-	eventStream = hostmgr.Command("events", "list all the task status update events present in event stream")
+	// command to watch mesos events update present in the event stream
+	watchHostMgr = hostmgr.Command("watch_events", "watch mesos event update received from mesos")
 
 	// command to disable the kill tasks request to mesos master
 	disableKillTasks = hostmgr.Command("disable-kill-tasks", "disable the kill task request to mesos master")
@@ -901,8 +901,8 @@ func main() {
 		err = client.PodRefreshAction(*podRefreshPodName)
 	case podStart.FullCommand():
 		err = client.PodStartAction(*podStartPodName)
-	case eventStream.FullCommand():
-		err = client.EventStreamAction()
+	case watchHostMgr.FullCommand():
+		err = client.WatchHostManagerEvents()
 	case statelessListJobs.FullCommand():
 		err = client.StatelessListJobsAction()
 	case statelessListPods.FullCommand():
@@ -994,7 +994,7 @@ func main() {
 	case podStop.FullCommand():
 		err = client.PodStopAction(*podStopPodName)
 	case podGet.FullCommand():
-		err = client.PodGetAction(*podGetPodName, *podGetStatusOnly, *podGetCurrentOnly)
+		err = client.PodGetAction(*podGetPodName, *podGetStatusOnly, *podGetLimit)
 	case podDeleteEvents.FullCommand():
 		err = client.PodDeleteEvents(*podDeleteEventsPodName, *podDeleteEventsPodID)
 	case statelessGet.FullCommand():

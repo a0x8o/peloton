@@ -32,12 +32,13 @@ import (
 	pb_eventstream "github.com/uber/peloton/.gen/peloton/private/eventstream"
 	"github.com/uber/peloton/.gen/peloton/private/resmgrsvc"
 
-	"github.com/google/uuid"
+	"github.com/pborman/uuid"
 	"github.com/uber/peloton/pkg/common"
 	"github.com/uber/peloton/pkg/common/cirbuf"
 	"github.com/uber/peloton/pkg/common/eventstream"
 	hostmgr_mesos "github.com/uber/peloton/pkg/hostmgr/mesos"
 	"github.com/uber/peloton/pkg/hostmgr/mesos/yarpc/encoding/mpb"
+	"github.com/uber/peloton/pkg/hostmgr/watchevent"
 )
 
 const (
@@ -54,10 +55,6 @@ type StateManager interface {
 
 	// EventPurged is for implementing PurgedEventsProcessor interface.
 	EventPurged(events []*cirbuf.CircularBufferItem)
-
-	// GetStatusUpdateEvents returns all the outstanding status update events
-	// from the event stream
-	GetStatusUpdateEvents() ([]*pb_eventstream.Event, error)
 }
 
 type stateManager struct {
@@ -66,6 +63,7 @@ type stateManager struct {
 	updateAckConcurrency int
 	ackChannel           chan *mesos.TaskStatus // Buffers the mesos task status updates to be acknowledged
 	ackStatusMap         sync.Map
+	watchProcessor       watchevent.WatchProcessor
 
 	eventStreamHandler *eventstream.Handler
 	metrics            *Metrics
@@ -109,13 +107,13 @@ func initResMgrEventForwarder(
 // to push task status update events.
 func initEventStreamHandler(
 	d *yarpc.Dispatcher,
-	purgedEventProcessor eventstream.PurgedEventsProcessor,
+	purgedEventsProcessor eventstream.PurgedEventsProcessor,
 	bufferSize int,
 	scope tally.Scope) *eventstream.Handler {
 	eventStreamHandler := eventstream.NewEventStreamHandler(
 		bufferSize,
 		[]string{common.PelotonJobManager, common.PelotonResourceManager},
-		purgedEventProcessor,
+		purgedEventsProcessor,
 		scope,
 	)
 
@@ -130,6 +128,7 @@ func initEventStreamHandler(
 func NewStateManager(
 	d *yarpc.Dispatcher,
 	schedulerClient mpb.SchedulerClient,
+	watchProcessor watchevent.WatchProcessor,
 	updateBufferSize int,
 	updateAckConcurrency int,
 	resmgrClient resmgrsvc.ResourceManagerServiceYARPCClient,
@@ -138,6 +137,7 @@ func NewStateManager(
 	stateManagerScope := parentScope.SubScope("taskStateManager")
 	handler := &stateManager{
 		schedulerclient:      schedulerClient,
+		watchProcessor:       watchProcessor,
 		updateAckConcurrency: updateAckConcurrency,
 		ackChannel:           make(chan *mesos.TaskStatus, updateBufferSize),
 		metrics:              NewMetrics(stateManagerScope),
@@ -211,13 +211,19 @@ func (f *eventForwarder) notifyResourceManager(
 // Update is the Mesos callback on mesos state updates
 func (m *stateManager) Update(ctx context.Context, body *sched.Event) error {
 	var err error
+	var event *pb_eventstream.Event
+	defer func() {
+		if err == nil {
+			m.watchProcessor.NotifyEventChange(event)
+		}
+	}()
 	taskUpdate := body.GetUpdate()
 	m.metrics.taskUpdateCounter.Inc(1)
 	taskStateCounter := m.metrics.scope.Counter(
 		"task_state_" + taskUpdate.GetStatus().GetState().String())
 	taskStateCounter.Inc(1)
 
-	event := &pb_eventstream.Event{
+	event = &pb_eventstream.Event{
 		MesosTaskStatus: taskUpdate.GetStatus(),
 		Type:            pb_eventstream.Event_MESOS_TASK_STATUS,
 	}
@@ -245,35 +251,23 @@ func (m *stateManager) UpdateCounters(_ *uatomic.Bool) {
 	m.metrics.taskAckMapSize.Update(length)
 }
 
-// GetStatusUpdateEvents returns all the outstanding status update events
-// from the event stream
-// This method is primarily for deubbing purpose
-func (m *stateManager) GetStatusUpdateEvents() ([]*pb_eventstream.Event, error) {
-	events, err := m.eventStreamHandler.GetEvents()
-	if err != nil {
-		return nil, err
-	}
-	return events, nil
-}
-
 // startAsyncProcessTaskUpdates concurrently process task status update events
 // ready to ACK iff uuid is not nil.
 func (m *stateManager) startAsyncProcessTaskUpdates() {
 	for i := 0; i < m.updateAckConcurrency; i++ {
 		go func() {
 			for taskStatus := range m.ackChannel {
-				if uuid, err := uuid.FromBytes(taskStatus.GetUuid()); err == nil {
-					// once acked, delete from map
-					// if ack failed at mesos master then agent will re-send
-					m.ackStatusMap.Delete(uuid)
+				uid := uuid.UUID(taskStatus.GetUuid()).String()
+				// once acked, delete from map
+				// if ack failed at mesos master then agent will re-send
+				m.ackStatusMap.Delete(uid)
 
-					if err := m.acknowledgeTaskUpdate(
-						context.Background(),
-						taskStatus); err != nil {
-						log.WithField("task_status", *taskStatus).
-							WithError(err).
-							Error("Failed to acknowledgeTaskUpdate")
-					}
+				if err := m.acknowledgeTaskUpdate(
+					context.Background(),
+					taskStatus); err != nil {
+					log.WithField("task_status", *taskStatus).
+						WithError(err).
+						Error("Failed to acknowledgeTaskUpdate")
 				}
 			}
 		}()
@@ -311,17 +305,17 @@ func (m *stateManager) EventPurged(events []*cirbuf.CircularBufferItem) {
 	for _, e := range events {
 		event, ok := e.Value.(*pb_eventstream.Event)
 		if ok {
-			uuid, err := uuid.FromBytes(event.GetMesosTaskStatus().GetUuid())
-			if err == nil {
-				// if ack for status update is pending, ignore it
-				_, ok := m.ackStatusMap.Load(uuid)
+			uid := uuid.UUID(event.GetMesosTaskStatus().GetUuid()).String()
+			// if ack for status update is pending, ignore it
+			if uid != "" {
+				_, ok := m.ackStatusMap.Load(uid)
 				if ok {
 					m.metrics.taskUpdateAckDeDupe.Inc(1)
 					continue
 				}
-				m.ackStatusMap.Store(uuid, struct{}{})
-				m.ackChannel <- event.GetMesosTaskStatus()
+				m.ackStatusMap.Store(uid, struct{}{})
 			}
+			m.ackChannel <- event.GetMesosTaskStatus()
 		}
 	}
 }

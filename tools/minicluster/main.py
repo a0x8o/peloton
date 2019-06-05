@@ -57,6 +57,7 @@ def load_config():
         os.path.dirname(os.path.abspath(__file__)), "config.yaml"
     )
     with open(config_file, "r") as f:
+        #config = yaml.load(f, Loader=yaml.FullLoader)
         config = yaml.load(f)
     return config
 
@@ -139,6 +140,7 @@ def teardown():
     minicluster.teardown_k8s()
 
     utils.remove_existing_container(config["cassandra_container"])
+    print_utils.okgreen("teardown complete!")
 
 
 def parse_arguments():

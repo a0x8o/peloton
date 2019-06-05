@@ -58,7 +58,6 @@ if [[ -z "${COMMIT_HASH}" ]]; then
   COMMIT_HASH=`make commit-hash`
 fi
 
-
 [[ $(uname) == Darwin || -n $JENKINS_HOME ]] && docker_cmd='docker' || docker_cmd='sudo docker'
 
 cur_dir="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
@@ -125,12 +124,12 @@ cleanup() {
 
 # Run current version
 vcluster_name="v${COMMIT_HASH:12:12}"
-vcluster_args="-z ${ZOOKEEPER} -p /PelotonPerformance -n ${vcluster_name}"
+vcluster_args="-z ${ZOOKEEPER} -p /PelotonPerformance -n ${vcluster_name} --auth-type ${PELTON_AUTH_TYPE} --auth-config-file ${PELTON_AUTH_CONFIG_FILE}"
 run_perf_test "${vcluster_name}" "${vcluster_args}" "${PELOTON_IMAGE_CURRENT}" "PERF_CURRENT"
 
 # Run base version
 vcluster_name="v${COMMIT_HASH:0:12}"
-vcluster_args="-z ${ZOOKEEPER} -p /PelotonPerformance -n ${vcluster_name}"
+vcluster_args="-z ${ZOOKEEPER} -p /PelotonPerformance -n ${vcluster_name} --auth-type ${PELTON_AUTH_TYPE} --auth-config-file ${PELTON_AUTH_CONFIG_FILE}"
 run_perf_test "${vcluster_name}" "${vcluster_args}" "${PELOTON_IMAGE_BASELINE}" "PERF_BASE"
 
 # Compare performance

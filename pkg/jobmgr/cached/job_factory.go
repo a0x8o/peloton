@@ -21,6 +21,8 @@ import (
 	pbjob "github.com/uber/peloton/.gen/peloton/api/v0/job"
 	"github.com/uber/peloton/.gen/peloton/api/v0/peloton"
 	pbtask "github.com/uber/peloton/.gen/peloton/api/v0/task"
+	pbupdate "github.com/uber/peloton/.gen/peloton/api/v0/update"
+
 	"github.com/uber/peloton/pkg/storage"
 	ormobjects "github.com/uber/peloton/pkg/storage/objects"
 
@@ -215,12 +217,22 @@ func (f *jobFactory) publishMetrics() map[pbtask.TaskState]map[pbtask.TaskState]
 		}
 	}
 
+	// Initialize update count map for all states
+	workflowCount := map[pbupdate.State]int{}
+	for s := range pbupdate.State_name {
+		workflowCount[pbupdate.State(s)] = 0
+	}
+
 	// Iterate through jobs, tasks and count
 	jobs := f.GetAllJobs()
-	var totalThrottledTasks int
+	var (
+		totalThrottledTasks int
+		spreadQuotientSum   float64
+		spreadQuotientCount int64
+	)
 	for _, j := range jobs {
-		stateCount, throttledTasks := j.GetStateCount()
-		for currentState, goalStateMap := range stateCount {
+		taskStateCount, throttledTasks, spread := j.GetTaskStateCount()
+		for currentState, goalStateMap := range taskStateCount {
 			for goalState, count := range goalStateMap {
 				if _, ok := tCount[currentState]; !ok {
 					// should not reach here, just for safety
@@ -230,16 +242,36 @@ func (f *jobFactory) publishMetrics() map[pbtask.TaskState]map[pbtask.TaskState]
 
 			}
 		}
+
 		totalThrottledTasks = totalThrottledTasks + throttledTasks
+
+		workflowStateCount := j.GetWorkflowStateCount()
+		for currentState, count := range workflowStateCount {
+			workflowCount[currentState] += count
+		}
+
+		if spread.hostCount > 0 {
+			spreadQuotientCount++
+			spreadQuotientSum +=
+				(float64(spread.taskCount) / float64(spread.hostCount))
+		}
 	}
 
 	// Publish
 	f.mtx.scope.Gauge("jobs_count").Update(float64(len(jobs)))
 	f.mtx.scope.Gauge("throttled_tasks").Update(float64(totalThrottledTasks))
+	if spreadQuotientCount > 0 {
+		f.taskMetrics.MeanSpreadQuotient.
+			Update(spreadQuotientSum / float64(spreadQuotientCount))
+	}
 	for s, sm := range tCount {
 		for gs, tc := range sm {
 			f.mtx.scope.Tagged(map[string]string{"state": s.String(), "goal_state": gs.String()}).Gauge("tasks_count").Update(float64(tc))
 		}
+	}
+
+	for s, tc := range workflowCount {
+		f.mtx.scope.Tagged(map[string]string{"state": s.String()}).Gauge("workflow_count").Update(float64(tc))
 	}
 
 	return tCount

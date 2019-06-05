@@ -1416,9 +1416,10 @@ func (suite *JobTestSuite) TestJobUpdateRuntimePlusConfigAndRecover() {
 // TestJobCreate tests job create in cache and db
 func (suite *JobTestSuite) TestJobCreate() {
 	jobConfig := &pbjob.JobConfig{
-		InstanceCount: 10,
-		Type:          pbjob.JobType_BATCH,
-		RespoolID:     &peloton.ResourcePoolID{Value: uuid.NewRandom().String()},
+		InstanceCount:     10,
+		Type:              pbjob.JobType_BATCH,
+		RespoolID:         &peloton.ResourcePoolID{Value: uuid.NewRandom().String()},
+		PlacementStrategy: pbjob.PlacementStrategy_PLACEMENT_STRATEGY_SPREAD_JOB,
 	}
 
 	createdBy := "test"
@@ -1513,6 +1514,8 @@ func (suite *JobTestSuite) TestJobCreate() {
 	suite.Equal(config.GetInstanceCount(), uint32(10))
 	suite.Equal(config.GetChangeLog().Version, uint64(1))
 	suite.Equal(config.GetType(), pbjob.JobType_BATCH)
+	suite.Equal(pbjob.PlacementStrategy_PLACEMENT_STRATEGY_SPREAD_JOB,
+		config.GetPlacementStrategy())
 	runtime, err := suite.job.GetRuntime(context.Background())
 	suite.NoError(err)
 	suite.Equal(runtime.GetRevision().GetVersion(), uint64(1))
@@ -4629,14 +4632,20 @@ func (suite *JobTestSuite) TestGetStateCount() {
 		jobType: pbjob.JobType_SERVICE,
 	}
 
-	stateCount, throttledTasks := suite.job.GetStateCount()
+	testUpdate := newUpdate(&peloton.UpdateID{Value: testUpdateID}, nil)
+	testUpdate.state = pbupdate.State_ROLLING_FORWARD
+	suite.job.workflows[testUpdateID] = testUpdate
+
+	taskCount, throttledTasks, _ := suite.job.GetTaskStateCount()
+	updateCount := suite.job.GetWorkflowStateCount()
 	suite.Equal(
-		stateCount[pbtask.TaskState_PENDING][pbtask.TaskState_SUCCEEDED],
+		taskCount[pbtask.TaskState_PENDING][pbtask.TaskState_SUCCEEDED],
 		2)
 	suite.Equal(
-		stateCount[pbtask.TaskState_KILLED][pbtask.TaskState_DELETED],
+		taskCount[pbtask.TaskState_KILLED][pbtask.TaskState_DELETED],
 		1)
 	suite.Equal(throttledTasks, 1)
+	suite.Equal(updateCount[pbupdate.State_ROLLING_FORWARD], 1)
 }
 
 // TestJobRollingCreateSuccess tests job
@@ -4911,4 +4920,54 @@ func (suite *JobTestSuite) TestJobRollingCreateJobRuntimeFailure() {
 		nil,
 	)
 	suite.Error(err)
+}
+
+// TestGetTaskSpreadCounts tests JobSpreadCounts returned by GetTaskStateCounts
+func (suite *JobTestSuite) TestGetTaskSpreadCounts() {
+	testcases := []struct {
+		isSpread                                bool
+		numTasksTotal, numTasksPlaced, numHosts uint32
+		message                                 string
+	}{
+		{
+			message:  "Not spread",
+			isSpread: false,
+		},
+		{
+			isSpread:      true,
+			numTasksTotal: 10,
+			message:       "Spread, no runtime",
+		},
+		{
+			message:        "Spread, with runtime",
+			isSpread:       true,
+			numTasksTotal:  10,
+			numTasksPlaced: 5,
+			numHosts:       4,
+		},
+	}
+	for _, tc := range testcases {
+		if tc.isSpread == true {
+			suite.job.config.placementStrategy =
+				pbjob.PlacementStrategy_PLACEMENT_STRATEGY_SPREAD_JOB
+		}
+		var tasks []*task
+		for i := uint32(0); i < tc.numTasksTotal; i++ {
+			tasks = append(tasks, suite.job.addTaskToJobMap(i))
+		}
+		if tc.numHosts > 0 {
+			taskRuntimes := initializeRuntimes(
+				tc.numTasksTotal,
+				pbtask.TaskState_LAUNCHED)
+			for i, r := range taskRuntimes {
+				tasks[i].runtime = r
+				if i < tc.numTasksPlaced {
+					r.Host = "host-" + fmt.Sprintf("%d", i%tc.numHosts)
+				}
+			}
+		}
+		_, _, spread := suite.job.GetTaskStateCount()
+		suite.Equal(int(tc.numTasksPlaced), spread.taskCount)
+		suite.Equal(int(tc.numHosts), spread.hostCount)
+	}
 }

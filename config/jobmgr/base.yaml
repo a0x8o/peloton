@@ -24,8 +24,6 @@ job_manager:
   goal_state:
     job_batch_runtime_update_interval: 10s
     job_service_runtime_update_interval: 1s
-    recovery:
-      recover_from_active_jobs: false
   task_launcher:
     placement_dequeue_limit: 10
     get_placements_timeout_ms: 100
@@ -60,3 +58,27 @@ metrics:
   runtime_metrics:
     enabled: true
     interval: 10s
+
+rate_limit:
+  enabled: false
+  methods:
+    # order of the entries matters here.
+    # a procedure will try to match each entry from top to bottom,
+    # and the first satisfied config will be used.
+  - name: 'peloton.api.v1alpha.job.stateless.svc.JobService:GetJob'
+    rate: 100
+    burst: 100
+  - name: 'peloton.api.v1alpha.job.stateless.svc.JobService:Get*'
+    rate: 100
+    burst: 100
+  - name: 'peloton.api.v1alpha.job.stateless.svc.JobService:Browse*'
+    rate: 100
+    burst: 100
+  - name: 'peloton.api.v1alpha.job.stateless.svc.JobService:List*'
+    rate: -1 # if either burst or rate is < 0, no rate limit
+
+  # if a user calls a method not listed in methods list,
+  # it would fall through to this branch
+  default:
+    rate: 100
+    burst: 100

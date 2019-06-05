@@ -38,6 +38,7 @@ import (
 	"github.com/uber-go/tally"
 	"github.com/uber/peloton/.gen/peloton/private/models"
 	"go.uber.org/yarpc"
+	"golang.org/x/time/rate"
 )
 
 // _sleepRetryCheckRunningState is the duration to wait during stop/start while waiting for
@@ -52,46 +53,6 @@ type driverState int32
 const (
 	notRunning driverState = iota + 1 // not running
 	running                           // running
-)
-
-var (
-	// batchJobStatesToRecover represents the job states which need recovery
-	// for a batch job cluster
-	batchJobStatesToRecover = []job.JobState{
-		job.JobState_INITIALIZED,
-		job.JobState_PENDING,
-		job.JobState_RUNNING,
-		job.JobState_KILLING,
-		// Get failed jobs in-case service jobs need to be restarted
-		// Only killed and succeeded jobs are not recovered as of now.
-		// TODO uncomment this after archiver has been put in to delete old jobs.
-		//job.JobState_FAILED,
-		// TODO remove recovery of UNKNOWN state after all old jobs created
-		// before job goal state engine was added have terminated.
-		job.JobState_UNKNOWN,
-		job.JobState_UNINITIALIZED,
-	}
-
-	// serviceJobStatesToRecover represents the job states which need recovery
-	// for a service job cluster
-	serviceJobStatesToRecover = []job.JobState{
-		job.JobState_INITIALIZED,
-		job.JobState_PENDING,
-		job.JobState_RUNNING,
-		job.JobState_KILLING,
-		// Get failed jobs in-case service jobs need to be restarted
-		// Only killed and succeeded jobs are not recovered as of now.
-		// TODO uncomment this after archiver has been put in to delete old jobs.
-		//job.JobState_FAILED,
-		// TODO remove recovery of UNKNOWN state after all old jobs created
-		// before job goal state engine was added have terminated.
-		job.JobState_UNKNOWN,
-		// for service job event terminal job state need to be recovered
-		job.JobState_KILLED,
-		job.JobState_FAILED,
-		job.JobState_SUCCEEDED,
-		job.JobState_UNINITIALIZED,
-	}
 )
 
 // Driver is the interface to enqueue jobs and tasks into the goal state engine
@@ -153,6 +114,7 @@ func NewDriver(
 	scope := parentScope.SubScope("goalstate")
 	jobScope := scope.SubScope("job")
 	taskScope := scope.SubScope("task")
+	workflowScope := scope.SubScope("workflow")
 
 	return &driver{
 		jobEngine: goalstate.NewEngine(
@@ -169,7 +131,7 @@ func NewDriver(
 			cfg.NumWorkerUpdateThreads,
 			cfg.FailureRetryDelay,
 			cfg.MaxRetryDelay,
-			jobScope),
+			workflowScope),
 		hostmgrClient: hostsvc.NewInternalHostServiceYARPCClient(
 			d.ClientConfig(common.PelotonHostManager)),
 		resmgrClient: resmgrsvc.NewResourceManagerServiceYARPCClient(
@@ -187,6 +149,12 @@ func NewDriver(
 		jobType:                       jobType,
 		jobRuntimeCalculationViaCache: jobRuntimeCalculationViaCache,
 		jobScope:                      jobScope,
+		taskKillRateLimiter: rate.NewLimiter(
+			cfg.RateLimiterConfig.TaskKill.Rate,
+			cfg.RateLimiterConfig.TaskKill.Burst),
+		executorShutShutdownRateLimiter: rate.NewLimiter(
+			cfg.RateLimiterConfig.ExecutorShutdown.Rate,
+			cfg.RateLimiterConfig.ExecutorShutdown.Burst),
 	}
 }
 
@@ -249,6 +217,12 @@ type driver struct {
 	jobRuntimeCalculationViaCache bool
 	// job scope for goalstate driver
 	jobScope tally.Scope
+
+	// rate limiter for goal state engine initiated task stop
+	taskKillRateLimiter *rate.Limiter
+
+	//  rate limiter for goal state engine initiated executor shutdown
+	executorShutShutdownRateLimiter *rate.Limiter
 }
 
 func (d *driver) EnqueueJob(jobID *peloton.JobID, deadline time.Time) {
@@ -411,22 +385,12 @@ func (d *driver) syncFromDB(ctx context.Context) error {
 	log.Info("syncing cache and goal state with db")
 	startRecoveryTime := time.Now()
 
-	jobStatesToRecover := batchJobStatesToRecover
-	if d.jobType == job.JobType_SERVICE {
-		jobStatesToRecover = serviceJobStatesToRecover
-	}
-	err := recovery.RecoverJobsByState(
+	if err := recovery.RecoverActiveJobs(
 		ctx,
 		d.jobScope,
 		d.jobStore,
-		jobStatesToRecover,
 		d.recoverTasks,
-		d.cfg.RecoveryConfig.RecoverFromActiveJobs,
-		// Jobmgr should not backfill active jobs. It will be done by resmgr
-		// during recovery.
-		false,
-	)
-	if err != nil {
+	); err != nil {
 		return err
 	}
 

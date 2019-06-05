@@ -42,10 +42,12 @@ import (
 	"github.com/uber/peloton/pkg/hostmgr/mesos/yarpc/encoding/mpb"
 	"github.com/uber/peloton/pkg/hostmgr/mesos/yarpc/peer"
 	"github.com/uber/peloton/pkg/hostmgr/mesos/yarpc/transport/mhttp"
+	hostmetric "github.com/uber/peloton/pkg/hostmgr/metrics"
 	"github.com/uber/peloton/pkg/hostmgr/offer"
 	"github.com/uber/peloton/pkg/hostmgr/queue"
 	"github.com/uber/peloton/pkg/hostmgr/reconcile"
 	"github.com/uber/peloton/pkg/hostmgr/task"
+	"github.com/uber/peloton/pkg/hostmgr/watchevent"
 	"github.com/uber/peloton/pkg/middleware/inbound"
 	"github.com/uber/peloton/pkg/middleware/outbound"
 	"github.com/uber/peloton/pkg/storage/stores"
@@ -54,7 +56,7 @@ import (
 	_ "go.uber.org/automaxprocs"
 	"go.uber.org/yarpc"
 	"go.uber.org/yarpc/api/transport"
-	"gopkg.in/alecthomas/kingpin.v2"
+	kingpin "gopkg.in/alecthomas/kingpin.v2"
 )
 
 var (
@@ -533,7 +535,13 @@ func main() {
 	}
 
 	bin_packing.Init()
-	log.Infof(" %s Bin Packing is enabled", cfg.HostManager.BinPacking)
+	log.WithField("ranker_name", cfg.HostManager.BinPacking).
+		Info("Bin packing is enabled")
+	defaultRanker := bin_packing.GetRankerByName(cfg.HostManager.BinPacking)
+	if defaultRanker == nil {
+		log.WithField("ranker_name", cfg.HostManager.BinPacking).
+			Fatal("Ranker not found")
+	}
 	offer.InitEventHandler(
 		dispatcher,
 		rootScope,
@@ -546,12 +554,15 @@ func main() {
 		cfg.HostManager.HeldHostPruningPeriodSec,
 		cfg.HostManager.ScarceResourceTypes,
 		cfg.HostManager.SlackResourceTypes,
-		bin_packing.CreateRanker(cfg.HostManager.BinPacking),
+		defaultRanker,
 		cfg.HostManager.BinPackingRefreshIntervalSec,
 		cfg.HostManager.HostPlacingOfferStatusTimeout,
 	)
 
 	maintenanceQueue := queue.NewMaintenanceQueue()
+	metric := hostmetric.NewMetrics(rootScope)
+	watchevent.InitWatchProcessor(cfg.HostManager.Watch, metric)
+	watchProcessor := watchevent.GetWatchProcessor()
 
 	// Initializing TaskStateManager will start to record task status
 	// update back to storage.  TODO(zhitao): This is
@@ -561,6 +572,7 @@ func main() {
 	taskStateManager := task.NewStateManager(
 		dispatcher,
 		schedulerClient,
+		watchProcessor,
 		cfg.HostManager.TaskUpdateBufferSize,
 		cfg.HostManager.TaskUpdateAckConcurrency,
 		resmgrsvc.NewResourceManagerServiceYARPCClient(
@@ -571,7 +583,7 @@ func main() {
 	// Create new hostmgr internal service handler.
 	serviceHandler := hostmgr.NewServiceHandler(
 		dispatcher,
-		rootScope,
+		metric,
 		schedulerClient,
 		masterOperatorClient,
 		driver,
@@ -583,6 +595,7 @@ func main() {
 		cfg.HostManager.SlackResourceTypes,
 		maintenanceHostInfoMap,
 		taskStateManager,
+		watchProcessor,
 	)
 
 	hostsvc.InitServiceHandler(
@@ -629,6 +642,7 @@ func main() {
 		recoveryHandler,
 		drainer,
 		serviceHandler.GetReserver(),
+		watchProcessor,
 	)
 	server.Start()
 
