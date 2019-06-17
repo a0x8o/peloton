@@ -12,19 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package testutil
+package mimir
 
-import (
-	"time"
-
-	"github.com/uber/peloton/.gen/peloton/private/resmgr"
-
-	"github.com/uber/peloton/pkg/placement/models"
-	"github.com/uber/peloton/pkg/placement/testutil/v0"
+const (
+	// HostNameLabel represents the hostname label used
+	// internally by placement engine
+	HostNameLabel = "peloton.placementengine.hostname"
 )
-
-// SetupHostOffers creates an host offer.
-func SetupHostOffers() *models.HostOffers {
-	hostOffer := v0_testutil.SetupHostOffer()
-	return models.NewHostOffers(hostOffer, []*resmgr.Task{}, time.Now())
-}

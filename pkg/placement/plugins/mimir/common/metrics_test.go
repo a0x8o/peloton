@@ -12,26 +12,25 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package testutil
+package mimir
 
 import (
-	"time"
+	"testing"
 
-	"github.com/uber/peloton/.gen/peloton/private/resmgr"
-	"github.com/uber/peloton/.gen/peloton/private/resmgrsvc"
-
-	"github.com/uber/peloton/pkg/placement/models"
-	"github.com/uber/peloton/pkg/placement/testutil/v0"
+	"github.com/stretchr/testify/assert"
+	"github.com/uber/peloton/pkg/placement/plugins/mimir/lib/model/metrics"
 )
 
-// SetupAssignment creates an assignment.
-func SetupAssignment(deadline time.Time, maxRounds int) *models.Assignment {
-	resmgrTask := v0_testutil.SetupRMTask()
-	resmgrGang := &resmgrsvc.Gang{
-		Tasks: []*resmgr.Task{
-			resmgrTask,
-		},
-	}
-	task := models.NewTask(resmgrGang, resmgrTask, deadline, deadline, maxRounds)
-	return models.NewAssignment(task)
+func TestDerivation_Calculate(t *testing.T) {
+	derivation := free(CPUAvailable, CPUReserved)
+	metricSet := metrics.NewSet()
+	metricSet.Add(CPUAvailable, 200.0)
+	metricSet.Add(CPUReserved, 50.0)
+	derivation.Calculate(CPUFree, metricSet)
+	assert.Equal(t, 150.0, metricSet.Get(CPUFree))
+}
+
+func TestDerivation_Dependencies(t *testing.T) {
+	derivation := free(CPUAvailable, CPUReserved)
+	assert.Equal(t, []metrics.Type{CPUAvailable, CPUReserved}, derivation.Dependencies())
 }

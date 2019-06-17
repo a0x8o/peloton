@@ -24,8 +24,10 @@ import (
 	"github.com/uber/peloton/pkg/placement/config"
 	"github.com/uber/peloton/pkg/placement/models"
 	"github.com/uber/peloton/pkg/placement/plugins"
+	common "github.com/uber/peloton/pkg/placement/plugins/mimir/common"
 	"github.com/uber/peloton/pkg/placement/plugins/mimir/lib/algorithms"
 	"github.com/uber/peloton/pkg/placement/plugins/mimir/lib/model/placement"
+	"github.com/uber/peloton/pkg/placement/plugins/mimir/v0"
 )
 
 var _offersFactor = map[resmgr.TaskType]float64{
@@ -62,7 +64,7 @@ func (mimir *mimir) convertAssignments(
 	for _, p := range pelotonAssignments {
 		data := p.GetTask().Data()
 		if data == nil {
-			entity := TaskToEntity(p.GetTask().GetTask(), false)
+			entity := v0_mimir.TaskToEntity(p.GetTask().GetTask(), false)
 			p.GetTask().SetData(entity)
 			data = entity
 		}
@@ -73,18 +75,20 @@ func (mimir *mimir) convertAssignments(
 	return assignments, entitiesToAssignments
 }
 
-func (mimir *mimir) convertHosts(hosts []*models.HostOffers) ([]*placement.Group,
-	map[*placement.Group]*models.HostOffers) {
+func (mimir *mimir) convertHosts(hosts []*models.HostOffers) (
+	[]*placement.Group,
+	map[*placement.Group]int,
+) {
 	// Convert the hosts to groups and keep a map from groups to hosts
 	groups := make([]*placement.Group, 0, len(hosts))
-	groupsToHosts := make(map[*placement.Group]*models.HostOffers, len(hosts))
-	for _, host := range hosts {
+	groupsToHosts := make(map[*placement.Group]int, len(hosts))
+	for i, host := range hosts {
 		data := host.Data()
 		if data == nil {
-			group := OfferToGroup(host.GetOffer())
+			group := v0_mimir.OfferToGroup(host.GetOffer())
 			entities := placement.Entities{}
 			for _, task := range host.GetTasks() {
-				entity := TaskToEntity(task, true)
+				entity := v0_mimir.TaskToEntity(task, true)
 				entities.Add(entity)
 			}
 			group.Entities = entities
@@ -93,32 +97,36 @@ func (mimir *mimir) convertHosts(hosts []*models.HostOffers) ([]*placement.Group
 			data = group
 		}
 		group := data.(*placement.Group)
-		groupsToHosts[group] = host
+		groupsToHosts[group] = i
 		groups = append(groups, group)
 	}
 	return groups, groupsToHosts
 }
 
-func (mimir *mimir) updateAssignments(
+func (mimir *mimir) getPlacements(
 	assignments []*placement.Assignment,
 	entitiesToAssignments map[*placement.Entity]*models.Assignment,
-	groupsToHosts map[*placement.Group]*models.HostOffers) {
-	// Update the Peloton assignments from the mimir assignments
-	for _, assignment := range assignments {
+	groupsToHosts map[*placement.Group]int,
+) map[int]int {
+	placements := map[int]int{}
+	for i, assignment := range assignments {
 		pelotonAssignment := entitiesToAssignments[assignment.Entity]
 		if assignment.Failed {
 			pelotonAssignment.SetReason(assignment.Transcript.String())
+			placements[i] = -1
 			continue
 		}
-		host := groupsToHosts[assignment.AssignedGroup]
-		pelotonAssignment.SetHost(host)
+		hostIndex := groupsToHosts[assignment.AssignedGroup]
+		placements[i] = hostIndex
 	}
+	return placements
 }
 
-// PlaceOnce is an implementation of the placement.Strategy interface.
-func (mimir *mimir) PlaceOnce(
+// GetTaskPlacements is an implementation of the placement.Strategy interface.
+func (mimir *mimir) GetTaskPlacements(
 	pelotonAssignments []*models.Assignment,
-	hosts []*models.HostOffers) {
+	hosts []*models.HostOffers,
+) map[int]int {
 	assignments, entitiesToAssignments := mimir.convertAssignments(pelotonAssignments)
 	groups, groupsToHosts := mimir.convertHosts(hosts)
 	scopeSet := placement.NewScopeSet(groups)
@@ -126,30 +134,32 @@ func (mimir *mimir) PlaceOnce(
 	log.WithFields(log.Fields{
 		"peloton_assignments": pelotonAssignments,
 		"peloton_hosts":       hosts,
-	}).Debug("PlaceOnce Mimir strategy called")
+	}).Debug("GetTaskPlacements Mimir strategy called")
 
 	// Place the assignments onto the groups
 	mimir.placer.Place(assignments, groups, scopeSet)
 
 	for _, assignment := range assignments {
 		if assignment.AssignedGroup != nil {
-			log.WithField("group", dumpGroup(assignment.AssignedGroup)).
-				WithField("entity", dumpEntity(assignment.Entity)).
+			log.WithField("group", common.DumpGroup(assignment.AssignedGroup)).
+				WithField("entity", common.DumpEntity(assignment.Entity)).
 				WithField("transcript", assignment.Transcript.String()).
 				Debug("Placed Mimir assignment")
 		} else {
-			log.WithField("entity", dumpEntity(assignment.Entity)).
+			log.WithField("entity", common.DumpEntity(assignment.Entity)).
 				WithField("transcript", assignment.Transcript.String()).
 				Debug("Did not place Mimir assignment")
 		}
 	}
 
-	mimir.updateAssignments(assignments, entitiesToAssignments, groupsToHosts)
+	placements := mimir.getPlacements(assignments, entitiesToAssignments, groupsToHosts)
 
 	log.WithFields(log.Fields{
+		"placements":  placements,
 		"assignments": pelotonAssignments,
 		"hosts":       hosts,
-	}).Debug("PlaceOnce Mimir strategy returned")
+	}).Debug("GetTaskPlacements Mimir strategy returned")
+	return placements
 }
 
 // Filters is an implementation of the placement.Strategy interface.
