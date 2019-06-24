@@ -27,6 +27,7 @@ import (
 	"github.com/uber/peloton/pkg/placement/config"
 	"github.com/uber/peloton/pkg/placement/models"
 	offers_mock "github.com/uber/peloton/pkg/placement/offers/mocks"
+	"github.com/uber/peloton/pkg/placement/plugins"
 	"github.com/uber/peloton/pkg/placement/plugins/batch"
 	"github.com/uber/peloton/pkg/placement/plugins/mimir"
 	"github.com/uber/peloton/pkg/placement/plugins/mimir/lib/algorithms"
@@ -486,14 +487,18 @@ func TestEnginePlaceCallToStrategy(t *testing.T) {
 		Return(map[int]int{})
 
 	mockStrategy.EXPECT().
-		Filters(
+		GroupTasksByPlacementNeeds(
 			gomock.Any()).
-		Return(map[*hostsvc.HostFilter][]*models.Assignment{nil: {assignment}})
+		Return([]*plugins.TasksByPlacementNeeds{
+			{PlacementNeeds: plugins.PlacementNeeds{}, Tasks: []int{0}},
+		})
 
 	mockStrategy.EXPECT().
-		Filters(
+		GroupTasksByPlacementNeeds(
 			gomock.Any()).
-		Return(map[*hostsvc.HostFilter][]*models.Assignment{nil: {assignment2}})
+		Return([]*plugins.TasksByPlacementNeeds{
+			{PlacementNeeds: plugins.PlacementNeeds{}, Tasks: []int{0}},
+		})
 
 	mockStrategy.EXPECT().
 		ConcurrencySafe().
@@ -680,39 +685,6 @@ func TestEngineCleanup(t *testing.T) {
 		Return()
 
 	engine.cleanup(context.Background(), assignments, nil, assignments, hosts)
-}
-
-func TestEngineCreatePlacement(t *testing.T) {
-	ctrl, engine, _, _, _ := setupEngine(t)
-	defer ctrl.Finish()
-
-	now := time.Now()
-	deadline := now.Add(30 * time.Second)
-	host := testutil.SetupHostOffers()
-	assignment1 := testutil.SetupAssignment(deadline, 1)
-	assignment1.SetHost(host)
-	assignment2 := testutil.SetupAssignment(deadline, 1)
-	assignments := []*models.Assignment{
-		assignment1,
-		assignment2,
-	}
-
-	placements := engine.createPlacement(assignments)
-	assert.Equal(t, 1, len(placements))
-	assert.Equal(t, host.GetOffer().GetHostname(), placements[0].GetHostname())
-	assert.Equal(t, host.GetOffer().GetId(), placements[0].GetHostOfferID())
-	assert.Equal(t, host.GetOffer().AgentId, placements[0].GetAgentId())
-	assert.Equal(t,
-		assignment1.GetTask().GetTask().GetType(),
-		placements[0].GetType())
-	assert.Equal(t,
-		[]*resmgr.Placement_Task{
-			{
-				PelotonTaskID: assignment1.GetTask().GetTask().GetId(),
-				MesosTaskID:   assignment1.GetTask().GetTask().GetTaskId(),
-			},
-		}, placements[0].GetTaskIDs())
-	assert.Equal(t, 3, len(placements[0].GetPorts()))
 }
 
 func TestEngineFindUnusedOffers(t *testing.T) {

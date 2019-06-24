@@ -15,31 +15,40 @@
 package models
 
 import (
-	"math"
-
 	log "github.com/sirupsen/logrus"
 
 	"github.com/uber/peloton/.gen/peloton/api/v0/job"
-	"github.com/uber/peloton/.gen/peloton/api/v0/task"
-	peloton_api_v0_task "github.com/uber/peloton/.gen/peloton/api/v0/task"
 	"github.com/uber/peloton/.gen/peloton/private/hostmgr/hostsvc"
-
 	"github.com/uber/peloton/pkg/hostmgr/scalar"
+	"github.com/uber/peloton/pkg/placement/plugins"
 )
+
+const (
+	_defaultMaxHosts = 1
+)
+
+var _ plugins.Task = &Assignment{}
+
+// AssignmentsToTasks converts a slice of assignments into a slice
+// of tasks for plugin use.
+func AssignmentsToTasks(assignments []*Assignment) []plugins.Task {
+	tasks := []plugins.Task{}
+	for _, a := range assignments {
+		tasks = append(tasks, a)
+	}
+	return tasks
+}
 
 // Assignment represents the assignment of a task to a host.
 // One host can be used in multiple assignments.
 type Assignment struct {
-	HostOffers *HostOffers `json:"host"`
-	Task       *Task       `json:"task"`
-	Reason     string
+	HostOffers       *HostOffers `json:"host"`
+	Task             *TaskV0     `json:"task"`
+	PlacementFailure string
 }
 
-// Assignments is a list of Assignments.
-type Assignments []*Assignment
-
 // NewAssignment will create a new empty assignment from a task.
-func NewAssignment(task *Task) *Assignment {
+func NewAssignment(task *TaskV0) *Assignment {
 	return &Assignment{
 		Task: task,
 	}
@@ -56,29 +65,23 @@ func (a *Assignment) SetHost(host *HostOffers) {
 }
 
 // GetTask returns the task of the assignment.
-func (a *Assignment) GetTask() *Task {
+func (a *Assignment) GetTask() *TaskV0 {
 	return a.Task
 }
 
 // SetTask sets the task in the assignment to the given task.
-func (a *Assignment) SetTask(task *Task) {
+func (a *Assignment) SetTask(task *TaskV0) {
 	a.Task = task
 }
 
-// GetReason returns the reason why the assignment was unsuccessful
-func (a *Assignment) GetReason() string {
-	return a.Reason
+// GetPlacementFailure returns the reason why the assignment was unsuccessful
+func (a *Assignment) GetPlacementFailure() string {
+	return a.PlacementFailure
 }
 
-// SetReason sets the reason for the failed assignment
-func (a *Assignment) SetReason(reason string) {
-	a.Reason = reason
-}
-
-// GetConstraint returns the stringified scheduling constraint of that
-// assignment.
-func (a *Assignment) GetConstraint() *peloton_api_v0_task.Constraint {
-	return a.GetTask().GetTask().GetConstraint()
+// SetPlacementFailure sets the reason for the failed assignment
+func (a *Assignment) SetPlacementFailure(failureReason string) {
+	a.PlacementFailure = failureReason
 }
 
 // GetUsage returns the resource and port usage of this assignment.
@@ -113,126 +116,53 @@ func (a *Assignment) Fits(
 	return remains, portsLeft - portsUsed, true
 }
 
-// GetHostHints returns the host hints for the host manager service
-// that matches this assignment.
-func (a *Assignment) GetHostHints() []*hostsvc.FilterHint_Host {
-	resmgrTask := a.GetTask().GetTask()
-	if len(resmgrTask.GetDesiredHost()) == 0 {
-		return nil
-	}
-	return []*hostsvc.FilterHint_Host{
-		{
-			Hostname: resmgrTask.GetDesiredHost(),
-			TaskID:   resmgrTask.GetId(),
-		},
-	}
+// ID returns the id of the task that the assignment represents.
+func (a *Assignment) ID() string {
+	return a.GetTask().GetTask().GetId().GetValue()
 }
 
-// GetSimpleHostFilter returns the simplest host filter that matches
-// this assignment. It includes a ResourceConstraint and a
-// SchedulingConstraint.
-func (a *Assignment) GetSimpleHostFilter() *hostsvc.HostFilter {
+// NeedsSpread returns whether this task was asked to be spread
+// onto the hosts in its gang.
+func (a *Assignment) NeedsSpread() bool {
+	spreadStrat := job.PlacementStrategy_PLACEMENT_STRATEGY_SPREAD_JOB
+	return a.GetTask().GetTask().GetPlacementStrategy() == spreadStrat
+}
+
+// PreferredHost returns the host preference for this task.
+func (a *Assignment) PreferredHost() string {
+	return a.GetTask().GetTask().GetDesiredHost()
+}
+
+// GetPlacementNeeds returns the placement needs of this task.
+func (a *Assignment) GetPlacementNeeds() plugins.PlacementNeeds {
 	rmTask := a.GetTask().GetTask()
-	result := &hostsvc.HostFilter{
-		ResourceConstraint: &hostsvc.ResourceConstraint{
-			Minimum:   rmTask.Resource,
-			NumPorts:  rmTask.NumPorts,
-			Revocable: rmTask.Revocable,
-		},
-		Hint: &hostsvc.FilterHint{},
+	needs := plugins.PlacementNeeds{
+		Resources:  scalar.FromResourceConfig(rmTask.GetResource()),
+		Ports:      uint64(rmTask.GetNumPorts()),
+		Revocable:  rmTask.Revocable,
+		FDs:        rmTask.GetResource().GetFdLimit(),
+		MaxHosts:   _defaultMaxHosts,
+		HostHints:  map[string]string{},
+		Constraint: rmTask.Constraint,
 	}
-	if constraint := rmTask.Constraint; constraint != nil {
-		result.SchedulingConstraint = constraint
+	if a.PreferredHost() != "" {
+		needs.HostHints[a.ID()] = a.PreferredHost()
 	}
 	// To spread out tasks over hosts, request host-manager
 	// to rank hosts randomly instead of a predictable order such
 	// as most-loaded.
 	if rmTask.GetPlacementStrategy() == job.PlacementStrategy_PLACEMENT_STRATEGY_SPREAD_JOB {
-		result.Hint.RankHint = hostsvc.FilterHint_FILTER_HINT_RANKING_RANDOM
+		needs.RankHint = hostsvc.FilterHint_FILTER_HINT_RANKING_RANDOM
 	}
-	return result
+	return needs
 }
 
-// GetFullHostFilter returns the full host filter complete with quantity
-// and hints.
-func (a *Assignment) GetFullHostFilter() *hostsvc.HostFilter {
-	filter := a.GetSimpleHostFilter()
-	filter.Quantity = &hostsvc.QuantityControl{MaxHosts: 1}
-	filter.Hint = &hostsvc.FilterHint{
-		RankHint: filter.Hint.RankHint,
-		HostHint: a.GetHostHints(),
-	}
-	return filter
+// IsReadyForHostReservation returns true if this task is ready for host reservation.
+func (a *Assignment) IsReadyForHostReservation() bool {
+	return a.GetTask().GetTask().ReadyForHostReservation
 }
 
-// MergeHostFilter returns a new host filter that matches this assignment's
-// filter as well as the previous filter. resulting filter is the union
-// of the new and current filters either of the filters.
-// This method assumes that the SchedulingConstraint is the same for this
-// assignment and the passed in filter.
-func (a *Assignment) MergeHostFilter(
-	filter *hostsvc.HostFilter,
-) *hostsvc.HostFilter {
-	if filter == nil {
-		return a.GetFullHostFilter()
-	}
-
-	resmgrTask := a.GetTask().GetTask()
-	filter.Quantity.MaxHosts++
-	filter.Hint.HostHint = append(filter.Hint.HostHint,
-		a.GetHostHints()...)
-	filter.ResourceConstraint.NumPorts = uint32(
-		math.Max(float64(resmgrTask.NumPorts),
-			float64(filter.ResourceConstraint.NumPorts)),
-	)
-
-	filter.ResourceConstraint.Minimum = &task.ResourceConfig{
-		CpuLimit: math.Max(resmgrTask.GetResource().GetCpuLimit(),
-			filter.ResourceConstraint.GetMinimum().GetCpuLimit()),
-		GpuLimit: math.Max(resmgrTask.GetResource().GetGpuLimit(),
-			filter.ResourceConstraint.GetMinimum().GetGpuLimit()),
-		MemLimitMb: math.Max(resmgrTask.GetResource().GetMemLimitMb(),
-			filter.ResourceConstraint.GetMinimum().GetMemLimitMb()),
-		DiskLimitMb: math.Max(resmgrTask.GetResource().GetDiskLimitMb(),
-			filter.ResourceConstraint.GetMinimum().GetDiskLimitMb()),
-	}
-	return filter
-}
-
-// GroupByHostFilter groups the assignments according to the result of
-// a function that takes in an assignment.
-func (as Assignments) GroupByHostFilter(
-	fn func(a *Assignment) *hostsvc.HostFilter,
-) map[*hostsvc.HostFilter]Assignments {
-	groups := map[string]*hostsvc.HostFilter{}
-	filters := map[*hostsvc.HostFilter]Assignments{}
-	for _, a := range as {
-		filter := fn(a)
-		s := filter.String()
-		if _, exists := groups[s]; !exists {
-			groups[s] = filter
-		}
-		filter = groups[s]
-		filters[filter] = append(filters[filter], a)
-	}
-	return filters
-}
-
-// MergeHostFilters merges the filters of all the assignment into a
-// single HostFilter that encapsulates all of their resource constraints.
-// It also takes care of aggregating all of the hints into that
-// filter, as well as a SchedulingConstraint and a Quantity.
-// Returns nil if the length of the assignment list is 0.
-func (as Assignments) MergeHostFilters() *hostsvc.HostFilter {
-	var filter *hostsvc.HostFilter
-	for _, a := range as {
-		filter = a.MergeHostFilter(filter)
-	}
-	return filter
-}
-
-// GetPlacementStrategy returns the placement strategy for this list
-// of assignments.
-func (as Assignments) GetPlacementStrategy() job.PlacementStrategy {
-	return as[0].GetTask().GetTask().GetPlacementStrategy()
+// IsRevocable returns true if the task should run on revocable resources.
+func (a *Assignment) IsRevocable() bool {
+	return a.GetTask().GetTask().Revocable
 }

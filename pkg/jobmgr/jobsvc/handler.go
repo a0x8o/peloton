@@ -80,6 +80,7 @@ func InitServiceHandler(
 		taskStore:       taskStore,
 		jobIndexOps:     ormobjects.NewJobIndexOps(ormStore),
 		jobConfigOps:    ormobjects.NewJobConfigOps(ormStore),
+		jobRuntimeOps:   ormobjects.NewJobRuntimeOps(ormStore),
 		secretInfoOps:   ormobjects.NewSecretInfoOps(ormStore),
 		respoolClient:   respool.NewResourceManagerYARPCClient(d.ClientConfig(clientName)),
 		resmgrClient:    resmgrsvc.NewResourceManagerServiceYARPCClient(d.ClientConfig(clientName)),
@@ -100,6 +101,7 @@ type serviceHandler struct {
 	taskStore       storage.TaskStore
 	jobIndexOps     ormobjects.JobIndexOps
 	jobConfigOps    ormobjects.JobConfigOps
+	jobRuntimeOps   ormobjects.JobRuntimeOps
 	secretInfoOps   ormobjects.SecretInfoOps
 	respoolClient   respool.ResourceManagerYARPCClient
 	resmgrClient    resmgrsvc.ResourceManagerServiceYARPCClient
@@ -443,7 +445,7 @@ func (h *serviceHandler) Get(
 		ctx,
 		req.Id,
 		h.jobFactory,
-		h.jobStore,
+		h.jobRuntimeOps,
 	)
 	if err != nil {
 		h.metrics.JobGetFail.Inc(1)
@@ -524,7 +526,7 @@ func (h *serviceHandler) Refresh(ctx context.Context, req *job.RefreshRequest) (
 		return nil, yarpcerrors.UnavailableErrorf("Job Refresh API not suppported on non-leader")
 	}
 
-	jobRuntime, err := h.jobStore.GetJobRuntime(ctx, req.GetId().GetValue())
+	jobRuntime, err := h.jobRuntimeOps.Get(ctx, req.GetId())
 	if err != nil {
 		log.WithError(err).
 			WithField("job_id", req.GetId().GetValue()).
@@ -646,7 +648,7 @@ func (h *serviceHandler) Delete(
 	h.metrics.JobAPIDelete.Inc(1)
 
 	jobRuntime, err := handler.GetJobRuntimeWithoutFillingCache(
-		ctx, req.Id, h.jobFactory, h.jobStore)
+		ctx, req.Id, h.jobFactory, h.jobRuntimeOps)
 	if err != nil {
 		log.WithError(err).
 			WithField("job_id", req.GetId().GetValue()).

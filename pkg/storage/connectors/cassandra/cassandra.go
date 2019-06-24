@@ -19,9 +19,6 @@ import (
 	"reflect"
 	"time"
 
-	"github.com/uber/peloton/pkg/common/backoff"
-	pelotoncassandra "github.com/uber/peloton/pkg/storage/cassandra"
-	"github.com/uber/peloton/pkg/storage/cassandra/impl"
 	"github.com/uber/peloton/pkg/storage/objects/base"
 	"github.com/uber/peloton/pkg/storage/orm"
 
@@ -61,24 +58,15 @@ type cassandraConnector struct {
 	executeFailScope tally.Scope
 
 	// Conf is the Cassandra connector config for this cluster
-	Conf *pelotoncassandra.Config
-	// retryPolicy defines a DB query retry policy for this connector
-	retryPolicy backoff.RetryPolicy
-}
-
-// Config is the config for cassandra Store
-type Config struct {
-	// CassandraConn is the cassandra specific configuration
-	CassandraConn *impl.CassandraConn `yaml:"connection"`
-	// Store name is the keyspace name in case of Cassandra
-	StoreName string `yaml:"store_name"`
+	Conf *Config
 }
 
 // NewCassandraConnector initializes a Cassandra Connector
 func NewCassandraConnector(
-	config *pelotoncassandra.Config, scope tally.Scope) (
-	orm.Connector, error) {
-	session, err := impl.CreateStoreSession(
+	config *Config,
+	scope tally.Scope,
+) (orm.Connector, error) {
+	session, err := CreateStoreSession(
 		config.CassandraConn, config.StoreName)
 	if err != nil {
 		return nil, err
@@ -96,8 +84,6 @@ func NewCassandraConnector(
 		executeFailScope: storeScope.Tagged(
 			map[string]string{"result": "fail"}),
 		Conf: config,
-		retryPolicy: backoff.NewRetryPolicy(
-			_defaultRetryAttempts, _defaultRetryTimeout),
 	}, nil
 }
 
@@ -108,6 +94,12 @@ var _ orm.Connector = (*cassandraConnector)(nil)
 // We cannot just use err.Error() as a tag because it contains invalid
 // characters like = : etc. which will be rejected by M3
 func getGocqlErrorTag(err error) string {
+	if yarpcerrors.IsAlreadyExists(err) {
+		return "already_exists"
+	}
+	if yarpcerrors.IsNotFound(err) {
+		return "not_found"
+	}
 	switch err.(type) {
 	case *gocql.RequestErrReadFailure:
 		return "read_failure"
@@ -349,6 +341,9 @@ func (c *cassandraConnector) Get(
 	result := buildResultRow(e, colNamesToRead)
 
 	if err := q.Scan(result...); err != nil {
+		if err == gocql.ErrNotFound {
+			err = yarpcerrors.NotFoundErrorf(err.Error())
+		}
 		sendCounters(c.executeFailScope, e.Name, get, err)
 		return nil, err
 	}

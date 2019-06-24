@@ -21,18 +21,12 @@ import (
 	"reflect"
 	"time"
 
-	pelotoncassandra "github.com/uber/peloton/pkg/storage/cassandra"
-	"github.com/uber/peloton/pkg/storage/cassandra/impl"
 	"github.com/uber/peloton/pkg/storage/objects/base"
 
-	"github.com/gocql/gocql"
 	log "github.com/sirupsen/logrus"
 	"github.com/uber-go/tally"
 	"go.uber.org/yarpc/yarpcerrors"
 )
-
-// C* config
-var config *pelotoncassandra.Config
 
 // C* connector
 var connector *cassandraConnector
@@ -115,8 +109,8 @@ var keyRow = []base.Column{
 // Initialize C* session and create a test table
 func init() {
 	rand.Seed(time.Now().UnixNano())
-	config = &pelotoncassandra.Config{
-		CassandraConn: &impl.CassandraConn{
+	config := &Config{
+		CassandraConn: &CassandraConn{
 			ContactPoints: []string{"127.0.0.1"},
 			Port:          9043,
 			CQLVersion:    "3.4.2",
@@ -125,7 +119,7 @@ func init() {
 		StoreName: "peloton_test",
 	}
 
-	session, err := impl.CreateStoreSession(
+	session, err := CreateStoreSession(
 		config.CassandraConn, config.StoreName)
 	if err != nil {
 		log.Fatal(err)
@@ -192,7 +186,7 @@ func (suite *CassandraConnSuite) TestCreateGetDelete() {
 	// read the row from C* test table for given keys
 	row, err = connector.Get(context.Background(), obj, keyRow)
 	suite.Error(err)
-	suite.Equal(err, gocql.ErrNotFound)
+	suite.True(yarpcerrors.IsNotFound(err))
 
 	// delete this row again from C*. It is a noop for C*
 	// this should not result in error.

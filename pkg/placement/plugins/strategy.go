@@ -15,8 +15,8 @@
 package plugins
 
 import (
-	"github.com/uber/peloton/.gen/peloton/private/hostmgr/hostsvc"
-	"github.com/uber/peloton/pkg/placement/models"
+	"github.com/uber/peloton/pkg/hostmgr/scalar"
+	"github.com/uber/peloton/pkg/placement/plugins/mimir/lib/model/placement"
 )
 
 // Strategy is a placment strategy that will do all the placement logic of
@@ -28,15 +28,87 @@ type Strategy interface {
 	// So for instance: map[int]int{2: 3} means that assignments[2] should
 	// be assigned to hosts[3].
 	// Tasks that could not be placed should map to an index of -1.
-	GetTaskPlacements(assignments []*models.Assignment, hosts []*models.HostOffers) map[int]int
+	GetTaskPlacements(tasks []Task, hosts []Host) map[int]int
 
-	// Filters will take a list of assignments and group them into groups that
+	// GroupTasksByPlacementNeeds will take a list of assignments and group them into groups that
 	// should use the same host filter to acquire offers from the host manager.
-	Filters(assignments []*models.Assignment) map[*hostsvc.HostFilter][]*models.Assignment
+	// Returns a list of TasksByPlacementNeedss, which group the tasks that share the same
+	// placement needs.
+	GroupTasksByPlacementNeeds(tasks []Task) []*TasksByPlacementNeeds
 
 	// ConcurrencySafe returns true iff the strategy is concurrency safe. If
 	// the strategy is concurrency safe then it is safe for multiple
 	// go-routines to run the GetTaskPlacements method concurrently, else only one
 	// go-routine is allowed to run the GetTaskPlacements method at a time.
 	ConcurrencySafe() bool
+}
+
+// PlacementNeeds is the struct that is needed to construct API calls to
+// HostManager to acquire host offers/leases.
+type PlacementNeeds struct {
+	// The minimum available resources for each host.
+	Resources scalar.Resources
+
+	// The minimum number of ports that each host needs.
+	Ports uint64
+
+	// IsRevocable returns whether or not the host filter is for
+	// revocable resources.
+	Revocable bool
+
+	// The minimum number of FDs that each host needs.
+	FDs uint32
+
+	// The maximum number of hosts required.
+	MaxHosts uint32
+
+	// A map from task/pod ID to preferred hostname.
+	HostHints map[string]string
+
+	// TODO: Constraint
+	Constraint interface{}
+
+	// TODO: RankingHint
+	RankHint interface{}
+}
+
+// Task is the interface that the Strategy takes in and tries to place on
+// Hosts.
+type Task interface {
+	// Returns the ID of the task.
+	ID() string
+
+	// Tries to fit the task on the host resources passed in as arguments.
+	// Returns as last argument whether or not that operation succeeded.
+	// Also returns the new resources after this task was fitted onto the host.
+	// NOTE: The resources returned are same as the ones passed in if the "fit"
+	// failed.
+	Fits(resLeft scalar.Resources, portsLeft uint64) (scalar.Resources, uint64, bool)
+
+	// Sets the placement failure reason for this task.
+	SetPlacementFailure(string)
+
+	// Returns the mimir entity representing this task.
+	// TODO: Remove this, it should definitely not be here.
+	ToMimirEntity() *placement.Entity
+
+	// Returns whether or not this task should be spread on hosts, instead of packed.
+	// TODO: Remove this, it should definitely not be here.
+	NeedsSpread() bool
+
+	// Returns the preferred hostname for this task.
+	PreferredHost() string
+
+	// A task inherently has its own PlacementNeeds.
+	GetPlacementNeeds() PlacementNeeds
+}
+
+// Host is the interface that the host offers or leases must satisfy in order
+// to be used by the placement strategy.
+type Host interface {
+	// Returns the free resources on this host.
+	GetAvailableResources() (res scalar.Resources, ports uint64)
+
+	// Returns the mimir group representing the host lease or offer.
+	ToMimirGroup() *placement.Group
 }

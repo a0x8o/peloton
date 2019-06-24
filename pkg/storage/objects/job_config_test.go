@@ -19,7 +19,6 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/gocql/gocql"
 	mesos_v1 "github.com/uber/peloton/.gen/mesos/v1"
 	"github.com/uber/peloton/.gen/peloton/api/v0/job"
 	"github.com/uber/peloton/.gen/peloton/api/v0/peloton"
@@ -31,6 +30,7 @@ import (
 	"github.com/golang/protobuf/proto"
 	"github.com/pborman/uuid"
 	"github.com/stretchr/testify/suite"
+	"go.uber.org/yarpc/yarpcerrors"
 )
 
 type JobConfigObjectTestSuite struct {
@@ -43,6 +43,7 @@ type JobConfigObjectTestSuite struct {
 }
 
 func (s *JobConfigObjectTestSuite) SetupTest() {
+	setupTestStore()
 	s.buildConfig()
 }
 
@@ -71,8 +72,31 @@ func (s *JobConfigObjectTestSuite) TestCreateGetDeleteJobConfig() {
 
 	_, _, err = jobConfigOps.Get(ctx, s.jobID, version)
 	s.Error(err)
-	s.Equal(err, gocql.ErrNotFound)
+	s.True(yarpcerrors.IsNotFound(err))
+}
 
+// TestGetCurrentVersion tests getting current version of JobConfigObject
+func (s *JobConfigObjectTestSuite) TestGetCurrentVersion() {
+	jobConfigOps := NewJobConfigOps(testStore)
+	jobRuntimeOps := NewJobRuntimeOps(testStore)
+	ctx := context.Background()
+
+	runtime := &job.RuntimeInfo{
+		State:                job.JobState_INITIALIZED,
+		GoalState:            job.JobState_SUCCEEDED,
+		ConfigurationVersion: 1,
+	}
+
+	err := jobRuntimeOps.Upsert(ctx, s.jobID, runtime)
+	s.NoError(err)
+
+	err = jobConfigOps.Create(ctx, s.jobID, s.config, s.configAddOn, uint64(1))
+	s.NoError(err)
+
+	config, configAddOn, err := jobConfigOps.GetCurrentVersion(ctx, s.jobID)
+	s.NoError(err)
+	s.True(proto.Equal(config, s.config))
+	s.True(proto.Equal(configAddOn, s.configAddOn))
 }
 
 // TestCreateGetDeleteJobConfigFail tests failure cases due to ORM Client errors
@@ -87,7 +111,7 @@ func (s *JobConfigObjectTestSuite) TestCreateGetDeleteJobConfigFail() {
 	mockClient.EXPECT().CreateIfNotExists(gomock.Any(), gomock.Any()).
 		Return(errors.New("createifnotexists failed"))
 	mockClient.EXPECT().Get(gomock.Any(), gomock.Any()).
-		Return(errors.New("get failed"))
+		Return(errors.New("get failed")).Times(2)
 	mockClient.EXPECT().Delete(gomock.Any(), gomock.Any()).
 		Return(errors.New("delete failed"))
 
@@ -101,6 +125,10 @@ func (s *JobConfigObjectTestSuite) TestCreateGetDeleteJobConfigFail() {
 	_, _, err = configOps.Get(ctx, s.jobID, version)
 	s.Error(err)
 	s.Equal("get failed", err.Error())
+
+	_, _, err = configOps.GetCurrentVersion(ctx, s.jobID)
+	s.Error(err)
+	s.Equal("Failed to get Job Runtime: get failed", err.Error())
 
 	err = configOps.Delete(ctx, s.jobID, version)
 	s.Error(err)

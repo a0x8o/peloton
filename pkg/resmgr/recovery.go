@@ -33,6 +33,7 @@ import (
 	"github.com/uber/peloton/pkg/resmgr/respool"
 	rmtask "github.com/uber/peloton/pkg/resmgr/task"
 	"github.com/uber/peloton/pkg/storage"
+	ormobjects "github.com/uber/peloton/pkg/storage/objects"
 
 	"github.com/pkg/errors"
 	log "github.com/sirupsen/logrus"
@@ -58,6 +59,14 @@ var (
 		task.TaskState_KILLED:      true,
 		task.TaskState_LOST:        true,
 		task.TaskState_INITIALIZED: true,
+	}
+	// runningTaskStates are the task states which are 'running' on the underlying system (such as Mesos).
+	runningTaskStates = map[task.TaskState]bool{
+		task.TaskState_LAUNCHED:   true,
+		task.TaskState_STARTING:   true,
+		task.TaskState_RUNNING:    true,
+		task.TaskState_KILLING:    true,
+		task.TaskState_PREEMPTING: true,
 	}
 )
 
@@ -87,6 +96,8 @@ type RecoveryHandler struct {
 	scope           tally.Scope
 	jobStore        storage.JobStore
 	taskStore       storage.TaskStore
+	jobConfigOps    ormobjects.JobConfigOps
+	jobRuntimeOps   ormobjects.JobRuntimeOps
 	handler         *ServiceHandler
 	config          Config
 	hostmgrClient   hostsvc.InternalHostServiceYARPCClient
@@ -106,6 +117,8 @@ func NewRecovery(
 	parent tally.Scope,
 	jobStore storage.JobStore,
 	taskStore storage.TaskStore,
+	jobConfigOps ormobjects.JobConfigOps,
+	jobRuntimeOps ormobjects.JobRuntimeOps,
 	handler *ServiceHandler,
 	tree respool.Tree,
 	config Config,
@@ -117,6 +130,8 @@ func NewRecovery(
 		config:        config,
 		jobStore:      jobStore,
 		taskStore:     taskStore,
+		jobConfigOps:  jobConfigOps,
+		jobRuntimeOps: jobRuntimeOps,
 		handler:       handler,
 		hostmgrClient: hostmgrClient,
 		tracker:       rmtask.GetTracker(),
@@ -156,6 +171,8 @@ func (r *RecoveryHandler) Start() error {
 		ctx,
 		r.scope,
 		r.jobStore,
+		r.jobConfigOps,
+		r.jobRuntimeOps,
 		r.requeueTasksInRange,
 	)
 	if err != nil {
@@ -332,6 +349,11 @@ func (r *RecoveryHandler) addTaskToTracker(
 	return nil
 }
 
+func isTaskRunning(state task.TaskState) bool {
+	_, ok := runningTaskStates[state]
+	return ok
+}
+
 func (r *RecoveryHandler) loadTasksInRange(
 	ctx context.Context,
 	jobID string,
@@ -367,8 +389,7 @@ func (r *RecoveryHandler) loadTasksInRange(
 				"task_id":    taskID,
 				"task_state": taskInfo.GetRuntime().GetState().String(),
 			}).Debugf("found task for recovery")
-			if taskInfo.GetRuntime().GetState() == task.TaskState_RUNNING ||
-				taskInfo.GetRuntime().GetState() == task.TaskState_LAUNCHED {
+			if isTaskRunning(taskInfo.GetRuntime().GetState()) {
 				runningTasks = append(runningTasks, taskInfo)
 			} else {
 				nonRunningTasks = append(nonRunningTasks, taskInfo)

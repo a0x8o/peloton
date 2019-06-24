@@ -105,6 +105,9 @@ type Task interface {
 	// GoalState of the task.
 	GoalState() TaskStateVector
 
+	// StateSummary of the task.
+	StateSummary() TaskStateSummary
+
 	// DeleteTask deletes any state, if any, stored by the task and let the
 	// listeners know that the task is being deleted.
 	DeleteTask()
@@ -116,6 +119,12 @@ type TaskStateVector struct {
 	State         pbtask.TaskState
 	ConfigVersion uint64
 	MesosTaskID   *mesos.TaskID
+}
+
+type TaskStateSummary struct {
+	CurrentState pbtask.TaskState
+	GoalState    pbtask.TaskState
+	HealthState  pbtask.HealthState
 }
 
 // newTask creates a new cache task object
@@ -510,6 +519,23 @@ func (t *task) DeleteTask() {
 	// There is no state to clean up as of now.
 	// If the goal state was set to DELETED, then let the
 	// listeners know that the task has been deleted.
+
+	var runtimeCopy *pbtask.RuntimeInfo
+	var labelsCopy []*peloton.Label
+
+	// notify listeners after dropping the lock
+	defer func() {
+		if runtimeCopy != nil {
+			t.jobFactory.notifyTaskRuntimeChanged(
+				t.jobID,
+				t.id,
+				t.jobType,
+				runtimeCopy,
+				labelsCopy,
+			)
+		}
+	}()
+
 	t.RLock()
 	defer t.RUnlock()
 
@@ -521,16 +547,9 @@ func (t *task) DeleteTask() {
 		return
 	}
 
-	runtimeCopy := proto.Clone(t.runtime).(*pbtask.RuntimeInfo)
+	runtimeCopy = proto.Clone(t.runtime).(*pbtask.RuntimeInfo)
 	runtimeCopy.State = pbtask.TaskState_DELETED
-	labelsCopy := t.copyLabelsInCache()
-	t.jobFactory.notifyTaskRuntimeChanged(
-		t.jobID,
-		t.id,
-		t.jobType,
-		runtimeCopy,
-		labelsCopy,
-	)
+	labelsCopy = t.copyLabelsInCache()
 }
 
 // ReplaceTask replaces runtime and config in cache with runtime input.
@@ -684,6 +703,17 @@ func (t *task) GoalState() TaskStateVector {
 		State:         t.runtime.GetGoalState(),
 		ConfigVersion: t.runtime.GetDesiredConfigVersion(),
 		MesosTaskID:   t.runtime.GetDesiredMesosTaskId(),
+	}
+}
+
+func (t *task) StateSummary() TaskStateSummary {
+	t.RLock()
+	defer t.RUnlock()
+
+	return TaskStateSummary{
+		CurrentState: t.runtime.GetState(),
+		GoalState:    t.runtime.GetGoalState(),
+		HealthState:  t.runtime.GetHealthy(),
 	}
 }
 

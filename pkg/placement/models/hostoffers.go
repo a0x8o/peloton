@@ -20,6 +20,8 @@ import (
 
 	"github.com/uber/peloton/.gen/peloton/private/hostmgr/hostsvc"
 	"github.com/uber/peloton/.gen/peloton/private/resmgr"
+
+	"github.com/uber/peloton/pkg/hostmgr/scalar"
 )
 
 // NewHostOffers will create a placement host from a host manager host and all the resource manager tasks on it.
@@ -44,6 +46,19 @@ type HostOffers struct {
 	// place once method.
 	data interface{}
 	lock sync.Mutex
+}
+
+// Make sure that that HostOffers satisfies the plugins interface.
+var _ Offer = &HostOffers{}
+
+// ID returns the ID of the offer.
+func (host *HostOffers) ID() string {
+	return host.Offer.GetId().GetValue()
+}
+
+// Hostname returns the hostname that this offer belongs to.
+func (host *HostOffers) Hostname() string {
+	return host.Offer.Hostname
 }
 
 // GetOffer returns the host offer of the host.
@@ -88,4 +103,11 @@ func (host *HostOffers) GetAvailablePortCount() uint64 {
 		}
 	}
 	return ports
+}
+
+// GetAvailableResources returns the available resources of this host offer.
+func (host *HostOffers) GetAvailableResources() (scalar.Resources, uint64) {
+	res := scalar.FromMesosResources(host.GetOffer().GetResources())
+	ports := host.GetAvailablePortCount()
+	return res, ports
 }

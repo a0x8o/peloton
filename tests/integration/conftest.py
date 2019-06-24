@@ -11,12 +11,14 @@ from tools.minicluster.minicluster import run_mesos_agent, teardown_mesos_agent
 from job import Job
 from job import query_jobs as batch_query_jobs
 from job import kill_jobs as batch_kill_jobs
+from host import start_maintenance, complete_maintenance, wait_for_host_state
 from stateless_job import StatelessJob
 from stateless_job import query_jobs as stateless_query_jobs
 from stateless_job import delete_jobs as stateless_delete_jobs
 from m3.client import M3
 from m3.emitter import BatchedEmitter
 from peloton_client.pbgen.peloton.api.v0.job import job_pb2
+from peloton_client.pbgen.peloton.api.v0.host import host_pb2
 from conf_util import (
     TERMINAL_JOB_STATES,
     ACTIVE_JOB_STATES,
@@ -184,13 +186,19 @@ def teardown_minicluster(dump_logs=False):
 
         # dump logs only if tests have failed in the current module
         if dump_logs:
+            # stop containers so that log stream will not block
+            teardown(stop=True)
+
             try:
                 # TODO (varung): enable PE and mesos-master logs if needed
                 cli = Client(base_url="unix://var/run/docker.sock")
-                log.info(cli.logs("peloton-jobmgr0"))
-                log.info(cli.logs("peloton-resmgr0"))
-                log.info(cli.logs("peloton-hostmgr0"))
-                log.info(cli.logs("peloton-aurorabridge0"))
+                for c in ("peloton-jobmgr0",
+                          "peloton-resmgr0",
+                          "peloton-hostmgr0",
+                          "peloton-aurorabridge0"):
+                    for l in cli.logs(c, stream=True):
+                        # remove newline character when logging
+                        log.info(l.rstrip())
             except Exception as e:
                 log.info(e)
 
@@ -321,6 +329,48 @@ def test_job(request):
 @pytest.fixture(params=[True, False])
 def in_place(request):
     return request.param
+
+
+@pytest.fixture
+def maintenance(request):
+    draining_hosts = []
+
+    def start(hosts):
+        resp = start_maintenance(hosts)
+        if not resp:
+            log.error("Start maintenance failed:" + resp)
+            return resp
+
+        draining_hosts.extend(hosts)
+        return resp
+
+    def stop(hosts):
+        resp = complete_maintenance(hosts)
+        if not resp:
+            log.error("Complete maintenance failed:" + resp)
+            return resp
+
+        for h in hosts:
+            draining_hosts.remove(h)
+            # The mesos-agent containers needs to be started explicitly as they would
+            # have been stopped when the agents transition to DOWN
+            Container([h]).start()
+
+        return resp
+
+    def clean_up():
+        if not draining_hosts:
+            return
+        for h in draining_hosts:
+            wait_for_host_state(h, host_pb2.HOST_STATE_DOWN)
+        stop(draining_hosts)
+
+    request.addfinalizer(clean_up)
+
+    response = dict()
+    response["start"] = start
+    response["stop"] = stop
+    return response
 
 
 """

@@ -55,6 +55,7 @@ import (
 	"github.com/uber/peloton/pkg/jobmgr/workflow/progress"
 	"github.com/uber/peloton/pkg/middleware/inbound"
 	"github.com/uber/peloton/pkg/middleware/outbound"
+	"github.com/uber/peloton/pkg/storage/cassandra"
 	ormobjects "github.com/uber/peloton/pkg/storage/objects"
 	"github.com/uber/peloton/pkg/storage/stores"
 
@@ -382,7 +383,7 @@ func main() {
 	// and FrameworkInfoStore
 	store := stores.MustCreateStore(&cfg.Storage, rootScope)
 	ormStore, ormErr := ormobjects.NewCassandraStore(
-		&cfg.Storage.Cassandra,
+		cassandra.ToOrmConfig(&cfg.Storage.Cassandra),
 		rootScope)
 	if ormErr != nil {
 		log.WithError(ormErr).Fatal("Failed to create ORM store for Cassandra")
@@ -658,7 +659,7 @@ func main() {
 	tasksvc.InitServiceHandler(
 		dispatcher,
 		rootScope,
-		store, // store implements JobStore
+		ormStore,
 		store, // store implements TaskStore
 		store, // store implements UpdateStore
 		store, // store implements FrameworkInfoStore
@@ -695,7 +696,7 @@ func main() {
 	updatesvc.InitServiceHandler(
 		dispatcher,
 		rootScope,
-		store, // store implements JobStore
+		ormStore,
 		store, // store implements UpdateStore
 		goalStateDriver,
 		jobFactory,
