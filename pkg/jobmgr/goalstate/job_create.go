@@ -21,8 +21,10 @@ import (
 	"github.com/uber/peloton/.gen/peloton/api/v0/job"
 	"github.com/uber/peloton/.gen/peloton/api/v0/peloton"
 	"github.com/uber/peloton/.gen/peloton/api/v0/task"
+	"github.com/uber/peloton/.gen/peloton/api/v1alpha/job/stateless"
 	"github.com/uber/peloton/.gen/peloton/private/resmgrsvc"
 
+	"github.com/uber/peloton/pkg/common"
 	"github.com/uber/peloton/pkg/common/goalstate"
 	"github.com/uber/peloton/pkg/common/taskconfig"
 	"github.com/uber/peloton/pkg/common/util"
@@ -47,14 +49,20 @@ func JobCreateTasks(ctx context.Context, entity goalstate.Entity) error {
 	jobID := &peloton.JobID{Value: id}
 	goalStateDriver := entity.(*jobEntity).driver
 
-	jobConfig, configAddOn, err :=
-		goalStateDriver.jobConfigOps.GetCurrentVersion(ctx, jobID)
+	obj, err :=
+		goalStateDriver.jobConfigOps.GetResultCurrentVersion(ctx, jobID)
 	if err != nil {
 		goalStateDriver.mtx.jobMetrics.JobCreateFailed.Inc(1)
 		log.WithError(err).
 			WithField("job_id", id).
 			Error("failed to get job config while creating tasks")
 		return err
+	}
+	jobConfig = obj.JobConfig
+	configAddOn := obj.ConfigAddOn
+	var spec *stateless.JobSpec
+	if obj.ApiVersion == common.V1AlphaApi {
+		spec = obj.JobSpec
 	}
 
 	instances := jobConfig.InstanceCount
@@ -65,7 +73,13 @@ func JobCreateTasks(ctx context.Context, entity goalstate.Entity) error {
 	}
 
 	// First create task configs
-	if err = cachedJob.CreateTaskConfigs(ctx, jobID, jobConfig, configAddOn); err != nil {
+	if err = cachedJob.CreateTaskConfigs(
+		ctx,
+		jobID,
+		jobConfig,
+		configAddOn,
+		spec,
+	); err != nil {
 		goalStateDriver.mtx.jobMetrics.JobCreateFailed.Inc(1)
 		log.WithError(err).
 			WithField("job_id", id).
@@ -97,8 +111,11 @@ func JobCreateTasks(ctx context.Context, entity goalstate.Entity) error {
 	}
 
 	err = cachedJob.Update(ctx, &job.JobInfo{
-		Runtime: &job.RuntimeInfo{State: job.JobState_PENDING},
+		Runtime: &job.RuntimeInfo{
+			State: job.JobState_PENDING,
+		},
 	}, configAddOn,
+		nil,
 		cached.UpdateCacheAndDB)
 	if err != nil {
 		goalStateDriver.mtx.jobMetrics.JobCreateFailed.Inc(1)
@@ -369,9 +386,15 @@ func transitTasksToPending(
 		return nil
 	}
 
-	err := cachedJob.PatchTasks(ctx, runtimeDiffs)
+	_, instancesToRetry, err := cachedJob.PatchTasks(ctx, runtimeDiffs, false)
 	if err != nil {
 		return errors.Wrap(err, "failed to update task runtime to pending")
 	}
+
+	if len(instancesToRetry) != 0 {
+		// throw error here so that the action is retried
+		return errors.Wrap(_errTasksNotInCache, "failed to update task runtime to pending")
+	}
+
 	return nil
 }

@@ -17,6 +17,7 @@ package hostmgr
 import (
 	"errors"
 	"fmt"
+	"math/rand"
 	"sort"
 	"strings"
 	"sync"
@@ -30,13 +31,12 @@ import (
 	hpb "github.com/uber/peloton/.gen/peloton/api/v0/host"
 	"github.com/uber/peloton/.gen/peloton/api/v0/peloton"
 	"github.com/uber/peloton/.gen/peloton/api/v0/task"
-	"github.com/uber/peloton/.gen/peloton/api/v0/volume"
+	halphapb "github.com/uber/peloton/.gen/peloton/api/v1alpha/host"
 	pb_eventstream "github.com/uber/peloton/.gen/peloton/private/eventstream"
 	"github.com/uber/peloton/.gen/peloton/private/hostmgr/hostsvc"
 
 	hostsvcmocks "github.com/uber/peloton/.gen/peloton/private/hostmgr/hostsvc/mocks"
 	"github.com/uber/peloton/pkg/common/queue"
-	"github.com/uber/peloton/pkg/common/reservation"
 	"github.com/uber/peloton/pkg/common/util"
 	bin_packing "github.com/uber/peloton/pkg/hostmgr/binpacking"
 	"github.com/uber/peloton/pkg/hostmgr/config"
@@ -53,7 +53,6 @@ import (
 	task_state_mocks "github.com/uber/peloton/pkg/hostmgr/task/mocks"
 	"github.com/uber/peloton/pkg/hostmgr/watchevent"
 	watchmocks "github.com/uber/peloton/pkg/hostmgr/watchevent/mocks"
-	storage_mocks "github.com/uber/peloton/pkg/storage/mocks"
 
 	"github.com/gogo/protobuf/proto"
 	"github.com/golang/mock/gomock"
@@ -184,16 +183,6 @@ func generateLaunchableTasks(numTasks int) []*hostsvc.LaunchableTask {
 					Value: &tmpCmd,
 				},
 			},
-			Volume: &hostsvc.Volume{
-				Resource: util.NewMesosResourceBuilder().
-					WithName("disk").
-					WithValue(1.0).
-					Build(),
-				ContainerPath: "test",
-				Id: &peloton.VolumeID{
-					Value: "volumeid",
-				},
-			},
 		})
 	}
 	return tasks
@@ -208,7 +197,6 @@ type HostMgrHandlerTestSuite struct {
 	schedulerClient        *mpb_mocks.MockSchedulerClient
 	masterOperatorClient   *mpb_mocks.MockMasterOperatorClient
 	provider               *hostmgr_mesos_mocks.MockFrameworkInfoProvider
-	volumeStore            *storage_mocks.MockPersistentVolumeStore
 	pool                   offerpool.Pool
 	handler                *ServiceHandler
 	frameworkID            *mesos.FrameworkID
@@ -219,7 +207,9 @@ type HostMgrHandlerTestSuite struct {
 	maintenanceHostInfoMap *hm.MockMaintenanceHostInfoMap
 	taskStateManager       *task_state_mocks.MockStateManager
 	watchProcessor         *watchmocks.MockWatchProcessor
-	watchEventServer       *hostsvcmocks.MockInternalHostServiceServiceWatchEventYARPCServer
+	watchEventStreamServer *hostsvcmocks.MockInternalHostServiceServiceWatchEventStreamEventYARPCServer
+	watchHostSummaryServer *hostsvcmocks.MockInternalHostServiceServiceWatchHostSummaryEventYARPCServer
+	topicsSupported        []watchevent.Topic
 }
 
 func (suite *HostMgrHandlerTestSuite) SetupSuite() {
@@ -249,9 +239,12 @@ func (suite *HostMgrHandlerTestSuite) SetupTest() {
 	suite.schedulerClient = mpb_mocks.NewMockSchedulerClient(suite.ctrl)
 	suite.masterOperatorClient = mpb_mocks.NewMockMasterOperatorClient(suite.ctrl)
 	suite.provider = hostmgr_mesos_mocks.NewMockFrameworkInfoProvider(suite.ctrl)
-	suite.volumeStore = storage_mocks.NewMockPersistentVolumeStore(suite.ctrl)
 	suite.mesosDetector = hostmgr_mesos_mocks.NewMockMasterDetector(suite.ctrl)
 	suite.taskStateManager = task_state_mocks.NewMockStateManager(suite.ctrl)
+	suite.watchProcessor = watchmocks.NewMockWatchProcessor(suite.ctrl)
+	suite.watchEventStreamServer = hostsvcmocks.NewMockInternalHostServiceServiceWatchEventStreamEventYARPCServer(suite.ctrl)
+	suite.watchHostSummaryServer = hostsvcmocks.NewMockInternalHostServiceServiceWatchHostSummaryEventYARPCServer(suite.ctrl)
+	suite.topicsSupported = []watchevent.Topic{watchevent.EventStream, watchevent.HostSummary}
 
 	mockValidValue := new(string)
 	*mockValidValue = _frameworkID
@@ -264,25 +257,22 @@ func (suite *HostMgrHandlerTestSuite) SetupTest() {
 		_offerHoldTime,
 		suite.schedulerClient,
 		offerpool.NewMetrics(suite.testScope.SubScope("offer")),
-		nil,               /* frameworkInfoProvider */
-		suite.volumeStore, /* volumeStore */
-		[]string{},        /*scarce_resource_types*/
-		[]string{},        /*slack_resource_types*/
+		nil,        /* frameworkInfoProvider */
+		[]string{}, /*scarce_resource_types*/
+		[]string{}, /*slack_resource_types*/
 		bin_packing.GetRankerByName("FIRST_FIT"),
 		time.Duration(30*time.Second),
+		suite.watchProcessor,
 	)
 
 	suite.maintenanceQueue = qm.NewMockMaintenanceQueue(suite.ctrl)
 	suite.maintenanceHostInfoMap = hm.NewMockMaintenanceHostInfoMap(suite.ctrl)
-	suite.watchProcessor = watchmocks.NewMockWatchProcessor(suite.ctrl)
-	suite.watchEventServer = hostsvcmocks.NewMockInternalHostServiceServiceWatchEventYARPCServer(suite.ctrl)
 	suite.handler = &ServiceHandler{
 		schedulerClient:        suite.schedulerClient,
 		operatorMasterClient:   suite.masterOperatorClient,
 		metrics:                metrics.NewMetrics(suite.testScope),
 		offerPool:              suite.pool,
 		frameworkInfoProvider:  suite.provider,
-		volumeStore:            suite.volumeStore,
 		mesosDetector:          suite.mesosDetector,
 		maintenanceQueue:       suite.maintenanceQueue,
 		maintenanceHostInfoMap: suite.maintenanceHostInfoMap,
@@ -583,6 +573,9 @@ func (suite *HostMgrHandlerTestSuite) TestAcquireReleaseHostOffers() {
 	defer suite.ctrl.Finish()
 
 	numHosts := 5
+	for i := 0; i < numHosts; i++ {
+		suite.watchProcessor.EXPECT().NotifyEventChange(gomock.Any())
+	}
 	suite.pool.AddOffers(context.Background(), generateOffers(numHosts))
 
 	suite.checkResourcesGauges(numHosts, "ready")
@@ -617,6 +610,9 @@ func (suite *HostMgrHandlerTestSuite) TestAcquireReleaseHostOffers() {
 		},
 	}
 
+	for i := 0; i < numHosts*2; i++ {
+		suite.watchProcessor.EXPECT().NotifyEventChange(gomock.Any())
+	}
 	acquiredResp, err = suite.handler.AcquireHostOffers(
 		rootCtx,
 		acquireReq,
@@ -697,6 +693,7 @@ func (suite *HostMgrHandlerTestSuite) TestAcquireAndLaunch() {
 
 	// only create one host offer in this test.
 	numHosts := 1
+	suite.watchProcessor.EXPECT().NotifyEventChange(gomock.Any())
 	acquiredResp, err := suite.acquireHostOffers(numHosts)
 	suite.NoError(err)
 	suite.Nil(acquiredResp.GetError())
@@ -736,6 +733,7 @@ func (suite *HostMgrHandlerTestSuite) TestAcquireAndLaunch() {
 	launchReq.Tasks = generateLaunchableTasks(1)
 
 	gomock.InOrder(
+		suite.watchProcessor.EXPECT().NotifyEventChange(gomock.Any()),
 		// Set expectations on provider
 		suite.provider.EXPECT().GetFrameworkID(context.Background()).Return(
 			suite.frameworkID),
@@ -794,6 +792,7 @@ func (suite *HostMgrHandlerTestSuite) TestAcquireAndLaunchOnNonHeldTask() {
 	defer suite.ctrl.Finish()
 
 	numHosts := 1
+	suite.watchProcessor.EXPECT().NotifyEventChange(gomock.Any())
 	acquiredResp, err := suite.acquireHostOffers(numHosts)
 	suite.NoError(err)
 	suite.Nil(acquiredResp.GetError())
@@ -812,7 +811,8 @@ func (suite *HostMgrHandlerTestSuite) TestAcquireAndLaunchOnNonHeldTask() {
 		Tasks:    []*hostsvc.LaunchableTask{launchabelTask},
 		Id:       acquiredHostOffers[0].GetId(),
 	}
-
+	suite.watchProcessor.EXPECT().NotifyEventChange(gomock.Any())
+	suite.watchProcessor.EXPECT().NotifyEventChange(gomock.Any())
 	// launch on host0 but host1 is held for the task
 	suite.pool.AddOffers(context.Background(), generateOffers(2))
 	hs1, err := suite.pool.GetHostSummary("hostname-1")
@@ -824,6 +824,8 @@ func (suite *HostMgrHandlerTestSuite) TestAcquireAndLaunchOnNonHeldTask() {
 	suite.Equal(hs1.GetHostStatus(), summary.HeldHost)
 
 	gomock.InOrder(
+		// set expectation on watch processor
+		suite.watchProcessor.EXPECT().NotifyEventChange(gomock.Any()),
 		// Set expectations on provider
 		suite.provider.EXPECT().GetFrameworkID(context.Background()).Return(
 			suite.frameworkID),
@@ -869,110 +871,6 @@ func (suite *HostMgrHandlerTestSuite) TestAcquireAndLaunchOnNonHeldTask() {
 	suite.Nil(launchResp.GetError().GetInvalidArgument())
 	// the host should go back to ready state
 	suite.Equal(hs1.GetHostStatus(), summary.ReadyHost)
-}
-
-// This checks the happy case of acquire -> launch sequence using offer operations.
-func (suite *HostMgrHandlerTestSuite) TestAcquireAndLaunchOperation() {
-	defer suite.ctrl.Finish()
-
-	// only create one host offer in this test.
-	numHosts := 1
-	acquiredResp, err := suite.acquireHostOffers(numHosts)
-
-	suite.NoError(err)
-	suite.Nil(acquiredResp.GetError())
-	acquiredHostOffers := acquiredResp.GetHostOffers()
-	suite.Equal(1, len(acquiredHostOffers))
-
-	suite.Equal(
-		int64(1),
-		suite.testScope.Snapshot().Counters()["acquire_host_offers+"].Value())
-
-	// TODO: Add check for number of HostOffers in placing state.
-	suite.checkResourcesGauges(0, "ready")
-	suite.checkResourcesGauges(numHosts, "placing")
-
-	launchOperation := &hostsvc.OfferOperation{
-		Type: hostsvc.OfferOperation_LAUNCH,
-		Launch: &hostsvc.OfferOperation_Launch{
-			Tasks: []*hostsvc.LaunchableTask{},
-		},
-	}
-	// An empty launch request will trigger an error.
-	operationReq := &hostsvc.OfferOperationsRequest{
-		Hostname: acquiredHostOffers[0].GetHostname(),
-		Operations: []*hostsvc.OfferOperation{
-			launchOperation,
-		},
-		Id: acquiredHostOffers[0].GetId(),
-	}
-
-	operationResp, err := suite.handler.OfferOperations(
-		rootCtx,
-		operationReq,
-	)
-
-	suite.NoError(err)
-	suite.NotNil(operationResp.GetError().GetInvalidArgument())
-
-	suite.Equal(
-		int64(1),
-		suite.testScope.Snapshot().Counters()["offer_operations_invalid+"].Value())
-
-	// Generate some launchable tasks.
-	operationReq.Operations[0].Launch.Tasks = generateLaunchableTasks(1)
-
-	gomock.InOrder(
-		// Set expectations on provider
-		suite.provider.EXPECT().GetFrameworkID(context.Background()).Return(
-			suite.frameworkID),
-		// Set expectations on provider
-		suite.provider.EXPECT().GetMesosStreamID(context.Background()).Return(_streamID),
-		// Set expectations on scheduler schedulerClient
-		suite.schedulerClient.EXPECT().
-			Call(
-				gomock.Eq(_streamID),
-				gomock.Any(),
-			).
-			Do(func(_ string, msg proto.Message) {
-				// Verify clientCall message.
-				call := msg.(*sched.Call)
-				suite.Equal(sched.Call_ACCEPT, call.GetType())
-				suite.Equal(_frameworkID, call.GetFrameworkId().GetValue())
-
-				accept := call.GetAccept()
-				suite.NotNil(accept)
-				suite.Equal(1, len(accept.GetOfferIds()))
-				suite.Equal("offer-0", accept.GetOfferIds()[0].GetValue())
-				suite.Equal(1, len(accept.GetOperations()))
-				operation := accept.GetOperations()[0]
-				suite.Equal(
-					mesos.Offer_Operation_LAUNCH,
-					operation.GetType())
-				launch := operation.GetLaunch()
-				suite.NotNil(launch)
-				suite.Equal(1, len(launch.GetTaskInfos()))
-				suite.Equal(
-					fmt.Sprintf(_taskIDFmt, 0),
-					launch.GetTaskInfos()[0].GetTaskId().GetValue())
-			}).
-			Return(nil),
-	)
-
-	operationResp, err = suite.handler.OfferOperations(
-		rootCtx,
-		operationReq,
-	)
-
-	suite.NoError(err)
-	suite.Nil(operationResp.GetError())
-	suite.Equal(
-		int64(1),
-		suite.testScope.Snapshot().Counters()["offer_operations+"].Value())
-
-	// TODO: Add check for number of HostOffers in placing state.
-	suite.checkResourcesGauges(0, "ready")
-	suite.checkResourcesGauges(0, "placing")
 }
 
 // Test happy case of shutdown executor
@@ -1228,6 +1126,8 @@ func (suite *HostMgrHandlerTestSuite) TestKillAndReserveTaskKillFailure() {
 	defer suite.ctrl.Finish()
 
 	numHosts := 2
+	suite.watchProcessor.EXPECT().NotifyEventChange(gomock.Any())
+	suite.watchProcessor.EXPECT().NotifyEventChange(gomock.Any())
 	suite.pool.AddOffers(context.Background(), generateOffers(numHosts))
 
 	t1 := "t1"
@@ -1241,6 +1141,9 @@ func (suite *HostMgrHandlerTestSuite) TestKillAndReserveTaskKillFailure() {
 	}
 	killedTaskIds := make(map[string]bool)
 	mockMutex := &sync.Mutex{}
+	// set expectation on watch processor
+	suite.watchProcessor.EXPECT().NotifyEventChange(gomock.Any())
+	suite.watchProcessor.EXPECT().NotifyEventChange(gomock.Any())
 
 	// Set expectations on provider
 	suite.provider.EXPECT().GetFrameworkID(context.Background()).Return(
@@ -1296,6 +1199,9 @@ func (suite *HostMgrHandlerTestSuite) TestKillAndReserveTask() {
 	defer suite.ctrl.Finish()
 
 	numHosts := 2
+	// set expectation on watch processor
+	suite.watchProcessor.EXPECT().NotifyEventChange(gomock.Any())
+	suite.watchProcessor.EXPECT().NotifyEventChange(gomock.Any())
 	suite.pool.AddOffers(context.Background(), generateOffers(numHosts))
 
 	t1 := "t1"
@@ -1376,7 +1282,7 @@ func (suite *HostMgrHandlerTestSuite) TestKillTask() {
 	}
 	killedTaskIds := make(map[string]bool)
 	mockMutex := &sync.Mutex{}
-
+	suite.watchProcessor.EXPECT().NotifyEventChange(gomock.Any()).AnyTimes()
 	suite.pool.AddOffers(context.Background(), generateOffers(1))
 	// simulate hold for mesosT1 on h1
 	suite.NoError(
@@ -1732,344 +1638,6 @@ func (suite *HostMgrHandlerTestSuite) TestServiceHandlerClusterCapacityWithQuota
 	}
 }
 
-func (suite *HostMgrHandlerTestSuite) TestLaunchOperationWithReservedOffers() {
-	defer suite.ctrl.Finish()
-
-	volumeInfo := &volume.PersistentVolumeInfo{}
-
-	suite.volumeStore.EXPECT().
-		GetPersistentVolume(context.Background(), gomock.Any()).
-		AnyTimes().
-		Return(volumeInfo, nil)
-	suite.volumeStore.EXPECT().
-		UpdatePersistentVolume(context.Background(), volumeInfo).
-		AnyTimes().
-		Return(nil)
-
-	gomock.InOrder(
-		// Set expectations on provider
-		suite.provider.EXPECT().GetFrameworkID(context.Background()).Return(
-			suite.frameworkID),
-		// Set expectations on provider
-		suite.provider.EXPECT().GetMesosStreamID(context.Background()).Return(_streamID),
-		// Set expectations on scheduler schedulerClient
-		suite.schedulerClient.EXPECT().
-			Call(
-				gomock.Eq(_streamID),
-				gomock.Any(),
-			).
-			Do(func(_ string, msg proto.Message) {
-				// Verify clientCall message.
-				call := msg.(*sched.Call)
-				suite.Equal(sched.Call_ACCEPT, call.GetType())
-				suite.Equal(_frameworkID, call.GetFrameworkId().GetValue())
-
-				accept := call.GetAccept()
-				suite.NotNil(accept)
-				suite.Equal(1, len(accept.GetOfferIds()))
-				suite.Equal("offer-0", accept.GetOfferIds()[0].GetValue())
-				suite.Equal(1, len(accept.GetOperations()))
-				launchOp := accept.GetOperations()[0]
-				suite.Equal(
-					mesos.Offer_Operation_LAUNCH,
-					launchOp.GetType())
-				launch := launchOp.GetLaunch()
-				suite.NotNil(launch)
-				suite.Equal(1, len(launch.GetTaskInfos()))
-				suite.Equal(
-					fmt.Sprintf(_taskIDFmt, 0),
-					launch.GetTaskInfos()[0].GetTaskId().GetValue())
-			}).
-			Return(nil),
-	)
-
-	launchOperation := createHostLaunchOperation()
-
-	operationReq := &hostsvc.OfferOperationsRequest{
-		Hostname: "hostname-0",
-		Operations: []*hostsvc.OfferOperation{
-			launchOperation,
-		},
-	}
-
-	reservedOffers := generateOffers(1)
-	reservedOffer := reservedOffers[0]
-	reservation := &mesos.Resource_ReservationInfo{
-		Labels: createReservationLabels(),
-	}
-	diskInfo := &mesos.Resource_DiskInfo{
-		Persistence: &mesos.Resource_DiskInfo_Persistence{
-			Id: &_testKey,
-		},
-	}
-	reservedResources := []*mesos.Resource{
-		util.NewMesosResourceBuilder().
-			WithName("cpus").
-			WithValue(_perHostCPU).
-			WithRole(_pelotonRole).
-			WithReservation(reservation).
-			Build(),
-		util.NewMesosResourceBuilder().
-			WithName("mem").
-			WithValue(_perHostMem).
-			WithReservation(reservation).
-			WithRole(_pelotonRole).
-			Build(),
-		util.NewMesosResourceBuilder().
-			WithName("disk").
-			WithValue(_perHostDisk).
-			WithRole(_pelotonRole).
-			WithReservation(reservation).
-			WithDisk(diskInfo).
-			Build(),
-	}
-	reservedOffer.Resources = append(reservedOffer.Resources, reservedResources...)
-	suite.pool.AddOffers(context.Background(), reservedOffers)
-
-	operationResp, err := suite.handler.OfferOperations(
-		rootCtx,
-		operationReq,
-	)
-
-	suite.NoError(err)
-	suite.Nil(operationResp.GetError())
-	suite.Equal(
-		int64(1),
-		suite.testScope.Snapshot().Counters()["offer_operations+"].Value())
-}
-
-func (suite *HostMgrHandlerTestSuite) TestReserveCreateLaunchOperation() {
-	defer suite.ctrl.Finish()
-
-	// only create one host offer in this test.
-	numHosts := 1
-	suite.pool.AddOffers(context.Background(), generateOffers(numHosts))
-
-	// TODO: Add check for number of HostOffers in placing state.
-	suite.checkResourcesGauges(numHosts, "ready")
-	suite.checkResourcesGauges(0, "placing")
-
-	// Matching constraint.
-	acquireReq := getAcquireHostOffersRequest()
-	acquiredResp, err := suite.handler.AcquireHostOffers(
-		rootCtx,
-		acquireReq,
-	)
-
-	suite.NoError(err)
-	suite.Nil(acquiredResp.GetError())
-	acquiredHostOffers := acquiredResp.GetHostOffers()
-	suite.Equal(1, len(acquiredHostOffers))
-
-	suite.Equal(
-		int64(1),
-		suite.testScope.Snapshot().Counters()["acquire_host_offers+"].Value())
-
-	// TODO: Add check for number of HostOffers in placing state.
-	suite.checkResourcesGauges(0, "ready")
-	suite.checkResourcesGauges(numHosts, "placing")
-
-	reserveOperation := createHostReserveOperation()
-	createOperation := createHostCreateOperation()
-	launchOperation := createHostLaunchOperation()
-
-	// launch operation before reserve/create will trigger an error.
-	operationReq := &hostsvc.OfferOperationsRequest{
-		Hostname: acquiredHostOffers[0].GetHostname(),
-		Operations: []*hostsvc.OfferOperation{
-			reserveOperation,
-			launchOperation,
-			createOperation,
-		},
-		Id: acquiredHostOffers[0].GetId(),
-	}
-
-	operationResp, err := suite.handler.OfferOperations(
-		rootCtx,
-		operationReq,
-	)
-
-	suite.NoError(err)
-	suite.NotNil(operationResp.GetError().GetInvalidArgument())
-
-	suite.Equal(
-		int64(1),
-		suite.testScope.Snapshot().Counters()["offer_operations_invalid+"].Value())
-
-	gomock.InOrder(
-		suite.volumeStore.EXPECT().
-			GetPersistentVolume(gomock.Any(), gomock.Any()).
-			Return(nil, nil),
-
-		suite.volumeStore.EXPECT().
-			CreatePersistentVolume(gomock.Any(), gomock.Any()).
-			Return(nil),
-
-		// Set expectations on provider
-		suite.provider.EXPECT().GetFrameworkID(context.Background()).Return(
-			suite.frameworkID),
-		// Set expectations on provider
-		suite.provider.EXPECT().GetMesosStreamID(context.Background()).Return(_streamID),
-		// Set expectations on scheduler schedulerClient
-		suite.schedulerClient.EXPECT().
-			Call(
-				gomock.Eq(_streamID),
-				gomock.Any(),
-			).
-			Do(func(_ string, msg proto.Message) {
-				// Verify clientCall message.
-				call := msg.(*sched.Call)
-				suite.Equal(sched.Call_ACCEPT, call.GetType())
-				suite.Equal(_frameworkID, call.GetFrameworkId().GetValue())
-
-				accept := call.GetAccept()
-				suite.NotNil(accept)
-				suite.Equal(1, len(accept.GetOfferIds()))
-				suite.Equal("offer-0", accept.GetOfferIds()[0].GetValue())
-				suite.Equal(3, len(accept.GetOperations()))
-				reserveOp := accept.GetOperations()[0]
-				createOp := accept.GetOperations()[1]
-				launchOp := accept.GetOperations()[2]
-				suite.Equal(
-					mesos.Offer_Operation_RESERVE,
-					reserveOp.GetType())
-				suite.Equal(
-					mesos.Offer_Operation_CREATE,
-					createOp.GetType())
-				suite.Equal(
-					mesos.Offer_Operation_LAUNCH,
-					launchOp.GetType())
-				launch := launchOp.GetLaunch()
-				suite.NotNil(launch)
-				suite.Equal(1, len(launch.GetTaskInfos()))
-				suite.Equal(
-					fmt.Sprintf(_taskIDFmt, 0),
-					launch.GetTaskInfos()[0].GetTaskId().GetValue())
-			}).
-			Return(nil),
-	)
-
-	operationReq = &hostsvc.OfferOperationsRequest{
-		Hostname: acquiredHostOffers[0].GetHostname(),
-		Operations: []*hostsvc.OfferOperation{
-			reserveOperation,
-			createOperation,
-			launchOperation,
-		},
-		Id: acquiredHostOffers[0].GetId(),
-	}
-
-	operationResp, err = suite.handler.OfferOperations(
-		rootCtx,
-		operationReq,
-	)
-
-	suite.NoError(err)
-	suite.Nil(operationResp.GetError())
-	suite.Equal(
-		int64(1),
-		suite.testScope.Snapshot().Counters()["offer_operations+"].Value())
-
-	// TODO: Add check for number of HostOffers in placing state.
-	suite.checkResourcesGauges(0, "ready")
-	suite.checkResourcesGauges(0, "placing")
-}
-
-func (suite *HostMgrHandlerTestSuite) TestReserveCreateLaunchOperationWithCreatedVolume() {
-	defer suite.ctrl.Finish()
-
-	// only create one host offer in this test.
-	numHosts := 1
-	suite.pool.AddOffers(context.Background(), generateOffers(numHosts))
-
-	// Matching constraint.
-	acquireReq := getAcquireHostOffersRequest()
-	acquiredResp, err := suite.handler.AcquireHostOffers(
-		rootCtx,
-		acquireReq,
-	)
-
-	suite.NoError(err)
-	suite.Nil(acquiredResp.GetError())
-	acquiredHostOffers := acquiredResp.GetHostOffers()
-
-	reserveOperation := createHostReserveOperation()
-	createOperation := createHostCreateOperation()
-	launchOperation := createHostLaunchOperation()
-
-	volumeInfo := &volume.PersistentVolumeInfo{}
-
-	gomock.InOrder(
-		suite.volumeStore.EXPECT().
-			GetPersistentVolume(gomock.Any(), gomock.Any()).
-			Return(volumeInfo, nil),
-
-		// Set expectations on provider
-		suite.provider.EXPECT().GetFrameworkID(context.Background()).Return(
-			suite.frameworkID),
-		// Set expectations on provider
-		suite.provider.EXPECT().GetMesosStreamID(context.Background()).Return(_streamID),
-		// Set expectations on scheduler schedulerClient
-		suite.schedulerClient.EXPECT().
-			Call(
-				gomock.Eq(_streamID),
-				gomock.Any(),
-			).
-			Do(func(_ string, msg proto.Message) {
-				// Verify clientCall message.
-				call := msg.(*sched.Call)
-				suite.Equal(sched.Call_ACCEPT, call.GetType())
-				suite.Equal(_frameworkID, call.GetFrameworkId().GetValue())
-
-				accept := call.GetAccept()
-				suite.NotNil(accept)
-				suite.Equal(1, len(accept.GetOfferIds()))
-				suite.Equal("offer-0", accept.GetOfferIds()[0].GetValue())
-				suite.Equal(3, len(accept.GetOperations()))
-				reserveOp := accept.GetOperations()[0]
-				createOp := accept.GetOperations()[1]
-				launchOp := accept.GetOperations()[2]
-				suite.Equal(
-					mesos.Offer_Operation_RESERVE,
-					reserveOp.GetType())
-				suite.Equal(
-					mesos.Offer_Operation_CREATE,
-					createOp.GetType())
-				suite.Equal(
-					mesos.Offer_Operation_LAUNCH,
-					launchOp.GetType())
-				launch := launchOp.GetLaunch()
-				suite.NotNil(launch)
-				suite.Equal(1, len(launch.GetTaskInfos()))
-				suite.Equal(
-					fmt.Sprintf(_taskIDFmt, 0),
-					launch.GetTaskInfos()[0].GetTaskId().GetValue())
-			}).
-			Return(nil),
-	)
-
-	operationReq := &hostsvc.OfferOperationsRequest{
-		Hostname: acquiredHostOffers[0].GetHostname(),
-		Operations: []*hostsvc.OfferOperation{
-			reserveOperation,
-			createOperation,
-			launchOperation,
-		},
-		Id: acquiredHostOffers[0].GetId(),
-	}
-
-	operationResp, err := suite.handler.OfferOperations(
-		rootCtx,
-		operationReq,
-	)
-
-	suite.NoError(err)
-	suite.Nil(operationResp.GetError())
-	suite.Equal(
-		int64(1),
-		suite.testScope.Snapshot().Counters()["offer_operations+"].Value())
-}
-
 func (suite *HostMgrHandlerTestSuite) TestGetMesosMasterHostPort() {
 	defer suite.ctrl.Finish()
 
@@ -2128,78 +1696,67 @@ func (suite *HostMgrHandlerTestSuite) TestServiceHandlerGetDrainingHosts() {
 func (suite *HostMgrHandlerTestSuite) TestServiceHandlerMarkHostsDrained() {
 	defer suite.ctrl.Finish()
 
-	hostInfos := []*hpb.HostInfo{
-		{
-			Hostname: "testhost",
-			Ip:       "0.0.0.0",
-			State:    hpb.HostState_HOST_STATE_DRAINING,
-		},
+	hostname := "testhost"
+	hostInfo := &hpb.HostInfo{
+		Hostname: hostname,
+		Ip:       "0.0.0.0",
+		State:    hpb.HostState_HOST_STATE_DRAINING,
 	}
 
-	var drainingMachines []*mesos_maintenance.ClusterStatus_DrainingMachine
-	for _, hostInfo := range hostInfos {
-		machineID := &mesos.MachineID{
-			Hostname: &hostInfo.Hostname,
-			Ip:       &hostInfo.Ip,
-		}
-		drainingMachines = append(drainingMachines,
-			&mesos_maintenance.ClusterStatus_DrainingMachine{
-				Id: machineID,
-			})
+	drainingMachines := []*mesos_maintenance.ClusterStatus_DrainingMachine{
+		{
+			Id: &mesos.MachineID{
+				Hostname: &hostInfo.Hostname,
+				Ip:       &hostInfo.Ip,
+			},
+		},
 	}
 
 	gomock.InOrder(
 		suite.maintenanceHostInfoMap.EXPECT().
 			GetDrainingHostInfos([]string{}).
-			Return(hostInfos),
+			Return([]*hpb.HostInfo{hostInfo}),
 
 		suite.masterOperatorClient.EXPECT().
 			StartMaintenance(gomock.Any()).
 			Return(nil).
 			Do(func(machineIds []*mesos.MachineID) {
-				for i := range drainingMachines {
-					suite.Exactly(drainingMachines[i].Id, machineIds[i])
-				}
+				suite.Exactly(drainingMachines[0].Id, machineIds[0])
 			}),
 	)
+	suite.maintenanceHostInfoMap.EXPECT().UpdateHostState(
+		hostInfo.GetHostname(),
+		hpb.HostState_HOST_STATE_DRAINING,
+		hpb.HostState_HOST_STATE_DOWN)
 
-	for _, hostInfo := range hostInfos {
-		suite.maintenanceHostInfoMap.EXPECT().UpdateHostState(
-			hostInfo.GetHostname(),
-			hpb.HostState_HOST_STATE_DRAINING,
-			hpb.HostState_HOST_STATE_DOWN)
-	}
-
-	var hostnames []string
-	for _, hostInfo := range hostInfos {
-		hostnames = append(hostnames, hostInfo.GetHostname())
-	}
-	resp, err := suite.handler.MarkHostsDrained(
+	resp, err := suite.handler.MarkHostDrained(
 		context.Background(),
-		&hostsvc.MarkHostsDrainedRequest{
-			Hostnames: hostnames,
+		&hostsvc.MarkHostDrainedRequest{
+			Hostname: hostname,
 		})
 	suite.NoError(err)
-	suite.NotNil(resp)
+	suite.Equal(&hostsvc.MarkHostDrainedResponse{
+		Hostname: hostname,
+	}, resp)
 
 	// Test host-not-DRAINING
 	suite.maintenanceHostInfoMap.EXPECT().
 		GetDrainingHostInfos([]string{}).
 		Return([]*hpb.HostInfo{})
 
-	resp, err = suite.handler.MarkHostsDrained(
+	resp, err = suite.handler.MarkHostDrained(
 		context.Background(),
-		&hostsvc.MarkHostsDrainedRequest{
-			Hostnames: hostnames,
+		&hostsvc.MarkHostDrainedRequest{
+			Hostname: hostname,
 		})
-	suite.Nil(resp.GetMarkedHosts())
+	suite.Equal("", resp.GetHostname())
 
 	// Test StartMaintenance error
 	suite.maintenanceHostInfoMap.EXPECT().
 		GetDrainingHostInfos([]string{}).
 		Return([]*hpb.HostInfo{
 			{
-				Hostname: "host1",
+				Hostname: hostname,
 				Ip:       "0.0.0.0",
 				State:    hpb.HostState_HOST_STATE_DRAINING,
 			},
@@ -2208,13 +1765,13 @@ func (suite *HostMgrHandlerTestSuite) TestServiceHandlerMarkHostsDrained() {
 	suite.masterOperatorClient.EXPECT().
 		StartMaintenance(gomock.Any()).
 		Return(fmt.Errorf("fake StartMaintenance error"))
-	resp, err = suite.handler.MarkHostsDrained(
+	resp, err = suite.handler.MarkHostDrained(
 		context.Background(),
-		&hostsvc.MarkHostsDrainedRequest{
-			Hostnames: []string{"host1"},
+		&hostsvc.MarkHostDrainedRequest{
+			Hostname: hostname,
 		})
 	suite.Error(err)
-	suite.Nil(resp.GetMarkedHosts())
+	suite.Equal("", resp.GetHostname())
 }
 
 func getAcquireHostOffersRequest() *hostsvc.AcquireHostOffersRequest {
@@ -2232,65 +1789,6 @@ func getAcquireHostOffersRequest() *hostsvc.AcquireHostOffersRequest {
 			},
 		},
 	}
-}
-
-func createHostReserveOperation() *hostsvc.OfferOperation {
-	reserveOperation := &hostsvc.OfferOperation{
-		Type: hostsvc.OfferOperation_RESERVE,
-		Reserve: &hostsvc.OfferOperation_Reserve{
-			Resources: []*mesos.Resource{
-				util.NewMesosResourceBuilder().
-					WithName("cpus").
-					WithValue(_perHostCPU).
-					Build(),
-				util.NewMesosResourceBuilder().
-					WithName("mem").
-					WithValue(11.0).
-					Build(),
-				util.NewMesosResourceBuilder().
-					WithName("disk").
-					WithValue(12.0).
-					Build(),
-			},
-		},
-		ReservationLabels: createReservationLabels(),
-	}
-	return reserveOperation
-}
-
-func createHostCreateOperation() *hostsvc.OfferOperation {
-	createOperation := &hostsvc.OfferOperation{
-		Type: hostsvc.OfferOperation_CREATE,
-		Create: &hostsvc.OfferOperation_Create{
-			Volume: &hostsvc.Volume{
-				Resource: util.NewMesosResourceBuilder().
-					WithName("disk").
-					WithValue(1.0).
-					Build(),
-				ContainerPath: "test",
-				Id: &peloton.VolumeID{
-					Value: "volumeid",
-				},
-			},
-		},
-		ReservationLabels: createReservationLabels(),
-	}
-	return createOperation
-}
-
-func createHostLaunchOperation() *hostsvc.OfferOperation {
-	launchOperation := &hostsvc.OfferOperation{
-		Type: hostsvc.OfferOperation_LAUNCH,
-		Launch: &hostsvc.OfferOperation_Launch{
-			Tasks: generateLaunchableTasks(1),
-		},
-		ReservationLabels: createReservationLabels(),
-	}
-	return launchOperation
-}
-
-func createReservationLabels() *mesos.Labels {
-	return reservation.CreateReservationLabels(_testJobID, 0, "hostname-0")
 }
 
 func makeAgentsResponse(numAgents int) *mesos_master.Response_GetAgents {
@@ -2568,81 +2066,6 @@ func (suite *HostMgrHandlerTestSuite) TestGetCompletedReservationsError() {
 	suite.Equal(reservations.GetError().GetNotFound().Message, "error")
 }
 
-// Test OfferOperations errors
-func (suite *HostMgrHandlerTestSuite) TestOfferOperationsError() {
-	launchOperation := &hostsvc.OfferOperation{
-		Type: hostsvc.OfferOperation_LAUNCH,
-		Launch: &hostsvc.OfferOperation_Launch{
-			Tasks: generateLaunchableTasks(1),
-		},
-	}
-
-	// Test offer pool ClaimForLaunch error
-	hostname := "test-host"
-	operationReq := &hostsvc.OfferOperationsRequest{
-		Hostname: hostname,
-		Operations: []*hostsvc.OfferOperation{
-			launchOperation,
-		},
-	}
-
-	operationResp, err := suite.handler.OfferOperations(
-		rootCtx,
-		operationReq,
-	)
-	suite.NotNil(operationResp.GetError().GetInvalidOffers())
-	suite.Equal(
-		operationResp.GetError().GetInvalidOffers().GetMessage(),
-		"cannot find input hostname test-host")
-	suite.Nil(err)
-
-	// Test scheduler Call error
-	numHosts := 1
-	acquiredResp, err := suite.acquireHostOffers(numHosts)
-
-	suite.NoError(err)
-	suite.Nil(acquiredResp.GetError())
-	acquiredHostOffers := acquiredResp.GetHostOffers()
-	suite.Equal(1, len(acquiredHostOffers))
-
-	suite.Equal(
-		int64(1),
-		suite.testScope.Snapshot().Counters()["acquire_host_offers+"].Value())
-
-	suite.checkResourcesGauges(0, "ready")
-	suite.checkResourcesGauges(numHosts, "placing")
-
-	operationReq.Hostname = acquiredHostOffers[0].GetHostname()
-	errString := "Fake scheduler call error"
-	gomock.InOrder(
-		suite.provider.EXPECT().GetFrameworkID(context.Background()).Return(
-			suite.frameworkID),
-		suite.provider.EXPECT().GetMesosStreamID(context.Background()).
-			Return(_streamID),
-		suite.schedulerClient.EXPECT().
-			Call(
-				gomock.Eq(_streamID),
-				gomock.Any(),
-			).Return(fmt.Errorf(errString)),
-	)
-
-	operationReq = &hostsvc.OfferOperationsRequest{
-		Hostname: acquiredHostOffers[0].GetHostname(),
-		Operations: []*hostsvc.OfferOperation{
-			launchOperation,
-		},
-		Id: acquiredHostOffers[0].GetId(),
-	}
-
-	operationResp, err = suite.handler.OfferOperations(
-		rootCtx,
-		operationReq,
-	)
-	suite.NoError(err)
-	suite.NotNil(operationResp.GetError().GetFailure())
-	suite.Equal(errString, operationResp.GetError().GetFailure().GetMessage())
-}
-
 func (suite *HostMgrHandlerTestSuite) withHostOffers(numHosts int) []*hostsvc.
 	HostOffer {
 	acquiredResp, err := suite.acquireHostOffers(numHosts)
@@ -2660,6 +2083,8 @@ func (suite *HostMgrHandlerTestSuite) withHostOffers(numHosts int) []*hostsvc.
 
 // Test LaunchTasks errors
 func (suite *HostMgrHandlerTestSuite) TestLaunchTasksInvalidOfferError() {
+	// set expectation on watch processor
+	suite.watchProcessor.EXPECT().NotifyEventChange(gomock.Any())
 	acquiredHostOffers := suite.withHostOffers(1)
 
 	tt := []struct {
@@ -2707,6 +2132,8 @@ func (suite *HostMgrHandlerTestSuite) TestLaunchTasksInvalidOfferError() {
 }
 
 func (suite *HostMgrHandlerTestSuite) TestLaunchTasksInvalidArgError() {
+	// set expectation on watch processor
+	suite.watchProcessor.EXPECT().NotifyEventChange(gomock.Any())
 	acquiredHostOffers := suite.withHostOffers(1)
 	tt := []struct {
 		test string
@@ -2777,11 +2204,15 @@ func (suite *HostMgrHandlerTestSuite) TestLaunchTasksInvalidArgError() {
 }
 
 func (suite *HostMgrHandlerTestSuite) TestLaunchTasksSchedulerError() {
+	// set expectation on watch processor
+	suite.watchProcessor.EXPECT().NotifyEventChange(gomock.Any())
 	acquiredHostOffers := suite.withHostOffers(1)
 
 	// Test framework client error
 	errString := "fake scheduler call error"
 	gomock.InOrder(
+		// set expectation on watch Processor
+		suite.watchProcessor.EXPECT().NotifyEventChange(gomock.Any()),
 		// Set expectations on provider
 		suite.provider.EXPECT().GetFrameworkID(context.Background()).Return(
 			suite.frameworkID),
@@ -2816,6 +2247,9 @@ func (suite *HostMgrHandlerTestSuite) TestReleaseHostsHeldForTasks() {
 	defer suite.ctrl.Finish()
 
 	numOffers := 2
+	// set expectation on watch Processor
+	suite.watchProcessor.EXPECT().NotifyEventChange(gomock.Any())
+	suite.watchProcessor.EXPECT().NotifyEventChange(gomock.Any())
 	offers := suite.pool.AddOffers(context.Background(), generateOffers(numOffers))
 
 	host1 := offers[0].GetHostname()
@@ -2943,39 +2377,40 @@ func (suite *HostMgrHandlerTestSuite) TestToHostStatus() {
 	}
 }
 
-// TestWatchEvent sets up a watch client, and verifies the responses
+// WatchEventStreamEvent sets up a watch client, and verifies the responses
 // are streamed back correctly based on the input, finally the
 // test cancels the watch stream.
-func (suite *HostMgrHandlerTestSuite) TestWatchEvent() {
-	watchID := watchevent.NewWatchID()
+func (suite *HostMgrHandlerTestSuite) TestWatchEventStreamEvent() {
+	watchID := watchevent.NewWatchID(watchevent.EventStream)
 	eventClient := &watchevent.EventClient{
 		// do not set buffer size for input to make sure the
 		// tests sends all the events before sending stop
 		// signal
-		Input:  make(chan *pb_eventstream.Event),
+		Input:  make(chan interface{}),
 		Signal: make(chan watchevent.StopSignal, 1),
 	}
 
-	suite.watchProcessor.EXPECT().NewEventClient().
+	suite.watchProcessor.EXPECT().NewEventClient(gomock.Any()).
 		Return(watchID, eventClient, nil)
 	suite.watchProcessor.EXPECT().StopEventClient(watchID)
 
 	event := &pb_eventstream.Event{}
 
-	suite.watchEventServer.EXPECT().
-		Send(&hostsvc.WatchEventResponse{
+	suite.watchEventStreamServer.EXPECT().
+		Send(&hostsvc.WatchEventStreamEventResponse{
 			WatchId: watchID,
-			Events:  nil,
-		}).
-		Return(nil)
-	suite.watchEventServer.EXPECT().
-		Send(&hostsvc.WatchEventResponse{
-			WatchId: watchID,
-			Events:  []*pb_eventstream.Event{event},
+			Topic:   string(watchevent.EventStream),
 		}).
 		Return(nil)
 
-	req := &hostsvc.WatchEventRequest{}
+	suite.watchEventStreamServer.EXPECT().
+		Send(&hostsvc.WatchEventStreamEventResponse{
+			WatchId:         watchID,
+			Topic:           string(watchevent.EventStream),
+			MesosTaskUpdate: event,
+		}).Return(nil)
+
+	req := &hostsvc.WatchEventRequest{Topic: string(watchevent.EventStream)}
 
 	go func() {
 		eventClient.Input <- event
@@ -2983,7 +2418,54 @@ func (suite *HostMgrHandlerTestSuite) TestWatchEvent() {
 		eventClient.Signal <- watchevent.StopSignalCancel
 	}()
 
-	err := suite.handler.WatchEvent(req, suite.watchEventServer)
+	err := suite.handler.WatchEventStreamEvent(req, suite.watchEventStreamServer)
+	suite.Error(err)
+	suite.True(yarpcerrors.IsCancelled(err))
+}
+
+// TestWatchHostSummaryEvent sets up a watch client, and verifies the responses
+// are streamed back correctly based on the input, finally the
+// test cancels the watch stream.
+func (suite *HostMgrHandlerTestSuite) TestWatchHostSummaryEvent() {
+	watchID := watchevent.NewWatchID(watchevent.HostSummary)
+	eventClient := &watchevent.EventClient{
+		// do not set buffer size for input to make sure the
+		// tests sends all the events before sending stop
+		// signal
+		Input:  make(chan interface{}),
+		Signal: make(chan watchevent.StopSignal, 1),
+	}
+
+	suite.watchProcessor.EXPECT().NewEventClient(gomock.Any()).
+		Return(watchID, eventClient, nil)
+	suite.watchProcessor.EXPECT().StopEventClient(watchID)
+
+	event := &halphapb.HostSummary{}
+
+	suite.watchHostSummaryServer.EXPECT().
+		Send(&hostsvc.WatchHostSummaryEventResponse{
+			WatchId: watchID,
+			Topic:   string(watchevent.HostSummary),
+		}).
+		Return(nil)
+
+	suite.watchHostSummaryServer.EXPECT().
+		Send(&hostsvc.WatchHostSummaryEventResponse{
+			WatchId:          watchID,
+			Topic:            string(watchevent.HostSummary),
+			HostSummaryEvent: event,
+		}).
+		Return(nil)
+
+	req := &hostsvc.WatchEventRequest{Topic: string(watchevent.HostSummary)}
+
+	go func() {
+		eventClient.Input <- event
+		// cancelling  watch event
+		eventClient.Signal <- watchevent.StopSignalCancel
+	}()
+
+	err := suite.handler.WatchHostSummaryEvent(req, suite.watchHostSummaryServer)
 	suite.Error(err)
 	suite.True(yarpcerrors.IsCancelled(err))
 }
@@ -2991,98 +2473,274 @@ func (suite *HostMgrHandlerTestSuite) TestWatchEvent() {
 // TestWatchEvent_MaxClientReached checks Watch will return resource-exhausted
 // error when NewEventClient reached max client.
 func (suite *HostMgrHandlerTestSuite) TestWatchEvent_MaxClientReached() {
-	suite.watchProcessor.EXPECT().NewEventClient().
-		Return("", nil, yarpcerrors.ResourceExhaustedErrorf("max client reached"))
+	suite.watchProcessor.EXPECT().NewEventClient(gomock.Any()).
+		Return("", nil, yarpcerrors.ResourceExhaustedErrorf("max client reached")).Times(2)
 
-	req := &hostsvc.WatchEventRequest{}
-	err := suite.handler.WatchEvent(req, suite.watchEventServer)
+	// testing eventstream for max client
+	req := &hostsvc.WatchEventRequest{Topic: string(watchevent.EventStream)}
+	err := suite.handler.WatchEventStreamEvent(req, suite.watchEventStreamServer)
+	suite.Error(err)
+	suite.True(yarpcerrors.IsResourceExhausted(err))
+
+	// testing eventstream for max client
+	req = &hostsvc.WatchEventRequest{Topic: string(watchevent.HostSummary)}
+	err = suite.handler.WatchHostSummaryEvent(req, suite.watchHostSummaryServer)
 	suite.Error(err)
 	suite.True(yarpcerrors.IsResourceExhausted(err))
 }
 
-// TestWatchEvent_InitSendError tests for error case of initial response.
-func (suite *HostMgrHandlerTestSuite) TestWatchEvent_InitSendError() {
-	watchID := watchevent.NewWatchID()
+// TestWatchEvent_WrongTopic  checks Watch will return InvalidArgument
+// error , topic provided is not supported.
+func (suite *HostMgrHandlerTestSuite) TestWatchEvent_WrongTopic() {
+	suite.watchProcessor.EXPECT().NewEventClient(gomock.Any()).
+		Return("", nil, yarpcerrors.InvalidArgumentErrorf("topicId %s provided  not supported", gomock.Any())).Times(2)
+
+	// Test Watch EventStream Api
+	req := &hostsvc.WatchEventRequest{Topic: string(watchevent.INVALID)}
+	err := suite.handler.WatchEventStreamEvent(req, suite.watchEventStreamServer)
+	suite.Error(err)
+	suite.True(yarpcerrors.IsInvalidArgument(err))
+
+	// Test HostSummary Api
+	req = &hostsvc.WatchEventRequest{Topic: string(watchevent.INVALID)}
+	err = suite.handler.WatchHostSummaryEvent(req, suite.watchHostSummaryServer)
+	suite.Error(err)
+	suite.True(yarpcerrors.IsInvalidArgument(err))
+}
+
+// TestWatchEventStreamEvent_InitSendError tests for error case of initial response.
+func (suite *HostMgrHandlerTestSuite) TestWatchEventStreamEvent_InitSendError() {
+	watchID := watchevent.NewWatchID(watchevent.EventStream)
 	eventClient := &watchevent.EventClient{
 		// do not set buffer size for input to make sure the
 		// tests sends all the events before sending stop
 		// signal
-		Input:  make(chan *pb_eventstream.Event),
+		Input:  make(chan interface{}),
 		Signal: make(chan watchevent.StopSignal, 1),
 	}
 
-	suite.watchProcessor.EXPECT().NewEventClient().
+	suite.watchProcessor.EXPECT().NewEventClient(gomock.Any()).
 		Return(watchID, eventClient, nil)
 	suite.watchProcessor.EXPECT().StopEventClient(watchID)
 
 	sendErr := errors.New("message:transport is closing")
 
 	// initial response
-	suite.watchEventServer.EXPECT().
-		Send(&hostsvc.WatchEventResponse{
+	suite.watchEventStreamServer.EXPECT().
+		Send(&hostsvc.WatchEventStreamEventResponse{
 			WatchId: watchID,
-			Events:  nil,
+			Topic:   string(watchevent.EventStream),
 		}).
 		Return(sendErr)
 
-	req := &hostsvc.WatchEventRequest{}
+	req := &hostsvc.WatchEventRequest{Topic: string(watchevent.EventStream)}
 
-	err := suite.handler.WatchEvent(req, suite.watchEventServer)
+	err := suite.handler.WatchEventStreamEvent(req, suite.watchEventStreamServer)
 	suite.Error(err)
 	suite.Equal(sendErr, err)
 }
 
-// TestWatchEvent_InitSendError tests for error case of subsequent response
-// after initial one.
-func (suite *HostMgrHandlerTestSuite) TestWatchEvent_SendError() {
-	watchID := watchevent.NewWatchID()
+//TestWatchHostSummaryEvent_InitSendError tests for error case of initial response.
+func (suite *HostMgrHandlerTestSuite) TestWatchHostSummaryEvent_InitSendError() {
+	watchID := watchevent.NewWatchID(watchevent.HostSummary)
 	eventClient := &watchevent.EventClient{
 		// do not set buffer size for input to make sure the
 		// tests sends all the events before sending stop
 		// signal
-		Input:  make(chan *pb_eventstream.Event),
+		Input:  make(chan interface{}),
 		Signal: make(chan watchevent.StopSignal, 1),
 	}
 
-	suite.watchProcessor.EXPECT().NewEventClient().
+	suite.watchProcessor.EXPECT().NewEventClient(gomock.Any()).
+		Return(watchID, eventClient, nil)
+	suite.watchProcessor.EXPECT().StopEventClient(watchID)
+
+	sendErr := errors.New("message:transport is closing")
+
+	// initial response
+	suite.watchHostSummaryServer.EXPECT().
+		Send(&hostsvc.WatchHostSummaryEventResponse{
+			WatchId: watchID,
+			Topic:   string(watchevent.HostSummary),
+		}).
+		Return(sendErr)
+
+	req := &hostsvc.WatchEventRequest{Topic: string(watchevent.HostSummary)}
+
+	err := suite.handler.WatchHostSummaryEvent(req, suite.watchHostSummaryServer)
+	suite.Error(err)
+	suite.Equal(sendErr, err)
+}
+
+// TestWatchEventStreamEvent_SendError tests for error case of subsequent response
+// after initial one.
+func (suite *HostMgrHandlerTestSuite) TestWatchEventStreamEvent_SendError() {
+	watchID := watchevent.NewWatchID(watchevent.EventStream)
+	eventClient := &watchevent.EventClient{
+		// do not set buffer size for input to make sure the
+		// tests sends all the events before sending stop
+		// signal
+		Input:  make(chan interface{}),
+		Signal: make(chan watchevent.StopSignal, 1),
+	}
+
+	suite.watchProcessor.EXPECT().NewEventClient(gomock.Any()).
 		Return(watchID, eventClient, nil)
 	suite.watchProcessor.EXPECT().StopEventClient(watchID)
 
 	// initial response
 	event := &pb_eventstream.Event{}
 
-	suite.watchEventServer.EXPECT().
-		Send(&hostsvc.WatchEventResponse{
+	suite.watchEventStreamServer.EXPECT().
+		Send(&hostsvc.WatchEventStreamEventResponse{
 			WatchId: watchID,
-			Events:  nil,
+			Topic:   string(watchevent.EventStream),
 		}).
 		Return(nil)
 
 	sendErr := errors.New("message:transport is closing")
 
-	// subsequent response
-	suite.watchEventServer.EXPECT().
-		Send(&hostsvc.WatchEventResponse{
-			WatchId: watchID,
-			Events:  []*pb_eventstream.Event{event},
-		}).
-		Return(sendErr)
+	suite.watchEventStreamServer.EXPECT().
+		Send(&hostsvc.WatchEventStreamEventResponse{
+			WatchId:         watchID,
+			Topic:           string(watchevent.EventStream),
+			MesosTaskUpdate: event,
+		}).Return(sendErr)
 
-	req := &hostsvc.WatchEventRequest{}
-
+	req := &hostsvc.WatchEventRequest{Topic: string(watchevent.EventStream)}
 	go func() {
 		eventClient.Input <- event
 		eventClient.Signal <- watchevent.StopSignalCancel
 	}()
 
-	err := suite.handler.WatchEvent(req, suite.watchEventServer)
+	err := suite.handler.WatchEventStreamEvent(req, suite.watchEventStreamServer)
 	suite.Error(err)
 	suite.Equal(sendErr, err)
+
+}
+
+// TestWatchEventStreamEvent_WrongTopicByProcessor tests for error case of subsequent response
+// after initial one.
+func (suite *HostMgrHandlerTestSuite) TestWatchEventStreamEvent_WrongTopicByProcessor() {
+	watchID := watchevent.NewWatchID(watchevent.EventStream)
+	eventClient := &watchevent.EventClient{
+		// do not set buffer size for input to make sure the
+		// tests sends all the events before sending stop
+		// signal
+		Input:  make(chan interface{}),
+		Signal: make(chan watchevent.StopSignal, 1),
+	}
+
+	suite.watchProcessor.EXPECT().NewEventClient(gomock.Any()).
+		Return(watchID, eventClient, nil)
+	suite.watchProcessor.EXPECT().StopEventClient(watchID)
+
+	// wrong event to eventstream api
+	event := &halphapb.HostSummary{}
+
+	suite.watchEventStreamServer.EXPECT().
+		Send(&hostsvc.WatchEventStreamEventResponse{
+			WatchId: watchID,
+			Topic:   string(watchevent.EventStream),
+		}).
+		Return(nil)
+
+	req := &hostsvc.WatchEventRequest{Topic: string(watchevent.EventStream)}
+	go func() {
+		eventClient.Input <- event
+		eventClient.Signal <- watchevent.StopSignalCancel
+	}()
+
+	err := suite.handler.WatchEventStreamEvent(req, suite.watchEventStreamServer)
+	suite.Error(err)
+}
+
+// TestWatchHostSummaryEvent_SendError tests for error case of subsequent response
+// after initial one.
+func (suite *HostMgrHandlerTestSuite) TestWatchHostSummaryEvent_SendError() {
+	watchID := watchevent.NewWatchID(watchevent.HostSummary)
+	eventClient := &watchevent.EventClient{
+		// do not set buffer size for input to make sure the
+		// tests sends all the events before sending stop
+		// signal
+		Input:  make(chan interface{}),
+		Signal: make(chan watchevent.StopSignal, 1),
+	}
+
+	suite.watchProcessor.EXPECT().NewEventClient(gomock.Any()).
+		Return(watchID, eventClient, nil)
+	suite.watchProcessor.EXPECT().StopEventClient(watchID)
+
+	// initial response
+	event := &halphapb.HostSummary{}
+
+	suite.watchHostSummaryServer.EXPECT().
+		Send(&hostsvc.WatchHostSummaryEventResponse{
+			WatchId: watchID,
+			Topic:   string(watchevent.HostSummary),
+		}).
+		Return(nil)
+
+	sendErr := errors.New("message:transport is closing")
+
+	suite.watchHostSummaryServer.EXPECT().
+		Send(&hostsvc.WatchHostSummaryEventResponse{
+			WatchId:          watchID,
+			Topic:            string(watchevent.HostSummary),
+			HostSummaryEvent: event,
+		}).Return(sendErr)
+
+	req := &hostsvc.WatchEventRequest{Topic: string(watchevent.HostSummary)}
+	go func() {
+		eventClient.Input <- event
+		eventClient.Signal <- watchevent.StopSignalCancel
+	}()
+
+	err := suite.handler.WatchHostSummaryEvent(req, suite.watchHostSummaryServer)
+	suite.Error(err)
+	suite.Equal(sendErr, err)
+
+}
+
+// TestWatchHostSummaryEvent_WrongTopicByProcessor tests for error case of wrong event send by watch processor
+func (suite *HostMgrHandlerTestSuite) TestWatchHostSummaryEvent_WrongTopicByProcessor() {
+	watchID := watchevent.NewWatchID(watchevent.HostSummary)
+	eventClient := &watchevent.EventClient{
+		// do not set buffer size for input to make sure the
+		// tests sends all the events before sending stop
+		// signal
+		Input:  make(chan interface{}),
+		Signal: make(chan watchevent.StopSignal, 1),
+	}
+
+	suite.watchProcessor.EXPECT().NewEventClient(gomock.Any()).
+		Return(watchID, eventClient, nil)
+	suite.watchProcessor.EXPECT().StopEventClient(watchID)
+
+	// sending eventstream event to host summary watch api
+	event := &pb_eventstream.Event{}
+
+	suite.watchHostSummaryServer.EXPECT().
+		Send(&hostsvc.WatchHostSummaryEventResponse{
+			WatchId: watchID,
+			Topic:   string(watchevent.HostSummary),
+		}).
+		Return(nil)
+
+	req := &hostsvc.WatchEventRequest{Topic: string(watchevent.HostSummary)}
+	go func() {
+		eventClient.Input <- event
+		eventClient.Signal <- watchevent.StopSignalCancel
+	}()
+
+	err := suite.handler.WatchHostSummaryEvent(req, suite.watchHostSummaryServer)
+	suite.Error(err)
+
 }
 
 // TestCancelWatchEvent tests Cancel request are proxied to watch processor correctly.
 func (suite *HostMgrHandlerTestSuite) TestCancel() {
-	watchID := watchevent.NewWatchID()
+	watchID := watchevent.NewWatchID(suite.topicsSupported[rand.Intn(len(suite.topicsSupported))])
 
 	suite.watchProcessor.EXPECT().StopEventClient(watchID).Return(nil)
 
@@ -3096,7 +2754,7 @@ func (suite *HostMgrHandlerTestSuite) TestCancel() {
 // TestCancelWatchEvent_NotFoundTaskEvent tests Cancel response returns not-found error, when
 // an invalid  watch-id is passed in.
 func (suite *HostMgrHandlerTestSuite) TestCancel_NotFoundTask() {
-	watchID := watchevent.NewWatchID()
+	watchID := watchevent.NewWatchID(suite.topicsSupported[rand.Intn(len(suite.topicsSupported))])
 
 	err := yarpcerrors.NotFoundErrorf("watch_id %s not exist for task watch client", watchID)
 

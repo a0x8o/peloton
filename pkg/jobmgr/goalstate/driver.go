@@ -23,14 +23,15 @@ import (
 	"github.com/uber/peloton/.gen/peloton/api/v0/job"
 	"github.com/uber/peloton/.gen/peloton/api/v0/peloton"
 	"github.com/uber/peloton/.gen/peloton/api/v0/task"
-	"github.com/uber/peloton/.gen/peloton/private/hostmgr/hostsvc"
 	"github.com/uber/peloton/.gen/peloton/private/resmgrsvc"
 
 	"github.com/uber/peloton/pkg/common"
+	"github.com/uber/peloton/pkg/common/api"
 	"github.com/uber/peloton/pkg/common/goalstate"
 	"github.com/uber/peloton/pkg/common/recovery"
 	"github.com/uber/peloton/pkg/jobmgr/cached"
 	"github.com/uber/peloton/pkg/jobmgr/task/launcher"
+	"github.com/uber/peloton/pkg/jobmgr/task/lifecyclemgr"
 	"github.com/uber/peloton/pkg/storage"
 	ormobjects "github.com/uber/peloton/pkg/storage/objects"
 
@@ -38,6 +39,7 @@ import (
 	"github.com/uber-go/tally"
 	"github.com/uber/peloton/.gen/peloton/private/models"
 	"go.uber.org/yarpc"
+	"go.uber.org/yarpc/yarpcerrors"
 	"golang.org/x/time/rate"
 )
 
@@ -109,7 +111,9 @@ func NewDriver(
 	jobType job.JobType,
 	parentScope tally.Scope,
 	cfg Config,
-	jobRuntimeCalculationViaCache bool) Driver {
+	jobRuntimeCalculationViaCache bool,
+	hmVersion api.Version,
+) Driver {
 	cfg.normalize()
 	scope := parentScope.SubScope("goalstate")
 	jobScope := scope.SubScope("job")
@@ -132,17 +136,19 @@ func NewDriver(
 			cfg.FailureRetryDelay,
 			cfg.MaxRetryDelay,
 			workflowScope),
-		hostmgrClient: hostsvc.NewInternalHostServiceYARPCClient(
-			d.ClientConfig(common.PelotonHostManager)),
+		lm: lifecyclemgr.New(hmVersion, d),
 		resmgrClient: resmgrsvc.NewResourceManagerServiceYARPCClient(
 			d.ClientConfig(common.PelotonResourceManager)),
 		jobStore:                      jobStore,
 		taskStore:                     taskStore,
 		volumeStore:                   volumeStore,
 		updateStore:                   updateStore,
+		podEventsOps:                  ormobjects.NewPodEventsOps(ormStore),
+		activeJobsOps:                 ormobjects.NewActiveJobsOps(ormStore),
 		jobConfigOps:                  ormobjects.NewJobConfigOps(ormStore),
 		jobIndexOps:                   ormobjects.NewJobIndexOps(ormStore),
 		jobRuntimeOps:                 ormobjects.NewJobRuntimeOps(ormStore),
+		taskConfigV2Ops:               ormobjects.NewTaskConfigV2Ops(ormStore),
 		jobFactory:                    jobFactory,
 		taskLauncher:                  taskLauncher,
 		mtx:                           NewMetrics(scope),
@@ -191,18 +197,20 @@ type driver struct {
 	taskEngine   goalstate.Engine
 	updateEngine goalstate.Engine
 
-	// hostmgrClient and resmgrClient are the host manager and resource manager clients.
-	hostmgrClient hostsvc.InternalHostServiceYARPCClient
-	resmgrClient  resmgrsvc.ResourceManagerServiceYARPCClient
+	lm           lifecyclemgr.Manager
+	resmgrClient resmgrsvc.ResourceManagerServiceYARPCClient
 
 	// jobStore, taskStore and volumeStore are the objects to the storage interface.
-	jobStore      storage.JobStore
-	taskStore     storage.TaskStore
-	volumeStore   storage.PersistentVolumeStore
-	updateStore   storage.UpdateStore
-	jobConfigOps  ormobjects.JobConfigOps  // DB ops for job_config table
-	jobRuntimeOps ormobjects.JobRuntimeOps // DB ops for job_runtime table
-	jobIndexOps   ormobjects.JobIndexOps   // DB ops for job_index table
+	jobStore        storage.JobStore
+	taskStore       storage.TaskStore
+	volumeStore     storage.PersistentVolumeStore
+	updateStore     storage.UpdateStore
+	podEventsOps    ormobjects.PodEventsOps
+	activeJobsOps   ormobjects.ActiveJobsOps   // DB ops for active_jobs table
+	jobConfigOps    ormobjects.JobConfigOps    // DB ops for job_config table
+	jobRuntimeOps   ormobjects.JobRuntimeOps   // DB ops for job_runtime table
+	jobIndexOps     ormobjects.JobIndexOps     // DB ops for job_index table
+	taskConfigV2Ops ormobjects.TaskConfigV2Ops // DB ops for task_config_v2_table
 
 	// jobFactory is the in-memory cache object fpr jobs and tasks
 	jobFactory cached.JobFactory
@@ -323,6 +331,7 @@ func (d *driver) recoverTasks(
 			Runtime: jobRuntime,
 			Config:  jobConfig,
 		}, configAddOn,
+			nil,
 			cached.UpdateCacheOnly)
 	}
 
@@ -341,7 +350,14 @@ func (d *driver) recoverTasks(
 			WithField("job_id", id).
 			WithField("from", batch.From).
 			WithField("to", batch.To).
-			Error("failed to fetch task runtimes")
+			Error("failed to fetch task infos")
+		if yarpcerrors.IsNotFound(err) {
+			// Due to task_config table deprecation, we might see old jobs
+			// fail to recover due to their task config was created in
+			// task_config table instead of task_config_v2. Only log the
+			// error here instead of crashing jobmgr.
+			return
+		}
 		errChan <- err
 		return
 	}
@@ -392,7 +408,7 @@ func (d *driver) syncFromDB(ctx context.Context) error {
 	if err := recovery.RecoverActiveJobs(
 		ctx,
 		d.jobScope,
-		d.jobStore,
+		d.activeJobsOps,
 		d.jobConfigOps,
 		d.jobRuntimeOps,
 		d.recoverTasks,

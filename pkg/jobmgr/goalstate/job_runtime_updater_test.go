@@ -25,10 +25,11 @@ import (
 	pbjob "github.com/uber/peloton/.gen/peloton/api/v0/job"
 	"github.com/uber/peloton/.gen/peloton/api/v0/peloton"
 	pbtask "github.com/uber/peloton/.gen/peloton/api/v0/task"
+	"github.com/uber/peloton/.gen/peloton/api/v1alpha/job/stateless"
 	"github.com/uber/peloton/.gen/peloton/private/models"
 	"github.com/uber/peloton/.gen/peloton/private/resmgrsvc"
-	resmocks "github.com/uber/peloton/.gen/peloton/private/resmgrsvc/mocks"
 
+	resmocks "github.com/uber/peloton/.gen/peloton/private/resmgrsvc/mocks"
 	goalstatemocks "github.com/uber/peloton/pkg/common/goalstate/mocks"
 	cachedmocks "github.com/uber/peloton/pkg/jobmgr/cached/mocks"
 	jobmgrtask "github.com/uber/peloton/pkg/jobmgr/task"
@@ -174,6 +175,10 @@ func (suite *JobRuntimeUpdaterTestSuite) TestJobCompletionTimeNotEmpty() {
 		State:     pbjob.JobState_KILLED,
 		GoalState: pbjob.JobState_SUCCEEDED,
 	}
+	cachedTasks := make(map[uint32]cached.Task)
+	for i := uint32(0); i < instanceCount; i++ {
+		cachedTasks[i] = suite.cachedTask
+	}
 	startTime, _ := time.Parse(time.RFC3339Nano, jobStartTime)
 	startTimeUnix := float64(startTime.UnixNano()) / float64(time.Second/time.Nanosecond)
 
@@ -185,6 +190,16 @@ func (suite *JobRuntimeUpdaterTestSuite) TestJobCompletionTimeNotEmpty() {
 		GetInstanceCount().
 		Return(instanceCount).
 		AnyTimes()
+
+	suite.cachedJob.EXPECT().
+		GetAllTasks().
+		Return(cachedTasks).Times(2)
+
+	for i := uint32(0); i < instanceCount; i++ {
+		suite.cachedTask.EXPECT().CurrentState().Return(cached.TaskStateVector{
+			State: pbtask.TaskState_KILLED,
+		})
+	}
 
 	suite.jobFactory.EXPECT().
 		AddJob(suite.jobID).
@@ -200,11 +215,12 @@ func (suite *JobRuntimeUpdaterTestSuite) TestJobCompletionTimeNotEmpty() {
 
 	suite.cachedConfig.EXPECT().
 		GetType().
-		Return(pbjob.JobType_BATCH)
+		Return(pbjob.JobType_BATCH).
+		Times(int(instanceCount))
 
-	suite.taskStore.EXPECT().
-		GetTaskStateSummaryForJob(gomock.Any(), suite.jobID).
-		Return(stateCounts, nil)
+	suite.cachedJob.EXPECT().
+		RepopulateInstanceAvailabilityInfo(gomock.Any()).
+		Return(nil)
 
 	suite.cachedJob.EXPECT().
 		GetFirstTaskUpdateTime().
@@ -221,10 +237,16 @@ func (suite *JobRuntimeUpdaterTestSuite) TestJobCompletionTimeNotEmpty() {
 		Return(&jobRuntime, nil)
 
 	suite.cachedJob.EXPECT().
-		Update(gomock.Any(), gomock.Any(), gomock.Any(), cached.UpdateCacheAndDB).
+		Update(
+			gomock.Any(),
+			gomock.Any(),
+			gomock.Any(),
+			nil,
+			cached.UpdateCacheAndDB).
 		Do(func(_ context.Context,
 			jobInfo *pbjob.JobInfo,
 			_ *models.ConfigAddOn,
+			_ *stateless.JobSpec,
 			_ cached.UpdateRequest) {
 			suite.NotEqual(jobInfo.Runtime.CompletionTime, "")
 		}).Return(nil)
@@ -260,6 +282,34 @@ func (suite *JobRuntimeUpdaterTestSuite) TestJobRuntimeUpdater_Batch_RUNNING() {
 	stateCounts[pbtask.TaskState_RUNNING.String()] = instanceCount / 4
 	stateCounts[pbtask.TaskState_LAUNCHED.String()] = instanceCount / 4
 	stateCounts[pbtask.TaskState_SUCCEEDED.String()] = instanceCount / 4
+	cachedTasks := make(map[uint32]cached.Task)
+	for i := uint32(0); i < instanceCount; i++ {
+		cachedTasks[i] = suite.cachedTask
+	}
+	suite.cachedJob.EXPECT().
+		GetAllTasks().
+		Return(cachedTasks).Times(2)
+
+	for i := uint32(0); i < instanceCount/4; i++ {
+		suite.cachedTask.EXPECT().CurrentState().Return(cached.TaskStateVector{
+			State: pbtask.TaskState_PENDING,
+		})
+	}
+	for i := uint32(0); i < instanceCount/4; i++ {
+		suite.cachedTask.EXPECT().CurrentState().Return(cached.TaskStateVector{
+			State: pbtask.TaskState_RUNNING,
+		})
+	}
+	for i := uint32(0); i < instanceCount/4; i++ {
+		suite.cachedTask.EXPECT().CurrentState().Return(cached.TaskStateVector{
+			State: pbtask.TaskState_LAUNCHED,
+		})
+	}
+	for i := uint32(0); i < instanceCount/4; i++ {
+		suite.cachedTask.EXPECT().CurrentState().Return(cached.TaskStateVector{
+			State: pbtask.TaskState_SUCCEEDED,
+		})
+	}
 
 	suite.jobFactory.EXPECT().
 		AddJob(suite.jobID).
@@ -275,29 +325,32 @@ func (suite *JobRuntimeUpdaterTestSuite) TestJobRuntimeUpdater_Batch_RUNNING() {
 
 	suite.cachedConfig.EXPECT().
 		GetType().
-		Return(pbjob.JobType_BATCH)
+		Return(pbjob.JobType_BATCH).
+		Times(int(instanceCount))
 
-	suite.taskStore.EXPECT().
-		GetTaskStateSummaryForJob(gomock.Any(), suite.jobID).
-		Return(stateCounts, nil)
+	suite.cachedJob.EXPECT().
+		RepopulateInstanceAvailabilityInfo(gomock.Any()).
+		Return(nil)
 
 	suite.cachedJob.EXPECT().
 		GetFirstTaskUpdateTime().
 		Return(float64(0))
 
 	suite.cachedJob.EXPECT().
-		GetLastTaskUpdateTime().
-		Return(suite.lastUpdateTs)
-
-	suite.cachedJob.EXPECT().
 		GetRuntime(gomock.Any()).
 		Return(&jobRuntime, nil)
 
 	suite.cachedJob.EXPECT().
-		Update(gomock.Any(), gomock.Any(), gomock.Any(), cached.UpdateCacheAndDB).
+		Update(
+			gomock.Any(),
+			gomock.Any(),
+			gomock.Any(),
+			nil,
+			cached.UpdateCacheAndDB).
 		Do(func(_ context.Context,
 			jobInfo *pbjob.JobInfo,
 			_ *models.ConfigAddOn,
+			_ *stateless.JobSpec,
 			_ cached.UpdateRequest) {
 			instanceCount := uint32(100)
 			suite.Equal(jobInfo.Runtime.State, pbjob.JobState_RUNNING)
@@ -331,6 +384,19 @@ func (suite *JobRuntimeUpdaterTestSuite) TestJobRuntimeUpdater_Batch_SUCCEED() {
 	// Simulate SUCCEEDED job
 	stateCounts := make(map[string]uint32)
 	stateCounts[pbtask.TaskState_SUCCEEDED.String()] = instanceCount
+	cachedTasks := make(map[uint32]cached.Task)
+	for i := uint32(0); i < instanceCount; i++ {
+		cachedTasks[i] = suite.cachedTask
+	}
+	suite.cachedJob.EXPECT().
+		GetAllTasks().
+		Return(cachedTasks).Times(2)
+
+	for i := uint32(0); i < instanceCount; i++ {
+		suite.cachedTask.EXPECT().CurrentState().Return(cached.TaskStateVector{
+			State: pbtask.TaskState_SUCCEEDED,
+		})
+	}
 
 	startTime, _ := time.Parse(time.RFC3339Nano, jobStartTime)
 	startTimeUnix := float64(startTime.UnixNano()) / float64(time.Second/time.Nanosecond)
@@ -351,16 +417,16 @@ func (suite *JobRuntimeUpdaterTestSuite) TestJobRuntimeUpdater_Batch_SUCCEED() {
 
 	suite.cachedConfig.EXPECT().
 		GetType().
-		Return(pbjob.JobType_BATCH)
+		Return(pbjob.JobType_BATCH).Times(int(instanceCount))
+
+	suite.cachedJob.EXPECT().
+		RepopulateInstanceAvailabilityInfo(gomock.Any()).
+		Return(nil)
 
 	suite.cachedConfig.EXPECT().
 		GetInstanceCount().
 		Return(instanceCount).
 		AnyTimes()
-
-	suite.taskStore.EXPECT().
-		GetTaskStateSummaryForJob(gomock.Any(), suite.jobID).
-		Return(stateCounts, nil)
 
 	suite.cachedJob.EXPECT().
 		GetFirstTaskUpdateTime().
@@ -371,10 +437,16 @@ func (suite *JobRuntimeUpdaterTestSuite) TestJobRuntimeUpdater_Batch_SUCCEED() {
 		Return(endTimeUnix)
 
 	suite.cachedJob.EXPECT().
-		Update(gomock.Any(), gomock.Any(), gomock.Any(), cached.UpdateCacheAndDB).
+		Update(
+			gomock.Any(),
+			gomock.Any(),
+			gomock.Any(),
+			nil,
+			cached.UpdateCacheAndDB).
 		Do(func(_ context.Context,
 			jobInfo *pbjob.JobInfo,
 			_ *models.ConfigAddOn,
+			_ *stateless.JobSpec,
 			_ cached.UpdateRequest) {
 			instanceCount := uint32(100)
 			suite.Equal(jobInfo.Runtime.State, pbjob.JobState_SUCCEEDED)
@@ -416,6 +488,24 @@ func (suite *JobRuntimeUpdaterTestSuite) TestJobRuntimeUpdater_Batch_PENDING() {
 	stateCounts := make(map[string]uint32)
 	stateCounts[pbtask.TaskState_PENDING.String()] = instanceCount / 2
 	stateCounts[pbtask.TaskState_SUCCEEDED.String()] = instanceCount / 2
+	cachedTasks := make(map[uint32]cached.Task)
+	for i := uint32(0); i < instanceCount; i++ {
+		cachedTasks[i] = suite.cachedTask
+	}
+	suite.cachedJob.EXPECT().
+		GetAllTasks().
+		Return(cachedTasks).Times(2)
+
+	for i := uint32(0); i < instanceCount/2; i++ {
+		suite.cachedTask.EXPECT().CurrentState().Return(cached.TaskStateVector{
+			State: pbtask.TaskState_PENDING,
+		})
+	}
+	for i := uint32(0); i < instanceCount/2; i++ {
+		suite.cachedTask.EXPECT().CurrentState().Return(cached.TaskStateVector{
+			State: pbtask.TaskState_SUCCEEDED,
+		})
+	}
 
 	suite.cachedJob.EXPECT().
 		IsPartiallyCreated(gomock.Any()).
@@ -435,25 +525,28 @@ func (suite *JobRuntimeUpdaterTestSuite) TestJobRuntimeUpdater_Batch_PENDING() {
 
 	suite.cachedConfig.EXPECT().
 		GetType().
-		Return(pbjob.JobType_BATCH)
+		Return(pbjob.JobType_BATCH).
+		Times(int(instanceCount))
 
-	suite.taskStore.EXPECT().
-		GetTaskStateSummaryForJob(gomock.Any(), suite.jobID).
-		Return(stateCounts, nil)
+	suite.cachedJob.EXPECT().
+		RepopulateInstanceAvailabilityInfo(gomock.Any()).
+		Return(nil)
 
 	suite.cachedJob.EXPECT().
 		GetFirstTaskUpdateTime().
 		Return(startTimeUnix)
 
 	suite.cachedJob.EXPECT().
-		GetLastTaskUpdateTime().
-		Return(suite.lastUpdateTs)
-
-	suite.cachedJob.EXPECT().
-		Update(gomock.Any(), gomock.Any(), gomock.Any(), cached.UpdateCacheAndDB).
+		Update(
+			gomock.Any(),
+			gomock.Any(),
+			gomock.Any(),
+			nil,
+			cached.UpdateCacheAndDB).
 		Do(func(_ context.Context,
 			jobInfo *pbjob.JobInfo,
 			_ *models.ConfigAddOn,
+			_ *stateless.JobSpec,
 			_ cached.UpdateRequest) {
 			instanceCount := uint32(100)
 			suite.Equal(jobInfo.Runtime.State, pbjob.JobState_PENDING)
@@ -482,7 +575,24 @@ func (suite *JobRuntimeUpdaterTestSuite) TestJobRuntimeUpdater_Batch_FAILED() {
 	stateCounts := make(map[string]uint32)
 	stateCounts[pbtask.TaskState_FAILED.String()] = instanceCount / 2
 	stateCounts[pbtask.TaskState_SUCCEEDED.String()] = instanceCount / 2
+	cachedTasks := make(map[uint32]cached.Task)
+	for i := uint32(0); i < instanceCount; i++ {
+		cachedTasks[i] = suite.cachedTask
+	}
+	suite.cachedJob.EXPECT().
+		GetAllTasks().
+		Return(cachedTasks).AnyTimes()
 
+	for i := uint32(0); i < instanceCount/2; i++ {
+		suite.cachedTask.EXPECT().CurrentState().Return(cached.TaskStateVector{
+			State: pbtask.TaskState_FAILED,
+		})
+	}
+	for i := uint32(0); i < instanceCount/2; i++ {
+		suite.cachedTask.EXPECT().CurrentState().Return(cached.TaskStateVector{
+			State: pbtask.TaskState_SUCCEEDED,
+		})
+	}
 	suite.cachedConfig.EXPECT().
 		GetInstanceCount().
 		Return(instanceCount).
@@ -506,11 +616,12 @@ func (suite *JobRuntimeUpdaterTestSuite) TestJobRuntimeUpdater_Batch_FAILED() {
 
 	suite.cachedConfig.EXPECT().
 		GetType().
-		Return(pbjob.JobType_BATCH)
+		Return(pbjob.JobType_BATCH).
+		Times(int(instanceCount))
 
-	suite.taskStore.EXPECT().
-		GetTaskStateSummaryForJob(gomock.Any(), suite.jobID).
-		Return(stateCounts, nil)
+	suite.cachedJob.EXPECT().
+		RepopulateInstanceAvailabilityInfo(gomock.Any()).
+		Return(nil)
 
 	suite.cachedJob.EXPECT().
 		GetFirstTaskUpdateTime().
@@ -521,10 +632,16 @@ func (suite *JobRuntimeUpdaterTestSuite) TestJobRuntimeUpdater_Batch_FAILED() {
 		Return(endTimeUnix)
 
 	suite.cachedJob.EXPECT().
-		Update(gomock.Any(), gomock.Any(), gomock.Any(), cached.UpdateCacheAndDB).
+		Update(
+			gomock.Any(),
+			gomock.Any(),
+			gomock.Any(),
+			nil,
+			cached.UpdateCacheAndDB).
 		Do(func(_ context.Context,
 			jobInfo *pbjob.JobInfo,
 			_ *models.ConfigAddOn,
+			_ *stateless.JobSpec,
 			_ cached.UpdateRequest) {
 			instanceCount := uint32(100)
 			suite.Equal(jobInfo.Runtime.State, pbjob.JobState_FAILED)
@@ -557,6 +674,23 @@ func (suite *JobRuntimeUpdaterTestSuite) TestJobRuntimeUpdater_Batch_LOST() {
 	stateCounts := make(map[string]uint32)
 	stateCounts[pbtask.TaskState_LOST.String()] = instanceCount / 2
 	stateCounts[pbtask.TaskState_SUCCEEDED.String()] = instanceCount / 2
+	cachedTasks := make(map[uint32]cached.Task)
+	for i := uint32(0); i < instanceCount; i++ {
+		cachedTasks[i] = suite.cachedTask
+	}
+	suite.cachedJob.EXPECT().
+		GetAllTasks().
+		Return(cachedTasks).Times(2)
+	for i := uint32(0); i < instanceCount/2; i++ {
+		suite.cachedTask.EXPECT().CurrentState().Return(cached.TaskStateVector{
+			State: pbtask.TaskState_LOST,
+		})
+	}
+	for i := uint32(0); i < instanceCount/2; i++ {
+		suite.cachedTask.EXPECT().CurrentState().Return(cached.TaskStateVector{
+			State: pbtask.TaskState_SUCCEEDED,
+		})
+	}
 
 	suite.cachedConfig.EXPECT().
 		GetInstanceCount().
@@ -581,11 +715,12 @@ func (suite *JobRuntimeUpdaterTestSuite) TestJobRuntimeUpdater_Batch_LOST() {
 
 	suite.cachedConfig.EXPECT().
 		GetType().
-		Return(pbjob.JobType_BATCH)
+		Return(pbjob.JobType_BATCH).
+		Times(int(instanceCount))
 
-	suite.taskStore.EXPECT().
-		GetTaskStateSummaryForJob(gomock.Any(), suite.jobID).
-		Return(stateCounts, nil)
+	suite.cachedJob.EXPECT().
+		RepopulateInstanceAvailabilityInfo(gomock.Any()).
+		Return(nil)
 
 	suite.cachedJob.EXPECT().
 		GetFirstTaskUpdateTime().
@@ -596,10 +731,16 @@ func (suite *JobRuntimeUpdaterTestSuite) TestJobRuntimeUpdater_Batch_LOST() {
 		Return(endTimeUnix)
 
 	suite.cachedJob.EXPECT().
-		Update(gomock.Any(), gomock.Any(), gomock.Any(), cached.UpdateCacheAndDB).
+		Update(
+			gomock.Any(),
+			gomock.Any(),
+			gomock.Any(),
+			nil,
+			cached.UpdateCacheAndDB).
 		Do(func(_ context.Context,
 			jobInfo *pbjob.JobInfo,
 			_ *models.ConfigAddOn,
+			_ *stateless.JobSpec,
 			_ cached.UpdateRequest) {
 			instanceCount := uint32(100)
 			suite.Equal(jobInfo.Runtime.State, pbjob.JobState_FAILED)
@@ -644,6 +785,29 @@ func (suite *JobRuntimeUpdaterTestSuite) TestJobRuntimeUpdater_Batch_KILLING() {
 	stateCounts[pbtask.TaskState_KILLED.String()] = instanceCount / 2
 	stateCounts[pbtask.TaskState_SUCCEEDED.String()] = instanceCount / 4
 
+	cachedTasks := make(map[uint32]cached.Task)
+	for i := uint32(0); i < instanceCount; i++ {
+		cachedTasks[i] = suite.cachedTask
+	}
+	suite.cachedJob.EXPECT().
+		GetAllTasks().
+		Return(cachedTasks).Times(2)
+	for i := uint32(0); i < instanceCount/4; i++ {
+		suite.cachedTask.EXPECT().CurrentState().Return(cached.TaskStateVector{
+			State: pbtask.TaskState_KILLING,
+		})
+	}
+	for i := uint32(0); i < instanceCount/4; i++ {
+		suite.cachedTask.EXPECT().CurrentState().Return(cached.TaskStateVector{
+			State: pbtask.TaskState_SUCCEEDED,
+		})
+	}
+	for i := uint32(0); i < instanceCount/2; i++ {
+		suite.cachedTask.EXPECT().CurrentState().Return(cached.TaskStateVector{
+			State: pbtask.TaskState_KILLED,
+		})
+	}
+
 	suite.jobFactory.EXPECT().
 		AddJob(suite.jobID).
 		Return(suite.cachedJob)
@@ -658,25 +822,28 @@ func (suite *JobRuntimeUpdaterTestSuite) TestJobRuntimeUpdater_Batch_KILLING() {
 
 	suite.cachedConfig.EXPECT().
 		GetType().
-		Return(pbjob.JobType_BATCH)
+		Return(pbjob.JobType_BATCH).
+		Times(int(instanceCount))
 
-	suite.taskStore.EXPECT().
-		GetTaskStateSummaryForJob(gomock.Any(), suite.jobID).
-		Return(stateCounts, nil)
+	suite.cachedJob.EXPECT().
+		RepopulateInstanceAvailabilityInfo(gomock.Any()).
+		Return(nil)
 
 	suite.cachedJob.EXPECT().
 		GetFirstTaskUpdateTime().
 		Return(startTimeUnix)
 
 	suite.cachedJob.EXPECT().
-		GetLastTaskUpdateTime().
-		Return(suite.lastUpdateTs)
-
-	suite.cachedJob.EXPECT().
-		Update(gomock.Any(), gomock.Any(), gomock.Any(), cached.UpdateCacheAndDB).
+		Update(
+			gomock.Any(),
+			gomock.Any(),
+			gomock.Any(),
+			nil,
+			cached.UpdateCacheAndDB).
 		Do(func(_ context.Context,
 			jobInfo *pbjob.JobInfo,
 			_ *models.ConfigAddOn,
+			_ *stateless.JobSpec,
 			_ cached.UpdateRequest) {
 			instanceCount := uint32(100)
 			suite.Equal(jobInfo.Runtime.State, pbjob.JobState_KILLING)
@@ -693,22 +860,53 @@ func (suite *JobRuntimeUpdaterTestSuite) TestJobRuntimeUpdater_Batch_KILLING() {
 // TestJobRuntimeUpdater_Batch_KILLED tests updating a KILLED batch job
 func (suite *JobRuntimeUpdaterTestSuite) TestJobRuntimeUpdater_Batch_KILLED() {
 	instanceCount := uint32(100)
-	jobRuntime := pbjob.RuntimeInfo{
-		State:     pbjob.JobState_PENDING,
-		GoalState: pbjob.JobState_SUCCEEDED,
-	}
 
 	startTime, _ := time.Parse(time.RFC3339Nano, jobStartTime)
 	startTimeUnix := float64(startTime.UnixNano()) / float64(time.Second/time.Nanosecond)
 	endTime, _ := time.Parse(time.RFC3339Nano, jobCompletionTime)
 	endTimeUnix := float64(endTime.UnixNano()) / float64(time.Second/time.Nanosecond)
 
+	jobRuntime := pbjob.RuntimeInfo{
+		State:     pbjob.JobState_PENDING,
+		GoalState: pbjob.JobState_KILLED,
+	}
 	// Simulate KILLED job
 	stateCounts := make(map[string]uint32)
 	stateCounts[pbtask.TaskState_FAILED.String()] = instanceCount / 4
 	stateCounts[pbtask.TaskState_LOST.String()] = instanceCount / 4
 	stateCounts[pbtask.TaskState_KILLED.String()] = instanceCount / 4
 	stateCounts[pbtask.TaskState_SUCCEEDED.String()] = instanceCount / 4
+	cachedTasks := make(map[uint32]cached.Task)
+	for i := uint32(0); i < instanceCount; i++ {
+		cachedTasks[i] = suite.cachedTask
+	}
+	suite.cachedJob.EXPECT().
+		GetAllTasks().
+		Return(cachedTasks).Times(2)
+	for i := uint32(0); i < instanceCount/4; i++ {
+		suite.cachedTask.EXPECT().CurrentState().Return(cached.TaskStateVector{
+			State: pbtask.TaskState_FAILED,
+		})
+	}
+	for i := uint32(0); i < instanceCount/4; i++ {
+		suite.cachedTask.EXPECT().CurrentState().Return(cached.TaskStateVector{
+			State: pbtask.TaskState_LOST,
+		})
+	}
+	for i := uint32(0); i < instanceCount/4; i++ {
+		suite.cachedTask.EXPECT().CurrentState().Return(cached.TaskStateVector{
+			State: pbtask.TaskState_KILLED,
+		})
+	}
+	for i := uint32(0); i < instanceCount/4; i++ {
+		suite.cachedTask.EXPECT().CurrentState().Return(cached.TaskStateVector{
+			State: pbtask.TaskState_SUCCEEDED,
+		})
+	}
+
+	suite.cachedJob.EXPECT().
+		GetRuntime(gomock.Any()).
+		Return(&jobRuntime, nil)
 
 	suite.cachedConfig.EXPECT().
 		GetInstanceCount().
@@ -724,20 +922,17 @@ func (suite *JobRuntimeUpdaterTestSuite) TestJobRuntimeUpdater_Batch_KILLED() {
 		Return(suite.cachedJob)
 
 	suite.cachedJob.EXPECT().
-		GetRuntime(gomock.Any()).
-		Return(&jobRuntime, nil)
-
-	suite.cachedJob.EXPECT().
 		GetConfig(gomock.Any()).
 		Return(suite.cachedConfig, nil)
 
 	suite.cachedConfig.EXPECT().
 		GetType().
-		Return(pbjob.JobType_BATCH)
+		Return(pbjob.JobType_BATCH).
+		Times(int(instanceCount))
 
-	suite.taskStore.EXPECT().
-		GetTaskStateSummaryForJob(gomock.Any(), suite.jobID).
-		Return(stateCounts, nil)
+	suite.cachedJob.EXPECT().
+		RepopulateInstanceAvailabilityInfo(gomock.Any()).
+		Return(nil)
 
 	suite.cachedJob.EXPECT().
 		GetFirstTaskUpdateTime().
@@ -748,10 +943,16 @@ func (suite *JobRuntimeUpdaterTestSuite) TestJobRuntimeUpdater_Batch_KILLED() {
 		Return(endTimeUnix)
 
 	suite.cachedJob.EXPECT().
-		Update(gomock.Any(), gomock.Any(), gomock.Any(), cached.UpdateCacheAndDB).
+		Update(
+			gomock.Any(),
+			gomock.Any(),
+			gomock.Any(),
+			nil,
+			cached.UpdateCacheAndDB).
 		Do(func(_ context.Context,
 			jobInfo *pbjob.JobInfo,
 			_ *models.ConfigAddOn,
+			_ *stateless.JobSpec,
 			_ cached.UpdateRequest) {
 			instanceCount := uint32(100)
 			suite.Equal(jobInfo.Runtime.State, pbjob.JobState_KILLED)
@@ -784,6 +985,19 @@ func (suite *JobRuntimeUpdaterTestSuite) TestJobRuntimeUpdater_DBError() {
 		State:     pbjob.JobState_RUNNING,
 		GoalState: pbjob.JobState_SUCCEEDED,
 	}
+	cachedTasks := make(map[uint32]cached.Task)
+	for i := uint32(0); i < instanceCount; i++ {
+		cachedTasks[i] = suite.cachedTask
+	}
+	suite.cachedJob.EXPECT().
+		GetAllTasks().
+		Return(cachedTasks).Times(2)
+
+	for i := uint32(0); i < instanceCount; i++ {
+		suite.cachedTask.EXPECT().CurrentState().Return(cached.TaskStateVector{
+			State: pbtask.TaskState_SUCCEEDED,
+		})
+	}
 
 	startTime, _ := time.Parse(time.RFC3339Nano, jobStartTime)
 	startTimeUnix := float64(startTime.UnixNano()) / float64(time.Second/time.Nanosecond)
@@ -809,15 +1023,15 @@ func (suite *JobRuntimeUpdaterTestSuite) TestJobRuntimeUpdater_DBError() {
 
 	suite.cachedConfig.EXPECT().
 		GetType().
-		Return(pbjob.JobType_BATCH)
+		Return(pbjob.JobType_BATCH).Times(int(instanceCount))
+
+	suite.cachedJob.EXPECT().
+		RepopulateInstanceAvailabilityInfo(gomock.Any()).
+		Return(nil)
 
 	suite.cachedConfig.EXPECT().
 		HasControllerTask().
 		Return(false)
-
-	suite.taskStore.EXPECT().
-		GetTaskStateSummaryForJob(gomock.Any(), suite.jobID).
-		Return(stateCounts, nil)
 
 	suite.cachedJob.EXPECT().
 		GetFirstTaskUpdateTime().
@@ -828,7 +1042,12 @@ func (suite *JobRuntimeUpdaterTestSuite) TestJobRuntimeUpdater_DBError() {
 		Return(endTimeUnix)
 
 	suite.cachedJob.EXPECT().
-		Update(gomock.Any(), gomock.Any(), gomock.Any(), cached.UpdateCacheAndDB).
+		Update(
+			gomock.Any(),
+			gomock.Any(),
+			gomock.Any(),
+			nil,
+			cached.UpdateCacheAndDB).
 		Return(fmt.Errorf("fake db error"))
 
 	err := JobRuntimeUpdater(context.Background(), suite.jobEnt)
@@ -852,6 +1071,19 @@ func (suite *JobRuntimeUpdaterTestSuite) TestJobRuntimeUpdater_IncorrectState() 
 		GoalState: pbjob.JobState_SUCCEEDED,
 		TaskStats: stateCounts,
 	}
+	cachedTasks := make(map[uint32]cached.Task)
+	for i := uint32(0); i < instanceCount; i++ {
+		cachedTasks[i] = suite.cachedTask
+	}
+	suite.cachedJob.EXPECT().
+		GetAllTasks().
+		Return(cachedTasks).Times(2)
+
+	for i := uint32(0); i < instanceCount; i++ {
+		suite.cachedTask.EXPECT().CurrentState().Return(cached.TaskStateVector{
+			State: pbtask.TaskState_SUCCEEDED,
+		})
+	}
 
 	suite.cachedConfig.EXPECT().
 		GetInstanceCount().
@@ -876,11 +1108,12 @@ func (suite *JobRuntimeUpdaterTestSuite) TestJobRuntimeUpdater_IncorrectState() 
 
 	suite.cachedConfig.EXPECT().
 		GetType().
-		Return(pbjob.JobType_BATCH)
+		Return(pbjob.JobType_BATCH).
+		Times(100)
 
-	suite.taskStore.EXPECT().
-		GetTaskStateSummaryForJob(gomock.Any(), suite.jobID).
-		Return(stateCounts, nil)
+	suite.cachedJob.EXPECT().
+		RepopulateInstanceAvailabilityInfo(gomock.Any()).
+		Return(nil)
 
 	suite.cachedJob.EXPECT().
 		GetFirstTaskUpdateTime().
@@ -891,10 +1124,16 @@ func (suite *JobRuntimeUpdaterTestSuite) TestJobRuntimeUpdater_IncorrectState() 
 		Return(endTimeUnix)
 
 	suite.cachedJob.EXPECT().
-		Update(gomock.Any(), gomock.Any(), gomock.Any(), cached.UpdateCacheAndDB).
+		Update(
+			gomock.Any(),
+			gomock.Any(),
+			gomock.Any(),
+			nil,
+			cached.UpdateCacheAndDB).
 		Do(func(_ context.Context,
 			jobInfo *pbjob.JobInfo,
 			_ *models.ConfigAddOn,
+			_ *stateless.JobSpec,
 			_ cached.UpdateRequest) {
 			suite.Equal(jobInfo.Runtime.State, pbjob.JobState_SUCCEEDED)
 		}).Return(nil)
@@ -918,6 +1157,10 @@ func (suite *JobRuntimeUpdaterTestSuite) TestJobRuntimeUpdater_KILLEDWithNoTask(
 		GoalState: pbjob.JobState_KILLED,
 		TaskStats: stateCounts,
 	}
+	cachedTasks := make(map[uint32]cached.Task)
+	suite.cachedJob.EXPECT().
+		GetAllTasks().
+		Return(cachedTasks)
 
 	suite.cachedConfig.EXPECT().
 		GetInstanceCount().
@@ -936,9 +1179,13 @@ func (suite *JobRuntimeUpdaterTestSuite) TestJobRuntimeUpdater_KILLEDWithNoTask(
 		GetConfig(gomock.Any()).
 		Return(suite.cachedConfig, nil)
 
-	suite.taskStore.EXPECT().
-		GetTaskStateSummaryForJob(gomock.Any(), suite.jobID).
-		Return(stateCounts, nil)
+	suite.cachedJob.EXPECT().
+		GetAllTasks().
+		Return(cachedTasks)
+
+	suite.cachedJob.EXPECT().
+		RepopulateInstanceAvailabilityInfo(gomock.Any()).
+		Return(nil)
 
 	err := JobRuntimeUpdater(context.Background(), suite.jobEnt)
 	suite.NoError(err)
@@ -960,6 +1207,24 @@ func (suite *JobRuntimeUpdaterTestSuite) TestJobRuntimeUpdater_PartiallyCreatedJ
 	stateCounts := make(map[string]uint32)
 	stateCounts[pbtask.TaskState_PENDING.String()] = instanceCount/2 - 1
 	stateCounts[pbtask.TaskState_SUCCEEDED.String()] = instanceCount/2 - 1
+	cachedTasks := make(map[uint32]cached.Task)
+	for i := uint32(0); i < instanceCount-2; i++ {
+		cachedTasks[i] = suite.cachedTask
+	}
+	suite.cachedJob.EXPECT().
+		GetAllTasks().
+		Return(cachedTasks).Times(2)
+
+	for i := uint32(0); i < instanceCount/2-1; i++ {
+		suite.cachedTask.EXPECT().CurrentState().Return(cached.TaskStateVector{
+			State: pbtask.TaskState_PENDING,
+		})
+	}
+	for i := uint32(0); i < instanceCount/2-1; i++ {
+		suite.cachedTask.EXPECT().CurrentState().Return(cached.TaskStateVector{
+			State: pbtask.TaskState_SUCCEEDED,
+		})
+	}
 
 	jobRuntime := pbjob.RuntimeInfo{
 		State:     pbjob.JobState_PENDING,
@@ -979,12 +1244,13 @@ func (suite *JobRuntimeUpdaterTestSuite) TestJobRuntimeUpdater_PartiallyCreatedJ
 		GetConfig(gomock.Any()).
 		Return(suite.cachedConfig, nil)
 
-	suite.cachedConfig.EXPECT().GetType().Return(pbjob.JobType_BATCH)
+	suite.cachedConfig.EXPECT().GetType().Return(pbjob.JobType_BATCH).Times(
+		int(instanceCount - 2))
 	suite.cachedJob.EXPECT().GetJobType().Return(pbjob.JobType_BATCH).AnyTimes()
 
-	suite.taskStore.EXPECT().
-		GetTaskStateSummaryForJob(gomock.Any(), suite.jobID).
-		Return(stateCounts, nil)
+	suite.cachedJob.EXPECT().
+		RepopulateInstanceAvailabilityInfo(gomock.Any()).
+		Return(nil)
 
 	suite.cachedJob.EXPECT().
 		IsPartiallyCreated(gomock.Any()).
@@ -996,14 +1262,16 @@ func (suite *JobRuntimeUpdaterTestSuite) TestJobRuntimeUpdater_PartiallyCreatedJ
 		Return(startTimeUnix)
 
 	suite.cachedJob.EXPECT().
-		GetLastTaskUpdateTime().
-		Return(suite.lastUpdateTs)
-
-	suite.cachedJob.EXPECT().
-		Update(gomock.Any(), gomock.Any(), gomock.Any(), cached.UpdateCacheAndDB).
+		Update(
+			gomock.Any(),
+			gomock.Any(),
+			gomock.Any(),
+			nil,
+			cached.UpdateCacheAndDB).
 		Do(func(_ context.Context,
 			jobInfo *pbjob.JobInfo,
 			_ *models.ConfigAddOn,
+			_ *stateless.JobSpec,
 			_ cached.UpdateRequest) {
 			suite.Equal(jobInfo.Runtime.State, pbjob.JobState_INITIALIZED)
 		}).Return(nil)
@@ -1039,6 +1307,24 @@ func (suite *JobRuntimeUpdaterTestSuite) TestJobRuntimeUpdater_InitializedJobWit
 		GoalState: pbjob.JobState_SUCCEEDED,
 		TaskStats: stateCounts,
 	}
+	cachedTasks := make(map[uint32]cached.Task)
+	for i := uint32(0); i < instanceCount; i++ {
+		cachedTasks[i] = suite.cachedTask
+	}
+	suite.cachedJob.EXPECT().
+		GetAllTasks().
+		Return(cachedTasks).Times(2)
+
+	for i := uint32(0); i < instanceCount/2; i++ {
+		suite.cachedTask.EXPECT().CurrentState().Return(cached.TaskStateVector{
+			State: pbtask.TaskState_PENDING,
+		})
+	}
+	for i := uint32(0); i < instanceCount/2; i++ {
+		suite.cachedTask.EXPECT().CurrentState().Return(cached.TaskStateVector{
+			State: pbtask.TaskState_SUCCEEDED,
+		})
+	}
 
 	suite.jobFactory.EXPECT().
 		AddJob(suite.jobID).
@@ -1061,9 +1347,9 @@ func (suite *JobRuntimeUpdaterTestSuite) TestJobRuntimeUpdater_InitializedJobWit
 		Return(pbjob.JobType_BATCH).
 		AnyTimes()
 
-	suite.taskStore.EXPECT().
-		GetTaskStateSummaryForJob(gomock.Any(), suite.jobID).
-		Return(stateCounts, nil)
+	suite.cachedJob.EXPECT().
+		RepopulateInstanceAvailabilityInfo(gomock.Any()).
+		Return(nil)
 
 	suite.cachedJob.EXPECT().
 		IsPartiallyCreated(gomock.Any()).
@@ -1075,14 +1361,16 @@ func (suite *JobRuntimeUpdaterTestSuite) TestJobRuntimeUpdater_InitializedJobWit
 		Return(startTimeUnix)
 
 	suite.cachedJob.EXPECT().
-		GetLastTaskUpdateTime().
-		Return(suite.lastUpdateTs)
-
-	suite.cachedJob.EXPECT().
-		Update(gomock.Any(), gomock.Any(), gomock.Any(), cached.UpdateCacheAndDB).
+		Update(
+			gomock.Any(),
+			gomock.Any(),
+			gomock.Any(),
+			nil,
+			cached.UpdateCacheAndDB).
 		Do(func(_ context.Context,
 			jobInfo *pbjob.JobInfo,
 			_ *models.ConfigAddOn,
+			_ *stateless.JobSpec,
 			_ cached.UpdateRequest) {
 			suite.Equal(jobInfo.Runtime.State, pbjob.JobState_PENDING)
 		}).Return(nil)
@@ -1112,7 +1400,24 @@ func (suite *JobRuntimeUpdaterTestSuite) TestJobRuntimeUpdater_PendingJobWithMor
 	stateCounts := make(map[string]uint32)
 	stateCounts[pbtask.TaskState_FAILED.String()] = instanceCount / 2
 	stateCounts[pbtask.TaskState_SUCCEEDED.String()] = instanceCount / 2
+	cachedTasks := make(map[uint32]cached.Task)
+	for i := uint32(0); i < instanceCount; i++ {
+		cachedTasks[i] = suite.cachedTask
+	}
+	suite.cachedJob.EXPECT().
+		GetAllTasks().
+		Return(cachedTasks).Times(2)
 
+	for i := uint32(0); i < instanceCount/2; i++ {
+		suite.cachedTask.EXPECT().CurrentState().Return(cached.TaskStateVector{
+			State: pbtask.TaskState_FAILED,
+		})
+	}
+	for i := uint32(0); i < instanceCount/2; i++ {
+		suite.cachedTask.EXPECT().CurrentState().Return(cached.TaskStateVector{
+			State: pbtask.TaskState_SUCCEEDED,
+		})
+	}
 	jobRuntime := pbjob.RuntimeInfo{
 		State:     pbjob.JobState_INITIALIZED,
 		GoalState: pbjob.JobState_SUCCEEDED,
@@ -1140,9 +1445,9 @@ func (suite *JobRuntimeUpdaterTestSuite) TestJobRuntimeUpdater_PendingJobWithMor
 		Return(pbjob.JobType_BATCH).
 		AnyTimes()
 
-	suite.taskStore.EXPECT().
-		GetTaskStateSummaryForJob(gomock.Any(), suite.jobID).
-		Return(stateCounts, nil)
+	suite.cachedJob.EXPECT().
+		RepopulateInstanceAvailabilityInfo(gomock.Any()).
+		Return(nil)
 
 	suite.cachedJob.EXPECT().
 		IsPartiallyCreated(gomock.Any()).
@@ -1154,14 +1459,16 @@ func (suite *JobRuntimeUpdaterTestSuite) TestJobRuntimeUpdater_PendingJobWithMor
 		Return(startTimeUnix)
 
 	suite.cachedJob.EXPECT().
-		GetLastTaskUpdateTime().
-		Return(suite.lastUpdateTs)
-
-	suite.cachedJob.EXPECT().
-		Update(gomock.Any(), gomock.Any(), gomock.Any(), cached.UpdateCacheAndDB).
+		Update(
+			gomock.Any(),
+			gomock.Any(),
+			gomock.Any(),
+			nil,
+			cached.UpdateCacheAndDB).
 		Do(func(_ context.Context,
 			jobInfo *pbjob.JobInfo,
 			_ *models.ConfigAddOn,
+			_ *stateless.JobSpec,
 			_ cached.UpdateRequest) {
 			suite.Equal(jobInfo.Runtime.State, pbjob.JobState_PENDING)
 		}).Return(nil)
@@ -1195,6 +1502,24 @@ func (suite *JobRuntimeUpdaterTestSuite) TestJobRuntimeUpdater_ControllerTaskSuc
 		GoalState: pbjob.JobState_SUCCEEDED,
 		TaskStats: stateCounts,
 	}
+	cachedTasks := make(map[uint32]cached.Task)
+	for i := uint32(0); i < instanceCount; i++ {
+		cachedTasks[i] = suite.cachedTask
+	}
+	suite.cachedJob.EXPECT().
+		GetAllTasks().
+		Return(cachedTasks).Times(2)
+
+	for i := uint32(0); i < instanceCount/2; i++ {
+		suite.cachedTask.EXPECT().CurrentState().Return(cached.TaskStateVector{
+			State: pbtask.TaskState_FAILED,
+		})
+	}
+	for i := uint32(0); i < instanceCount/2; i++ {
+		suite.cachedTask.EXPECT().CurrentState().Return(cached.TaskStateVector{
+			State: pbtask.TaskState_SUCCEEDED,
+		})
+	}
 
 	suite.jobFactory.EXPECT().
 		AddJob(suite.jobID).
@@ -1208,15 +1533,15 @@ func (suite *JobRuntimeUpdaterTestSuite) TestJobRuntimeUpdater_ControllerTaskSuc
 		GetConfig(gomock.Any()).
 		Return(suite.cachedConfig, nil)
 
-	suite.cachedConfig.EXPECT().GetType().Return(pbjob.JobType_BATCH)
+	suite.cachedConfig.EXPECT().GetType().Return(pbjob.JobType_BATCH).Times(100)
 
 	suite.cachedConfig.EXPECT().
 		HasControllerTask().
 		Return(true)
 
-	suite.taskStore.EXPECT().
-		GetTaskStateSummaryForJob(gomock.Any(), suite.jobID).
-		Return(stateCounts, nil)
+	suite.cachedJob.EXPECT().
+		RepopulateInstanceAvailabilityInfo(gomock.Any()).
+		Return(nil)
 
 	suite.cachedJob.EXPECT().
 		IsPartiallyCreated(gomock.Any()).
@@ -1241,12 +1566,18 @@ func (suite *JobRuntimeUpdaterTestSuite) TestJobRuntimeUpdater_ControllerTaskSuc
 		GetLastTaskUpdateTime().
 		Return(float64(0))
 
-	// as long as controller task succeeds, job state is succeeded
+		// as long as controller task succeeds, job state is succeeded
 	suite.cachedJob.EXPECT().
-		Update(gomock.Any(), gomock.Any(), gomock.Any(), cached.UpdateCacheAndDB).
+		Update(
+			gomock.Any(),
+			gomock.Any(),
+			gomock.Any(),
+			nil,
+			cached.UpdateCacheAndDB).
 		Do(func(_ context.Context,
 			jobInfo *pbjob.JobInfo,
 			_ *models.ConfigAddOn,
+			_ *stateless.JobSpec,
 			_ cached.UpdateRequest) {
 			suite.Equal(jobInfo.Runtime.State, pbjob.JobState_SUCCEEDED)
 		}).Return(nil)
@@ -1272,6 +1603,24 @@ func (suite *JobRuntimeUpdaterTestSuite) TestJobRuntimeUpdaterControllerTaskFail
 	stateCounts[pbtask.TaskState_FAILED.String()] = instanceCount / 2
 	stateCounts[pbtask.TaskState_SUCCEEDED.String()] = instanceCount / 2
 
+	cachedTasks := make(map[uint32]cached.Task)
+	for i := uint32(0); i < instanceCount; i++ {
+		cachedTasks[i] = suite.cachedTask
+	}
+	suite.cachedJob.EXPECT().
+		GetAllTasks().
+		Return(cachedTasks).Times(2)
+
+	for i := uint32(0); i < instanceCount/2; i++ {
+		suite.cachedTask.EXPECT().CurrentState().Return(cached.TaskStateVector{
+			State: pbtask.TaskState_FAILED,
+		})
+	}
+	for i := uint32(0); i < instanceCount/2; i++ {
+		suite.cachedTask.EXPECT().CurrentState().Return(cached.TaskStateVector{
+			State: pbtask.TaskState_SUCCEEDED,
+		})
+	}
 	jobRuntime := pbjob.RuntimeInfo{
 		State:     pbjob.JobState_INITIALIZED,
 		GoalState: pbjob.JobState_SUCCEEDED,
@@ -1281,6 +1630,10 @@ func (suite *JobRuntimeUpdaterTestSuite) TestJobRuntimeUpdaterControllerTaskFail
 	suite.jobFactory.EXPECT().
 		AddJob(suite.jobID).
 		Return(suite.cachedJob)
+
+	suite.cachedConfig.EXPECT().
+		GetType().
+		Return(pbjob.JobType_BATCH).Times(100)
 
 	suite.cachedJob.EXPECT().
 		GetRuntime(gomock.Any()).
@@ -1294,9 +1647,9 @@ func (suite *JobRuntimeUpdaterTestSuite) TestJobRuntimeUpdaterControllerTaskFail
 		HasControllerTask().
 		Return(true)
 
-	suite.taskStore.EXPECT().
-		GetTaskStateSummaryForJob(gomock.Any(), suite.jobID).
-		Return(stateCounts, nil)
+	suite.cachedJob.EXPECT().
+		RepopulateInstanceAvailabilityInfo(gomock.Any()).
+		Return(nil)
 
 	suite.cachedJob.EXPECT().
 		IsPartiallyCreated(gomock.Any()).
@@ -1324,11 +1677,34 @@ func (suite *JobRuntimeUpdaterTestSuite) TestJobRuntimeUpdaterControllerTaskFail
 	stateCounts[pbtask.TaskState_FAILED.String()] = instanceCount / 2
 	stateCounts[pbtask.TaskState_SUCCEEDED.String()] = instanceCount / 2
 
+	cachedTasks := make(map[uint32]cached.Task)
+	for i := uint32(0); i < instanceCount; i++ {
+		cachedTasks[i] = suite.cachedTask
+	}
+	suite.cachedConfig.EXPECT().
+		GetType().
+		Return(pbjob.JobType_BATCH).Times(100)
+
 	jobRuntime := pbjob.RuntimeInfo{
 		State:     pbjob.JobState_INITIALIZED,
 		GoalState: pbjob.JobState_SUCCEEDED,
 		TaskStats: stateCounts,
 	}
+
+	for i := uint32(0); i < instanceCount/2; i++ {
+		suite.cachedTask.EXPECT().CurrentState().Return(cached.TaskStateVector{
+			State: pbtask.TaskState_FAILED,
+		})
+	}
+	for i := uint32(0); i < instanceCount/2; i++ {
+		suite.cachedTask.EXPECT().CurrentState().Return(cached.TaskStateVector{
+			State: pbtask.TaskState_SUCCEEDED,
+		})
+	}
+
+	suite.cachedJob.EXPECT().
+		GetAllTasks().
+		Return(cachedTasks).Times(2)
 
 	suite.jobFactory.EXPECT().
 		AddJob(suite.jobID).
@@ -1346,9 +1722,9 @@ func (suite *JobRuntimeUpdaterTestSuite) TestJobRuntimeUpdaterControllerTaskFail
 		HasControllerTask().
 		Return(true)
 
-	suite.taskStore.EXPECT().
-		GetTaskStateSummaryForJob(gomock.Any(), suite.jobID).
-		Return(stateCounts, nil)
+	suite.cachedJob.EXPECT().
+		RepopulateInstanceAvailabilityInfo(gomock.Any()).
+		Return(nil)
 
 	suite.cachedJob.EXPECT().
 		IsPartiallyCreated(gomock.Any()).
@@ -1388,6 +1764,22 @@ func (suite *JobRuntimeUpdaterTestSuite) TestJobRuntimeUpdater_ControllerTaskFai
 		GoalState: pbjob.JobState_SUCCEEDED,
 		TaskStats: stateCounts,
 	}
+	cachedTasks := make(map[uint32]cached.Task)
+	for i := uint32(0); i < instanceCount; i++ {
+		cachedTasks[i] = suite.cachedTask
+	}
+	suite.cachedJob.EXPECT().
+		GetAllTasks().
+		Return(cachedTasks).Times(2)
+
+	for i := uint32(0); i < instanceCount-1; i++ {
+		suite.cachedTask.EXPECT().CurrentState().Return(cached.TaskStateVector{
+			State: pbtask.TaskState_SUCCEEDED,
+		})
+	}
+	suite.cachedTask.EXPECT().CurrentState().Return(cached.TaskStateVector{
+		State: pbtask.TaskState_FAILED,
+	})
 
 	suite.jobFactory.EXPECT().
 		AddJob(suite.jobID).
@@ -1403,15 +1795,15 @@ func (suite *JobRuntimeUpdaterTestSuite) TestJobRuntimeUpdater_ControllerTaskFai
 
 	suite.cachedConfig.EXPECT().
 		GetType().
-		Return(pbjob.JobType_BATCH)
+		Return(pbjob.JobType_BATCH).Times(100)
 
 	suite.cachedConfig.EXPECT().
 		HasControllerTask().
 		Return(true)
 
-	suite.taskStore.EXPECT().
-		GetTaskStateSummaryForJob(gomock.Any(), suite.jobID).
-		Return(stateCounts, nil)
+	suite.cachedJob.EXPECT().
+		RepopulateInstanceAvailabilityInfo(gomock.Any()).
+		Return(nil)
 
 	suite.cachedJob.EXPECT().
 		IsPartiallyCreated(gomock.Any()).
@@ -1436,12 +1828,18 @@ func (suite *JobRuntimeUpdaterTestSuite) TestJobRuntimeUpdater_ControllerTaskFai
 		GetLastTaskUpdateTime().
 		Return(suite.lastUpdateTs)
 
-	// as long as controller task failed, job state is failed
+		// as long as controller task failed, job state is failed
 	suite.cachedJob.EXPECT().
-		Update(gomock.Any(), gomock.Any(), gomock.Any(), cached.UpdateCacheAndDB).
+		Update(
+			gomock.Any(),
+			gomock.Any(),
+			gomock.Any(),
+			nil,
+			cached.UpdateCacheAndDB).
 		Do(func(_ context.Context,
 			jobInfo *pbjob.JobInfo,
 			_ *models.ConfigAddOn,
+			_ *stateless.JobSpec,
 			_ cached.UpdateRequest) {
 			suite.Equal(jobInfo.Runtime.State, pbjob.JobState_FAILED)
 		}).Return(nil)
@@ -1475,6 +1873,22 @@ func (suite *JobRuntimeUpdaterTestSuite) TestJobRuntimeUpdater_ControllerTaskLos
 		GoalState: pbjob.JobState_SUCCEEDED,
 		TaskStats: stateCounts,
 	}
+	cachedTasks := make(map[uint32]cached.Task)
+	for i := uint32(0); i < instanceCount; i++ {
+		cachedTasks[i] = suite.cachedTask
+	}
+	suite.cachedJob.EXPECT().
+		GetAllTasks().
+		Return(cachedTasks).Times(2)
+
+	for i := uint32(0); i < instanceCount-1; i++ {
+		suite.cachedTask.EXPECT().CurrentState().Return(cached.TaskStateVector{
+			State: pbtask.TaskState_SUCCEEDED,
+		})
+	}
+	suite.cachedTask.EXPECT().CurrentState().Return(cached.TaskStateVector{
+		State: pbtask.TaskState_LOST,
+	})
 
 	suite.jobFactory.EXPECT().
 		AddJob(suite.jobID).
@@ -1490,15 +1904,15 @@ func (suite *JobRuntimeUpdaterTestSuite) TestJobRuntimeUpdater_ControllerTaskLos
 
 	suite.cachedConfig.EXPECT().
 		GetType().
-		Return(pbjob.JobType_BATCH)
+		Return(pbjob.JobType_BATCH).Times(100)
 
 	suite.cachedConfig.EXPECT().
 		HasControllerTask().
 		Return(true)
 
-	suite.taskStore.EXPECT().
-		GetTaskStateSummaryForJob(gomock.Any(), suite.jobID).
-		Return(stateCounts, nil)
+	suite.cachedJob.EXPECT().
+		RepopulateInstanceAvailabilityInfo(gomock.Any()).
+		Return(nil)
 
 	suite.cachedJob.EXPECT().
 		IsPartiallyCreated(gomock.Any()).
@@ -1523,12 +1937,18 @@ func (suite *JobRuntimeUpdaterTestSuite) TestJobRuntimeUpdater_ControllerTaskLos
 		GetLastTaskUpdateTime().
 		Return(suite.lastUpdateTs)
 
-	// as long as controller task failed, job state is failed
+		// as long as controller task failed, job state is failed
 	suite.cachedJob.EXPECT().
-		Update(gomock.Any(), gomock.Any(), gomock.Any(), cached.UpdateCacheAndDB).
+		Update(
+			gomock.Any(),
+			gomock.Any(),
+			gomock.Any(),
+			nil,
+			cached.UpdateCacheAndDB).
 		Do(func(_ context.Context,
 			jobInfo *pbjob.JobInfo,
 			_ *models.ConfigAddOn,
+			_ *stateless.JobSpec,
 			_ cached.UpdateRequest) {
 			suite.Equal(jobInfo.Runtime.State, pbjob.JobState_FAILED)
 		}).Return(nil)
@@ -1562,6 +1982,24 @@ func (suite *JobRuntimeUpdaterTestSuite) TestJobRuntimeUpdater_ControllerTaskRun
 		GoalState: pbjob.JobState_SUCCEEDED,
 		TaskStats: stateCounts,
 	}
+	cachedTasks := make(map[uint32]cached.Task)
+	for i := uint32(0); i < instanceCount; i++ {
+		cachedTasks[i] = suite.cachedTask
+	}
+	suite.cachedJob.EXPECT().
+		GetAllTasks().
+		Return(cachedTasks).Times(2)
+
+	for i := uint32(0); i < instanceCount/2; i++ {
+		suite.cachedTask.EXPECT().CurrentState().Return(cached.TaskStateVector{
+			State: pbtask.TaskState_RUNNING,
+		})
+	}
+	for i := uint32(0); i < instanceCount/2; i++ {
+		suite.cachedTask.EXPECT().CurrentState().Return(cached.TaskStateVector{
+			State: pbtask.TaskState_SUCCEEDED,
+		})
+	}
 
 	suite.jobFactory.EXPECT().
 		AddJob(suite.jobID).
@@ -1577,15 +2015,15 @@ func (suite *JobRuntimeUpdaterTestSuite) TestJobRuntimeUpdater_ControllerTaskRun
 
 	suite.cachedConfig.EXPECT().
 		GetType().
-		Return(pbjob.JobType_BATCH)
+		Return(pbjob.JobType_BATCH).Times(100)
 
 	suite.cachedConfig.EXPECT().
 		HasControllerTask().
 		Return(true)
 
-	suite.taskStore.EXPECT().
-		GetTaskStateSummaryForJob(gomock.Any(), suite.jobID).
-		Return(stateCounts, nil)
+	suite.cachedJob.EXPECT().
+		RepopulateInstanceAvailabilityInfo(gomock.Any()).
+		Return(nil)
 
 	suite.cachedJob.EXPECT().
 		IsPartiallyCreated(gomock.Any()).
@@ -1596,17 +2034,19 @@ func (suite *JobRuntimeUpdaterTestSuite) TestJobRuntimeUpdater_ControllerTaskRun
 		GetFirstTaskUpdateTime().
 		Return(startTimeUnix)
 
-	suite.cachedJob.EXPECT().
-		GetLastTaskUpdateTime().
-		Return(suite.lastUpdateTs)
-
 	// even if controller task finishes, still wait for all tasks
 	// finish before entering terminal state
 	suite.cachedJob.EXPECT().
-		Update(gomock.Any(), gomock.Any(), gomock.Any(), cached.UpdateCacheAndDB).
+		Update(
+			gomock.Any(),
+			gomock.Any(),
+			gomock.Any(),
+			nil,
+			cached.UpdateCacheAndDB).
 		Do(func(_ context.Context,
 			jobInfo *pbjob.JobInfo,
 			_ *models.ConfigAddOn,
+			_ *stateless.JobSpec,
 			_ cached.UpdateRequest) {
 			suite.Equal(jobInfo.Runtime.State, pbjob.JobState_RUNNING)
 		}).Return(nil)
@@ -1631,7 +2071,24 @@ func (suite *JobRuntimeUpdaterTestSuite) TestJobRuntimeUpdater_UpdateAddingInsta
 	stateCounts := make(map[string]uint32)
 	stateCounts[pbtask.TaskState_PENDING.String()] = instanceCount/2 - 1
 	stateCounts[pbtask.TaskState_RUNNING.String()] = instanceCount/2 - 1
+	cachedTasks := make(map[uint32]cached.Task)
+	for i := uint32(0); i < instanceCount-2; i++ {
+		cachedTasks[i] = suite.cachedTask
+	}
+	suite.cachedJob.EXPECT().
+		GetAllTasks().
+		Return(cachedTasks).Times(2)
 
+	for i := uint32(0); i < instanceCount/2-1; i++ {
+		suite.cachedTask.EXPECT().CurrentState().Return(cached.TaskStateVector{
+			State: pbtask.TaskState_PENDING,
+		})
+	}
+	for i := uint32(0); i < instanceCount/2-1; i++ {
+		suite.cachedTask.EXPECT().CurrentState().Return(cached.TaskStateVector{
+			State: pbtask.TaskState_RUNNING,
+		})
+	}
 	jobRuntime := pbjob.RuntimeInfo{
 		State:     pbjob.JobState_PENDING,
 		GoalState: pbjob.JobState_SUCCEEDED,
@@ -1650,13 +2107,9 @@ func (suite *JobRuntimeUpdaterTestSuite) TestJobRuntimeUpdater_UpdateAddingInsta
 		GetConfig(gomock.Any()).
 		Return(suite.cachedConfig, nil)
 
-	suite.taskStore.EXPECT().
-		GetTaskStateSummaryForJob(gomock.Any(), suite.jobID).
-		Return(stateCounts, nil)
-
 	suite.cachedConfig.EXPECT().
 		GetType().
-		Return(pbjob.JobType_BATCH)
+		Return(pbjob.JobType_BATCH).Times(98)
 
 	suite.cachedJob.EXPECT().
 		GetJobType().
@@ -1669,18 +2122,24 @@ func (suite *JobRuntimeUpdaterTestSuite) TestJobRuntimeUpdater_UpdateAddingInsta
 		AnyTimes()
 
 	suite.cachedJob.EXPECT().
+		RepopulateInstanceAvailabilityInfo(gomock.Any()).
+		Return(nil)
+
+	suite.cachedJob.EXPECT().
 		GetFirstTaskUpdateTime().
 		Return(startTimeUnix)
 
 	suite.cachedJob.EXPECT().
-		GetLastTaskUpdateTime().
-		Return(suite.lastUpdateTs)
-
-	suite.cachedJob.EXPECT().
-		Update(gomock.Any(), gomock.Any(), gomock.Any(), cached.UpdateCacheAndDB).
+		Update(
+			gomock.Any(),
+			gomock.Any(),
+			gomock.Any(),
+			nil,
+			cached.UpdateCacheAndDB).
 		Do(func(_ context.Context,
 			jobInfo *pbjob.JobInfo,
 			_ *models.ConfigAddOn,
+			_ *stateless.JobSpec,
 			_ cached.UpdateRequest) {
 			suite.Equal(jobInfo.Runtime.State, pbjob.JobState_INITIALIZED)
 		}).Return(nil)
@@ -1696,7 +2155,6 @@ func (suite *JobRuntimeUpdaterTestSuite) TestJobRuntimeUpdater_UpdateAddingInsta
 // Test partially created service job whose desired state is terminal
 func (suite *JobRuntimeUpdaterTestSuite) TestJobStateDeterminer_PartiallyCreatedServiceJob() {
 	instanceCount := uint32(100)
-	configVersion := uint64(4)
 
 	testTable := []struct {
 		expectedState    job.JobState
@@ -1775,41 +2233,13 @@ func (suite *JobRuntimeUpdaterTestSuite) TestJobStateDeterminer_PartiallyCreated
 			taskStates = append(taskStates, pbtask.TaskState_KILLED)
 		}
 
-		first := uint32(0)
-		last := instanceCount / 3
-		cachedTasks := make(map[uint32]cached.Task)
-		for _, state := range taskStates {
-			for i := first; i < last; i++ {
-				cachedTasks[i] = suite.cachedTask
-
-				suite.cachedTask.EXPECT().
-					CurrentState().
-					Return(cached.TaskStateVector{
-						State: state,
-					})
-
-				suite.cachedTask.EXPECT().
-					GetRuntime(gomock.Any()).
-					Return(&pbtask.RuntimeInfo{
-						State:         state,
-						ConfigVersion: configVersion,
-					}, nil)
-			}
-			first = last
-			last = first + instanceCount/3
-		}
-
-		suite.cachedJob.EXPECT().
-			GetAllTasks().
-			Return(cachedTasks)
-
 		jobRuntime := &pbjob.RuntimeInfo{
 			State:     tt.actualState,
 			GoalState: tt.desiredGoalState,
 			UpdateID:  &peloton.UpdateID{Value: uuid.NewRandom().String()},
 		}
 
-		jobState, _, _, _, err := determineJobRuntimeStateAndCounts(context.Background(),
+		jobState, _, err := determineJobRuntimeStateAndCounts(context.Background(),
 			jobRuntime, stateCounts, suite.cachedConfig, suite.goalStateDriver, suite.cachedJob)
 		suite.NoError(err)
 		suite.Equal(jobState, tt.expectedState)
@@ -1845,164 +2275,10 @@ func (suite *JobRuntimeUpdaterTestSuite) TestJobStateDeterminer_NoInstancesCreat
 		Return(job.JobType_SERVICE).
 		AnyTimes()
 
-	suite.cachedJob.EXPECT().
-		GetAllTasks().
-		Return(nil)
-
-	jobState, _, _, _, err := determineJobRuntimeStateAndCounts(context.Background(),
+	jobState, _, err := determineJobRuntimeStateAndCounts(context.Background(),
 		jobRuntime, stateCounts, suite.cachedConfig, suite.goalStateDriver, suite.cachedJob)
 	suite.NoError(err)
 	suite.Equal(job.JobState_KILLED, jobState)
-}
-
-// TestDetermineJobRuntimeStateStaleJob tests determining job runtime state
-// for a stale active job with out of sync materialized view
-func (suite *JobRuntimeUpdaterTestSuite) TestDetermineJobRuntimeStateStaleJob() {
-	instanceCount := uint32(10)
-
-	// State count from MV shows that half of tasks are in RUNNING state
-	stateCounts := map[string]uint32{
-		pbtask.TaskState_SUCCEEDED.String(): instanceCount / 2,
-		pbtask.TaskState_RUNNING.String():   instanceCount / 2,
-	}
-
-	// State count form cache shows that all the tasks are in Succeed state
-	stateCountsFromCache := map[string]uint32{
-		pbtask.TaskState_SUCCEEDED.String(): instanceCount,
-	}
-
-	suite.initTaskStats(stateCountsFromCache)
-	cachedTasks := make(map[uint32]cached.Task)
-	mockTasks := make(map[uint32]*cachedmocks.MockTask)
-	for i := uint32(0); i < instanceCount; i++ {
-		cachedTask := cachedmocks.NewMockTask(suite.ctrl)
-		mockTasks[i] = cachedTask
-		cachedTasks[i] = cachedTask
-	}
-
-	// Simulate that MV is out of sync with base table by setting ALL of cached
-	// tasks to SUCCEEDED state
-	suite.cachedJob.EXPECT().GetAllTasks().Return(cachedTasks)
-	for i := uint32(0); i < instanceCount; i++ {
-		mockTasks[i].EXPECT().CurrentState().Return(cached.TaskStateVector{
-			State: pbtask.TaskState_SUCCEEDED,
-		})
-	}
-
-	// Set the current job state to RUNNING
-	jobRuntime := &pbjob.RuntimeInfo{
-		State: pbjob.JobState_RUNNING,
-	}
-	suite.cachedConfig.EXPECT().GetType().Return(pbjob.JobType_BATCH).AnyTimes()
-	suite.cachedConfig.EXPECT().GetInstanceCount().
-		Return(instanceCount).AnyTimes()
-	suite.cachedConfig.EXPECT().HasControllerTask().Return(false).AnyTimes()
-	suite.cachedJob.EXPECT().IsPartiallyCreated(false).AnyTimes()
-	suite.cachedJob.EXPECT().GetLastTaskUpdateTime().
-		Return(float64(time.Now().AddDate(0, 0, -5).Second())).AnyTimes()
-	suite.cachedJob.EXPECT().ID().Return(
-		&peloton.JobID{Value: uuid.New()}).Times(2)
-	jobState, currentStateCounts, _, _, err := determineJobRuntimeStateAndCounts(
-		context.Background(), jobRuntime, stateCounts, suite.cachedConfig,
-		suite.goalStateDriver, suite.cachedJob)
-	suite.NoError(err)
-	suite.Equal(jobState, pbjob.JobState_SUCCEEDED)
-	suite.Equal(currentStateCounts, stateCountsFromCache)
-
-	// Simulate that some of cached tasks have UNKNOWN state, in this case
-	// the original RUNNING state should be returned
-	suite.cachedJob.EXPECT().GetAllTasks().Return(cachedTasks)
-	for i := uint32(0); i < instanceCount; i++ {
-		mockTasks[i].EXPECT().CurrentState().Return(cached.TaskStateVector{
-			State: pbtask.TaskState_UNKNOWN,
-		})
-	}
-
-	jobState, currentStateCounts, _, _, err = determineJobRuntimeStateAndCounts(
-		context.Background(), jobRuntime, stateCounts, suite.cachedConfig,
-		suite.goalStateDriver, suite.cachedJob)
-	suite.NoError(err)
-	suite.Equal(jobState, pbjob.JobState_RUNNING)
-	suite.Equal(currentStateCounts, stateCounts)
-}
-
-// TestDetermineJobRuntimeFlagOn tests determining job runtime state
-// jobRuntimeCalculationViaCache flag for this Peloton cluster is on.
-// Verify job runtime state will be calculated from cache
-func (suite *JobRuntimeUpdaterTestSuite) TestDetermineJobRuntimeFlagOn() {
-	suite.determineJobRuntimeHelper(true)
-}
-
-// TestDetermineJobRuntimeFlagOff  tests determining job runtime state
-// with total instance count derived from MV is greater than what configured
-// which indicates MV is out of sync
-// and jobRuntimeCalculationViaCache flag for this Peloton cluster is Off
-// Verify job runtime state will not be calculated from cache
-func (suite *JobRuntimeUpdaterTestSuite) TestDetermineJobRuntimeFlagOff() {
-	suite.determineJobRuntimeHelper(false)
-}
-
-func (suite *JobRuntimeUpdaterTestSuite) determineJobRuntimeHelper(flag bool) {
-	suite.goalStateDriver.jobRuntimeCalculationViaCache = flag
-	instanceCount := uint32(10)
-	// Simulate mismatch of instances count between MV and configuration,
-	// 10 still in KILLING stage, 10 in KILLED stage
-	stateCounts := map[string]uint32{
-		pbtask.TaskState_KILLING.String(): instanceCount,
-		pbtask.TaskState_KILLED.String():  instanceCount,
-	}
-
-	// State counts from cache shows all the tasks in KILLED state
-	stateCountsFromCache := map[string]uint32{
-		pbtask.TaskState_KILLED.String(): instanceCount,
-	}
-
-	suite.initTaskStats(stateCountsFromCache)
-
-	// Set the current job state to KILLED
-	jobRuntime := &pbjob.RuntimeInfo{
-		State: pbjob.JobState_KILLED,
-	}
-	if flag {
-		cachedTasks := make(map[uint32]cached.Task)
-		mockTasks := make(map[uint32]*cachedmocks.MockTask)
-		for i := uint32(0); i < instanceCount; i++ {
-			cachedTask := cachedmocks.NewMockTask(suite.ctrl)
-			mockTasks[i] = cachedTask
-			cachedTasks[i] = cachedTask
-		}
-
-		// Setting ALL of cached tasks to KILLED state
-		for i := uint32(0); i < instanceCount; i++ {
-			mockTasks[i].EXPECT().CurrentState().Return(cached.TaskStateVector{
-				State: pbtask.TaskState_KILLED,
-			})
-		}
-		suite.cachedConfig.EXPECT().GetType().Return(pbjob.JobType_BATCH).Times(3)
-		suite.cachedJob.EXPECT().GetAllTasks().Return(cachedTasks)
-		suite.cachedConfig.EXPECT().GetInstanceCount().
-			Return(instanceCount).Times(4)
-	} else {
-		suite.cachedConfig.EXPECT().GetType().Return(pbjob.JobType_BATCH).Times(2)
-		suite.cachedConfig.EXPECT().GetInstanceCount().
-			Return(instanceCount).Times(2)
-	}
-	suite.cachedConfig.EXPECT().HasControllerTask().Return(false).AnyTimes()
-	suite.cachedJob.EXPECT().IsPartiallyCreated(false).AnyTimes()
-	suite.cachedJob.EXPECT().GetLastTaskUpdateTime().
-		Return(suite.lastUpdateTs).Times(1)
-	jobState, currentStateCounts, _, _, err := determineJobRuntimeStateAndCounts(
-		context.Background(), jobRuntime, stateCounts, suite.cachedConfig,
-		suite.goalStateDriver, suite.cachedJob)
-	suite.NoError(err)
-
-	if flag {
-		suite.Equal(jobState, pbjob.JobState_KILLED)
-		suite.Equal(currentStateCounts, stateCountsFromCache)
-	} else {
-		suite.Equal(jobState, pbjob.JobState_PENDING)
-		suite.Equal(currentStateCounts, stateCounts)
-	}
 }
 
 // TestDetermineBatchJobRuntimeState tests determining JobRuntimeState for batch jobs
@@ -2096,7 +2372,6 @@ func (suite *JobRuntimeUpdaterTestSuite) TestDetermineBatchJobRuntimeState() {
 
 		cachedConfig.EXPECT().GetType().Return(pbjob.JobType_BATCH).AnyTimes()
 		cachedJob.EXPECT().GetJobType().Return(pbjob.JobType_BATCH).AnyTimes()
-
 		cachedConfig.EXPECT().GetInstanceCount().
 			Return(test.configuredInstanceCount).AnyTimes()
 
@@ -2108,7 +2383,7 @@ func (suite *JobRuntimeUpdaterTestSuite) TestDetermineBatchJobRuntimeState() {
 		cachedJob.EXPECT().GetLastTaskUpdateTime().
 			Return(suite.lastUpdateTs).AnyTimes()
 
-		jobState, currentStateCount, _, _, _ := determineJobRuntimeStateAndCounts(
+		jobState, _, _ := determineJobRuntimeStateAndCounts(
 			context.Background(),
 			jobRuntime,
 			test.stateCounts,
@@ -2118,7 +2393,6 @@ func (suite *JobRuntimeUpdaterTestSuite) TestDetermineBatchJobRuntimeState() {
 		)
 
 		suite.Equal(jobState, test.expectedState, "Test %d: %s", index, test.message)
-		suite.Equal(currentStateCount, test.stateCounts)
 
 		ctrl.Finish()
 	}
@@ -2259,21 +2533,16 @@ func (suite *JobRuntimeUpdaterTestSuite) TestDetermineServiceJobRuntimeState() {
 
 		cachedConfig.EXPECT().GetType().Return(pbjob.JobType_SERVICE).AnyTimes()
 		cachedJob.EXPECT().GetJobType().Return(pbjob.JobType_SERVICE).AnyTimes()
-
 		cachedConfig.EXPECT().GetInstanceCount().
 			Return(test.configuredInstanceCount).AnyTimes()
 
 		cachedConfig.EXPECT().HasControllerTask().Return(false).AnyTimes()
 
-		cachedJob.EXPECT().
-			GetAllTasks().
-			Return(cachedTasks)
-
 		cachedJob.EXPECT().IsPartiallyCreated(gomock.Any()).
 			Return(getTotalInstanceCount(taskStateCounts) <
 				test.configuredInstanceCount).AnyTimes()
 
-		jobState, currentStateCount, _, _, _ := determineJobRuntimeStateAndCounts(
+		jobState, _, _ := determineJobRuntimeStateAndCounts(
 			context.Background(),
 			jobRuntime,
 			taskStateCounts,
@@ -2283,14 +2552,12 @@ func (suite *JobRuntimeUpdaterTestSuite) TestDetermineServiceJobRuntimeState() {
 		)
 
 		suite.Equal(jobState, test.expectedState, "Test %d: %s", index, test.message)
-		suite.Equal(currentStateCount, taskStateCounts)
 
 		ctrl.Finish()
 	}
 }
 
 func (suite *JobRuntimeUpdaterTestSuite) TestDetermineStatelessJobRuntimeState() {
-	suite.goalStateDriver.jobRuntimeCalculationViaCache = true
 	instanceCount := uint32(100)
 	stateCounts := make(map[string]uint32)
 	stateCounts[pbtask.TaskState_RUNNING.String()] = instanceCount
@@ -2319,26 +2586,14 @@ func (suite *JobRuntimeUpdaterTestSuite) TestDetermineStatelessJobRuntimeState()
 		Return(false).
 		AnyTimes()
 
-	suite.cachedJob.EXPECT().
-		GetAllTasks().
-		Return(cachedTasks)
-
-	suite.cachedTask.EXPECT().
-		CurrentState().
-		Return(cached.TaskStateVector{
-			State: pbtask.TaskState_RUNNING,
-		}).
-		Times(int(instanceCount))
-
 	suite.cachedTask.EXPECT().
 		GetRuntime(gomock.Any()).
 		Return(&pbtask.RuntimeInfo{
 			State:         pbtask.TaskState_RUNNING,
 			ConfigVersion: configVersion,
-		}, nil).
-		Times(int(instanceCount))
+		}, nil).AnyTimes()
 
-	jobState, _, configVersionStateStats, _, _ := determineJobRuntimeStateAndCounts(
+	jobState, _, _ := determineJobRuntimeStateAndCounts(
 		context.Background(),
 		jobRuntime,
 		stateCounts,
@@ -2348,10 +2603,6 @@ func (suite *JobRuntimeUpdaterTestSuite) TestDetermineStatelessJobRuntimeState()
 	)
 
 	suite.Equal(jobState, pbjob.JobState_RUNNING)
-	suite.Equal(len(configVersionStateStats), 1)
-	suite.Equal(
-		configVersionStateStats[configVersion].GetStateStats()[pbtask.TaskState_RUNNING.String()],
-		instanceCount)
 }
 
 // TestJobEvaluateMaxRunningInstances tests
@@ -2373,6 +2624,13 @@ func (suite *JobRuntimeUpdaterTestSuite) TestJobEvaluateMaxRunningInstances() {
 		State:     pbjob.JobState_RUNNING,
 		GoalState: pbjob.JobState_SUCCEEDED,
 	}
+	cachedTasks := make(map[uint32]cached.Task)
+	for i := uint32(0); i < instanceCount; i++ {
+		cachedTasks[i] = suite.cachedTask
+	}
+	suite.cachedJob.EXPECT().
+		GetAllTasks().
+		Return(cachedTasks)
 
 	suite.cachedConfig.EXPECT().
 		GetSLA().
@@ -2382,6 +2640,17 @@ func (suite *JobRuntimeUpdaterTestSuite) TestJobEvaluateMaxRunningInstances() {
 	stateCounts := make(map[string]uint32)
 	stateCounts[pbtask.TaskState_INITIALIZED.String()] = instanceCount / 2
 	stateCounts[pbtask.TaskState_SUCCEEDED.String()] = instanceCount / 2
+	for i := uint32(0); i < instanceCount/2; i++ {
+		suite.cachedTask.EXPECT().CurrentState().Return(cached.TaskStateVector{
+			State: pbtask.TaskState_INITIALIZED,
+		})
+		suite.cachedTask.EXPECT().ID().Return(i)
+	}
+	for i := uint32(0); i < instanceCount/2; i++ {
+		suite.cachedTask.EXPECT().CurrentState().Return(cached.TaskStateVector{
+			State: pbtask.TaskState_SUCCEEDED,
+		})
+	}
 	jobRuntime.TaskStats = stateCounts
 
 	var initializedTasks []uint32
@@ -2410,18 +2679,12 @@ func (suite *JobRuntimeUpdaterTestSuite) TestJobEvaluateMaxRunningInstances() {
 		GetCurrentVersion(gomock.Any(), suite.jobID).
 		Return(&jobConfig, &models.ConfigAddOn{}, nil)
 
-	suite.taskStore.EXPECT().
-		GetTaskIDsForJobAndState(gomock.Any(), suite.jobID, pbtask.TaskState_INITIALIZED.String()).
-		Return(initializedTasks, nil)
-
 	for i := uint32(0); i < jobConfig.SLA.MaximumRunningInstances; i++ {
-		suite.taskStore.EXPECT().
-			GetTaskRuntime(gomock.Any(), suite.jobID, gomock.Any()).
-			Return(&pbtask.RuntimeInfo{
-				State: pbtask.TaskState_INITIALIZED,
-			}, nil)
-		suite.cachedJob.EXPECT().
-			GetTask(gomock.Any()).Return(suite.cachedTask)
+		suite.cachedTask.EXPECT().GetRuntime(gomock.Any()).Return(&pbtask.
+			RuntimeInfo{
+			State: pbtask.TaskState_INITIALIZED,
+		}, nil)
+		suite.cachedJob.EXPECT().GetTask(i).Return(suite.cachedTask)
 		suite.taskGoalStateEngine.EXPECT().
 			IsScheduled(gomock.Any()).
 			Return(false)
@@ -2432,14 +2695,13 @@ func (suite *JobRuntimeUpdaterTestSuite) TestJobEvaluateMaxRunningInstances() {
 		Return(&resmgrsvc.EnqueueGangsResponse{}, nil)
 
 	suite.cachedJob.EXPECT().
-		PatchTasks(gomock.Any(), gomock.Any()).
-		Do(func(ctx context.Context, runtimeDiffs map[uint32]jobmgrcommon.RuntimeDiff) {
+		PatchTasks(gomock.Any(), gomock.Any(), false).
+		Do(func(ctx context.Context, runtimeDiffs map[uint32]jobmgrcommon.RuntimeDiff, _ bool) {
 			suite.Equal(uint32(len(runtimeDiffs)), jobConfig.SLA.MaximumRunningInstances)
 			for _, runtimeDiff := range runtimeDiffs {
 				suite.Equal(runtimeDiff[jobmgrcommon.StateField], pbtask.TaskState_PENDING)
 			}
-		}).
-		Return(nil)
+		}).Return(nil, nil, nil)
 
 	err := JobEvaluateMaxRunningInstancesSLA(context.Background(), suite.jobEnt)
 	suite.NoError(err)
@@ -2489,62 +2751,6 @@ func (suite *JobRuntimeUpdaterTestSuite) TestJobEvaluateMaxRunningInstances() {
 
 	err = JobEvaluateMaxRunningInstancesSLA(context.Background(), suite.jobEnt)
 	suite.NoError(err)
-}
-
-// TestShouldRecalculateJobStateNonBatch tests shouldRecalculateJobStateFromCache
-// function for a service job
-func (suite *JobRuntimeUpdaterTestSuite) TestShouldRecalculateJobStateNonBatch() {
-	suite.True(shouldRecalculateJobStateFromCache(
-		suite.cachedJob, pbjob.JobType_SERVICE, pbjob.JobState_RUNNING,
-		suite.goalStateDriver.jobRuntimeCalculationViaCache))
-}
-
-// TestshouldRecalculateJobStateTerminalJob tests shouldRecalculateJobStateFromCache
-// function for a terminal job
-func (suite *JobRuntimeUpdaterTestSuite) TestshouldRecalculateJobStateTerminalJob() {
-	suite.False(shouldRecalculateJobStateFromCache(
-		suite.cachedJob, pbjob.JobType_BATCH, pbjob.JobState_SUCCEEDED,
-		suite.goalStateDriver.jobRuntimeCalculationViaCache))
-}
-
-// TestShouldRecalculateJobState tests shouldRecalculateJobStateFromCache function to
-// determine if the job state is stale and needs to be recalculated
-func (suite *JobRuntimeUpdaterTestSuite) TestShouldRecalculateJobState() {
-	// assume last update to the job state was 5 days ago
-	lastUpdateTs := float64(time.Now().AddDate(0, 0, -5).Unix())
-	suite.cachedJob.EXPECT().GetLastTaskUpdateTime().Return(lastUpdateTs)
-	suite.cachedJob.EXPECT().ID().Return(
-		&peloton.JobID{Value: uuid.New()}).Times(1)
-	suite.True(shouldRecalculateJobStateFromCache(
-		suite.cachedJob, pbjob.JobType_BATCH, pbjob.JobState_PENDING,
-		suite.goalStateDriver.jobRuntimeCalculationViaCache))
-
-	suite.cachedJob.EXPECT().GetLastTaskUpdateTime().Return(suite.lastUpdateTs)
-	suite.False(shouldRecalculateJobStateFromCache(
-		suite.cachedJob, pbjob.JobType_BATCH, pbjob.JobState_PENDING,
-		suite.goalStateDriver.jobRuntimeCalculationViaCache))
-}
-
-// TestShouldRecalculateJobStateFlagOnMVDiverged tests
-// shouldRecalculateJobStateFromCache function
-// when MV diverged and jobRuntimeCalculationViaCache flag is on
-func (suite *JobRuntimeUpdaterTestSuite) TestShouldRecalculateJobStateFlagOnMVDiverged() {
-	suite.goalStateDriver.jobRuntimeCalculationViaCache = true
-	suite.cachedJob.EXPECT().GetLastTaskUpdateTime().Return(suite.lastUpdateTs)
-	suite.True(shouldRecalculateJobStateFromCache(
-		suite.cachedJob, pbjob.JobType_BATCH, pbjob.JobState_PENDING,
-		suite.goalStateDriver.jobRuntimeCalculationViaCache))
-}
-
-// TestShouldRecalculateJobStateFlagOffMVDiverged tests
-// shouldRecalculateJobStateFromCache function
-// when MV diverged and jobRuntimeCalculationViaCache flag is Off
-func (suite *JobRuntimeUpdaterTestSuite) TestShouldRecalculateJobStateFlagOffMVDiverged() {
-	suite.goalStateDriver.jobRuntimeCalculationViaCache = false
-	suite.cachedJob.EXPECT().GetLastTaskUpdateTime().Return(suite.lastUpdateTs)
-	suite.False(shouldRecalculateJobStateFromCache(
-		suite.cachedJob, pbjob.JobType_BATCH, pbjob.JobState_PENDING,
-		suite.goalStateDriver.jobRuntimeCalculationViaCache))
 }
 
 func (suite *JobRuntimeUpdaterTestSuite) initTaskStats(

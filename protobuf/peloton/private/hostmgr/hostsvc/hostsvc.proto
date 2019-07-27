@@ -13,6 +13,7 @@ import "mesos/v1/mesos.proto";
 import "mesos/v1/master/master.proto";
 import "peloton/api/v0/peloton.proto";
 import "peloton/api/v0/task/task.proto";
+import "peloton/api/v1alpha/host/host.proto";
 import "peloton/private/resmgr/resmgr.proto";
 import "peloton/private/eventstream/eventstream.proto";
 
@@ -424,7 +425,11 @@ service InternalHostService
   rpc GetHostsByQuery(GetHostsByQueryRequest) returns (GetHostsByQueryResponse);
 
   // Return all the outstanding status update events present in the event stream.
-  rpc WatchEvent(WatchEventRequest) returns (stream WatchEventResponse);
+  rpc WatchEventStreamEvent(WatchEventRequest) returns (stream WatchEventStreamEventResponse);
+
+
+  // Return all the host summary event updates from the host manage
+  rpc WatchHostSummaryEvent(WatchEventRequest) returns (stream WatchHostSummaryEventResponse);
 
   // Cancel a watch. The watch stream will get an error indicating
   // watch was cancelled and the stream will be closed.
@@ -434,9 +439,9 @@ service InternalHostService
   // to get hosts which are to be drained.
   rpc GetDrainingHosts (GetDrainingHostsRequest) returns (GetDrainingHostsResponse);
 
-  // Mark the hosts as drained. This method is called by Resource Manager  to
-  // notify Host Manager that specified DRAINING hosts are cleared of all tasks.
-  rpc MarkHostsDrained (MarkHostsDrainedRequest) returns (MarkHostsDrainedResponse);
+  // Mark a host as drained. This method is called by Resource Manager to
+  // notify Host Manager the specified DRAINING host is cleared of all tasks.
+  rpc MarkHostDrained (MarkHostDrainedRequest) returns (MarkHostDrainedResponse);
 
   // Return Mesos agent info
   rpc GetMesosAgentInfo(GetMesosAgentInfoRequest)
@@ -445,6 +450,12 @@ service InternalHostService
   // Release the hosts which are held for the tasks provided
   rpc ReleaseHostsHeldForTasks(ReleaseHostsHeldForTasksRequest)
   returns (ReleaseHostsHeldForTasksResponse);
+
+  // ChangeHostPool moves given host from source host pool to destination host pool.
+  // It returns SourcePoolNotFoundFailure error if source pool not found.
+  // It returns DestinationPoolNotFoundFailure error if destination pool not found.
+  // It returns YARPC error accordingly for other types of failures.
+  rpc ChangeHostPool(ChangeHostPoolRequest) returns (ChangeHostPoolResponse);
 }
 
 /**
@@ -528,17 +539,30 @@ message GetHostsByQueryResponse {
 /**
  * Request object to watch request by client
  */
-message WatchEventRequest {}
+message WatchEventRequest {
+    string topic = 1;
+}
 
 /**
  * Responds to all pending status update events.
  */
-message WatchEventResponse {
+message WatchEventStreamEventResponse {
 
     // Unique identifier for the watch session
     string watch_id = 1;
-    repeated eventstream.Event events = 2;
+    string topic = 2;
+    eventstream.Event mesos_task_update = 3;
+}
 
+/**
+ * Responds to all host summary update events.
+ */
+message WatchHostSummaryEventResponse {
+
+    // Unique identifier for the watch session
+    string watch_id = 1;
+    string topic = 2;
+    api.v1alpha.host.HostSummary  hostSummaryEvent  = 3;
 }
 
 // CancelRequest is request for method WatchService.Cancel
@@ -935,19 +959,19 @@ message GetDrainingHostsResponse {
 }
 
 /*
-* MarkHostsDrainedRequest is the request message for InternalHostService.MarkHostsDrained
+* MarkHostDrainedRequest is the request message for InternalHostService.MarkHostDrained
 */
-message MarkHostsDrainedRequest {
-    // Hostnames of the hosts to be marked as drained
-    repeated string hostnames = 1;
+message MarkHostDrainedRequest {
+    // Hostname of the host to be marked as drained
+    string hostname = 1;
 }
 
 /*
-* MarkHostsDrainedResponse is the response message for InternalHostService.MarkHostsDrained
+* MarkHostDrainedResponse is the response message for InternalHostService.MarkHostDrained
 */
-message MarkHostsDrainedResponse {
-    // Hostnames of the hosts successfully marked as drained
-    repeated string marked_hosts = 1;
+message MarkHostDrainedResponse {
+    // Hostname of the host successfully marked as drained
+    string hostname = 1;
 }
 
 /**
@@ -985,6 +1009,49 @@ message ReleaseHostsHeldForTasksRequest {
 message ReleaseHostsHeldForTasksResponse {
     message Error {
         string message = 1;
+    }
+
+    Error error = 1;
+}
+
+/**
+ * Error for source host pool not found when changing host pool.
+ */
+message SourcePoolNotFoundFailure {
+    string message = 1;
+}
+
+/**
+ * Error for destination host pool not found when changing host pool.
+ */
+message DestinationPoolNotFoundFailure {
+    string message = 1;
+}
+
+/**
+ * Request to change host pool of given host from source pool to destination pool.
+ */
+message ChangeHostPoolRequest {
+    // Source host pool id of given host.
+    string sourcePool = 1;
+
+    // Destination host pool id of given host.
+    string destinationPool = 2;
+
+    // Hostname of Host to change host pool.
+    string hostname = 3;
+}
+
+/**
+ * Response containing result of changing host pool of given host.
+ */
+message ChangeHostPoolResponse {
+    message Error {
+        // Error for source pool not found failure.
+        SourcePoolNotFoundFailure sourcePoolNotFoundFailure = 1;
+
+        // Error for destination pool not found failure.
+        DestinationPoolNotFoundFailure destinationPoolNotFoundFailure = 2;
     }
 
     Error error = 1;

@@ -27,6 +27,7 @@ import (
 	"github.com/uber/peloton/.gen/peloton/api/v1alpha/pod/svc"
 	"github.com/uber/peloton/.gen/peloton/private/hostmgr/hostsvc"
 
+	"github.com/uber/peloton/pkg/common/api"
 	"github.com/uber/peloton/pkg/common/leader"
 	"github.com/uber/peloton/pkg/common/util"
 	versionutil "github.com/uber/peloton/pkg/common/util/entityversion"
@@ -37,9 +38,9 @@ import (
 	"github.com/uber/peloton/pkg/jobmgr/logmanager"
 	jobmgrtask "github.com/uber/peloton/pkg/jobmgr/task"
 	goalstateutil "github.com/uber/peloton/pkg/jobmgr/util/goalstate"
-	handlerutil "github.com/uber/peloton/pkg/jobmgr/util/handler"
 	taskutil "github.com/uber/peloton/pkg/jobmgr/util/task"
 	"github.com/uber/peloton/pkg/storage"
+	ormobjects "github.com/uber/peloton/pkg/storage/objects"
 
 	"github.com/pkg/errors"
 	log "github.com/sirupsen/logrus"
@@ -51,10 +52,14 @@ const (
 	_frameworkName = "Peloton"
 )
 
+var _errPodNotInCache = yarpcerrors.InternalErrorf("pod not present in cache, please retry action")
+
 type serviceHandler struct {
 	jobStore           storage.JobStore
 	podStore           storage.TaskStore
 	frameworkInfoStore storage.FrameworkInfoStore
+	podEventsOps       ormobjects.PodEventsOps
+	taskConfigV2Ops    ormobjects.TaskConfigV2Ops
 	jobFactory         cached.JobFactory
 	goalStateDriver    goalstate.Driver
 	candidate          leader.Candidate
@@ -69,6 +74,7 @@ func InitV1AlphaPodServiceHandler(
 	jobStore storage.JobStore,
 	podStore storage.TaskStore,
 	frameworkInfoStore storage.FrameworkInfoStore,
+	ormStore *ormobjects.Store,
 	jobFactory cached.JobFactory,
 	goalStateDriver goalstate.Driver,
 	candidate leader.Candidate,
@@ -80,6 +86,8 @@ func InitV1AlphaPodServiceHandler(
 		jobStore:           jobStore,
 		podStore:           podStore,
 		frameworkInfoStore: frameworkInfoStore,
+		podEventsOps:       ormobjects.NewPodEventsOps(ormStore),
+		taskConfigV2Ops:    ormobjects.NewTaskConfigV2Ops(ormStore),
 		jobFactory:         jobFactory,
 		goalStateDriver:    goalStateDriver,
 		candidate:          candidate,
@@ -223,7 +231,7 @@ func (h *serviceHandler) startPod(
 				"cannot start a pod going to be deleted")
 		}
 
-		taskConfig, _, err := h.podStore.GetTaskConfig(
+		taskConfig, _, err := h.taskConfigV2Ops.GetTaskConfig(
 			ctx,
 			cachedJob.ID(),
 			cachedTask.ID(),
@@ -244,8 +252,12 @@ func (h *serviceHandler) startPod(
 			jobmgrtask.GetDefaultTaskGoalState(jobType)
 		taskRuntime.Message = "PodSVC.StartPod request"
 
-		if _, err = cachedTask.CompareAndSetTask(
-			ctx, taskRuntime, jobType); err == nil {
+		if _, err = cachedJob.CompareAndSetTask(
+			ctx,
+			cachedTask.ID(),
+			taskRuntime,
+			false,
+		); err == nil {
 			return nil
 		}
 		if err == jobmgrcommon.UnexpectedVersionError {
@@ -312,7 +324,7 @@ func (h *serviceHandler) StopPod(
 		},
 		jobmgrcommon.DesiredHostField: "",
 	}
-	err = cachedJob.PatchTasks(ctx, runtimeDiff)
+	_, instancesToRetry, err := cachedJob.PatchTasks(ctx, runtimeDiff, false)
 
 	// We should enqueue the tasks even if PatchTasks fail,
 	// because some tasks may get updated successfully in db.
@@ -322,6 +334,10 @@ func (h *serviceHandler) StopPod(
 		instanceID,
 		time.Now(),
 	)
+
+	if err == nil && len(instancesToRetry) != 0 {
+		return nil, _errPodNotInCache
+	}
 
 	return &svc.StopPodResponse{}, err
 }
@@ -370,7 +386,7 @@ func (h *serviceHandler) RestartPod(
 	runtimeDiff[instanceID] = jobmgrcommon.RuntimeDiff{
 		jobmgrcommon.DesiredMesosTaskIDField: newPodID,
 	}
-	err = cachedJob.PatchTasks(ctx, runtimeDiff)
+	_, instancesToRetry, err := cachedJob.PatchTasks(ctx, runtimeDiff, false)
 
 	// We should enqueue the tasks even if PatchTasks fail,
 	// because some tasks may get updated successfully in db.
@@ -380,6 +396,10 @@ func (h *serviceHandler) RestartPod(
 		instanceID,
 		time.Now(),
 	)
+
+	if err == nil && len(instancesToRetry) != 0 {
+		return nil, _errPodNotInCache
+	}
 
 	return &svc.RestartPodResponse{}, err
 }
@@ -416,11 +436,11 @@ func (h *serviceHandler) GetPod(
 		return nil, errors.Wrap(err, "failed to get task runtime")
 	}
 
-	podStatus := handlerutil.ConvertTaskRuntimeToPodStatus(taskRuntime)
+	podStatus := api.ConvertTaskRuntimeToPodStatus(taskRuntime)
 
 	var podSpec *pbpod.PodSpec
 	if !req.GetStatusOnly() {
-		taskConfig, _, err := h.podStore.GetTaskConfig(
+		taskConfig, _, err := h.taskConfigV2Ops.GetTaskConfig(
 			ctx,
 			pelotonJobID,
 			instanceID,
@@ -430,7 +450,7 @@ func (h *serviceHandler) GetPod(
 			return nil, errors.Wrap(err, "failed to get task config")
 		}
 
-		podSpec = handlerutil.ConvertTaskConfigToPodSpec(
+		podSpec = api.ConvertTaskConfigToPodSpec(
 			taskConfig,
 			jobID,
 			instanceID,
@@ -488,7 +508,7 @@ func (h *serviceHandler) GetPodEvents(
 		return nil, err
 	}
 
-	taskEvents, err := h.podStore.GetPodEvents(
+	taskEvents, err := h.podEventsOps.GetAll(
 		ctx,
 		jobID,
 		instanceID,
@@ -498,7 +518,7 @@ func (h *serviceHandler) GetPodEvents(
 	}
 
 	return &svc.GetPodEventsResponse{
-		Events: handlerutil.ConvertTaskEventsToPodEvents(taskEvents),
+		Events: api.ConvertTaskEventsToPodEvents(taskEvents),
 	}, nil
 }
 
@@ -692,8 +712,8 @@ func (h *serviceHandler) GetPodCache(
 	}
 
 	return &svc.GetPodCacheResponse{
-		Status: handlerutil.ConvertTaskRuntimeToPodStatus(runtime),
-		Labels: handlerutil.ConvertLabels(labels),
+		Status: api.ConvertTaskRuntimeToPodStatus(runtime),
+		Labels: api.ConvertLabels(labels),
 	}, nil
 }
 
@@ -747,7 +767,7 @@ func (h *serviceHandler) getHostInfo(
 	instanceID uint32,
 	podID string,
 ) (hostname, podid, agentID string, err error) {
-	taskEvents, err := h.podStore.GetPodEvents(ctx, jobID, instanceID, podID)
+	taskEvents, err := h.podEventsOps.GetAll(ctx, jobID, instanceID, podID)
 	if err != nil {
 		return "", "", "", errors.Wrap(err, "failed to get pod events")
 	}
@@ -841,12 +861,12 @@ func (h *serviceHandler) getPodInfoForAllPodRuns(
 
 	pID := podID.GetValue()
 	for {
-		taskEvents, err := h.podStore.GetPodEvents(ctx, jobID, instanceID, pID)
+		taskEvents, err := h.podEventsOps.GetAll(ctx, jobID, instanceID, pID)
 		if err != nil {
 			return nil, err
 		}
 
-		podEvents := handlerutil.ConvertTaskEventsToPodEvents(taskEvents)
+		podEvents := api.ConvertTaskEventsToPodEvents(taskEvents)
 
 		if len(podEvents) == 0 {
 			break
@@ -895,7 +915,7 @@ func (h *serviceHandler) getPodInfoForAllPodRuns(
 					errors.Wrap(err, "failed to get config version for pod run")
 			}
 
-			taskConfig, _, err := h.podStore.GetTaskConfig(
+			taskConfig, _, err := h.taskConfigV2Ops.GetTaskConfig(
 				ctx,
 				&v0peloton.JobID{Value: jobID},
 				instanceID,
@@ -917,7 +937,7 @@ func (h *serviceHandler) getPodInfoForAllPodRuns(
 				return nil, errors.Wrap(err, "failed to get task config")
 			}
 
-			spec := handlerutil.ConvertTaskConfigToPodSpec(
+			spec := api.ConvertTaskConfigToPodSpec(
 				taskConfig,
 				jobID,
 				instanceID,

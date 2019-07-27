@@ -84,6 +84,7 @@ func InitServiceHandler(
 		jobRuntimeOps:      ormobjects.NewJobRuntimeOps(ormStore),
 		updateStore:        updateStore,
 		frameworkInfoStore: frameworkInfoStore,
+		podEventsOps:       ormobjects.NewPodEventsOps(ormStore),
 		metrics:            NewMetrics(parent.SubScope("jobmgr").SubScope("task")),
 		resmgrClient:       resmgrsvc.NewResourceManagerServiceYARPCClient(d.ClientConfig(common.PelotonResourceManager)),
 		taskLauncher:       launcher.GetLauncher(),
@@ -105,6 +106,7 @@ type serviceHandler struct {
 	jobRuntimeOps      ormobjects.JobRuntimeOps
 	updateStore        storage.UpdateStore
 	frameworkInfoStore storage.FrameworkInfoStore
+	podEventsOps       ormobjects.PodEventsOps
 	metrics            *Metrics
 	resmgrClient       resmgrsvc.ResourceManagerServiceYARPCClient
 	taskLauncher       launcher.Launcher
@@ -239,7 +241,7 @@ func (m *serviceHandler) GetPodEvents(
 	mesosTaskID := body.GetRunId()
 	var result []*task.PodEvent
 	for i := uint64(0); i < limit; i++ {
-		taskEvents, err := m.taskStore.GetPodEvents(
+		taskEvents, err := m.podEventsOps.GetAll(
 			ctx,
 			body.GetJobId().GetValue(),
 			body.GetInstanceId(),
@@ -608,7 +610,7 @@ func (m *serviceHandler) Start(
 	var failedInstanceIds []uint32
 
 	for _, taskInfo := range taskInfos {
-		cachedTask, err := cachedJob.AddTask(ctx, taskInfo.InstanceId)
+		cachedTask, err := cachedJob.AddTask(ctx, taskInfo.GetInstanceId())
 		if err != nil {
 			log.WithFields(log.Fields{
 				"job_id":      body.GetJobId().GetValue(),
@@ -657,8 +659,12 @@ func (m *serviceHandler) Start(
 			// compare and set calls cannot be batched as one transaction
 			// as if task runtime of only one task has changed, then it should
 			// not cause the entire transaction to fail and to be retried again.
-			_, err = cachedTask.CompareAndSetTask(
-				ctx, taskRuntime, cachedConfig.GetType())
+			_, err = cachedJob.CompareAndSetTask(
+				ctx,
+				taskInfo.GetInstanceId(),
+				taskRuntime,
+				false,
+			)
 
 			if err == jobmgrcommon.UnexpectedVersionError {
 				count = count + 1
@@ -872,7 +878,7 @@ func (m *serviceHandler) Stop(
 		instanceIds = append(instanceIds, taskInfo.InstanceId)
 	}
 
-	err = cachedJob.PatchTasks(ctx, runtimeDiffs)
+	_, _, err = cachedJob.PatchTasks(ctx, runtimeDiffs, false)
 	if err != nil {
 		log.WithError(err).
 			WithField("instance_ids", instanceIds).
@@ -959,7 +965,7 @@ func (m *serviceHandler) Restart(
 		m.metrics.TaskRestartFail.Inc(1)
 		return nil, err
 	}
-	if err := cachedJob.PatchTasks(ctx, runtimeDiffs); err != nil {
+	if _, _, err := cachedJob.PatchTasks(ctx, runtimeDiffs, false); err != nil {
 		m.metrics.TaskRestartFail.Inc(1)
 		return nil, err
 	}
@@ -1374,7 +1380,7 @@ func (m *serviceHandler) BrowseSandbox(
 		MesosMasterHostname: mesosMasterHostPortRespose.Hostname,
 		MesosMasterPort:     mesosMasterHostPortRespose.Port,
 	}
-	log.WithField("response", resp).Info("TaskSVC.BrowseSandbox returned")
+	log.WithField("response", resp).Debug("TaskSVC.BrowseSandbox returned")
 	return resp, nil
 }
 
@@ -1426,7 +1432,8 @@ func (m *serviceHandler) getPodEvents(
 	runID string) ([]*task.PodEvent, error) {
 	var events []*task.PodEvent
 	for {
-		taskEvents, err := m.taskStore.GetPodEvents(ctx, id.GetValue(), instanceID, runID)
+		taskEvents, err := m.podEventsOps.GetAll(ctx, id.GetValue(), instanceID,
+			runID)
 		if err != nil {
 			return nil, err
 		}

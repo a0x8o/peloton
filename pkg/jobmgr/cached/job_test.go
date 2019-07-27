@@ -20,16 +20,21 @@ import (
 	"testing"
 	"time"
 
+	mesos "github.com/uber/peloton/.gen/mesos/v1"
 	pbjob "github.com/uber/peloton/.gen/peloton/api/v0/job"
 	"github.com/uber/peloton/.gen/peloton/api/v0/peloton"
 	pbtask "github.com/uber/peloton/.gen/peloton/api/v0/task"
 	pbupdate "github.com/uber/peloton/.gen/peloton/api/v0/update"
+	"github.com/uber/peloton/.gen/peloton/api/v1alpha/job/stateless"
+	v1alphapeloton "github.com/uber/peloton/.gen/peloton/api/v1alpha/peloton"
+	pbpod "github.com/uber/peloton/.gen/peloton/api/v1alpha/pod"
 	"github.com/uber/peloton/.gen/peloton/private/models"
 
 	"github.com/uber/peloton/pkg/common"
 	versionutil "github.com/uber/peloton/pkg/common/util/entityversion"
 	jobmgrcommon "github.com/uber/peloton/pkg/jobmgr/common"
 	storemocks "github.com/uber/peloton/pkg/storage/mocks"
+	ormobjects "github.com/uber/peloton/pkg/storage/objects"
 	objectmocks "github.com/uber/peloton/pkg/storage/objects/mocks"
 
 	"github.com/gogo/protobuf/proto"
@@ -43,38 +48,47 @@ import (
 var dbError = yarpcerrors.UnavailableErrorf("db error")
 
 const (
-	testUpdateID = "941ff353-ba82-49fe-8f80-fb5bc649b04d"
+	testMesosTaskID    = "941ff353-ba82-49fe-8f80-fb5bc649b04d-1-2"
+	testNewMesosTaskID = "941ff353-ba82-49fe-8f80-fb5bc649b04d-1-3"
+	testUpdateID       = "941ff353-ba82-49fe-8f80-fb5bc649b04d"
 )
 
-type JobTestSuite struct {
+type jobTestSuite struct {
 	suite.Suite
 
-	ctrl           *gomock.Controller
-	jobStore       *storemocks.MockJobStore
-	taskStore      *storemocks.MockTaskStore
-	updateStore    *storemocks.MockUpdateStore
-	jobIndexOps    *objectmocks.MockJobIndexOps
-	jobNameToIDOps *objectmocks.MockJobNameToIDOps
-	jobConfigOps   *objectmocks.MockJobConfigOps
-	jobRuntimeOps  *objectmocks.MockJobRuntimeOps
-	jobID          *peloton.JobID
-	job            *job
-	listeners      []*FakeJobListener
+	ctrl               *gomock.Controller
+	jobStore           *storemocks.MockJobStore
+	taskStore          *storemocks.MockTaskStore
+	updateStore        *storemocks.MockUpdateStore
+	activeJobsOps      *objectmocks.MockActiveJobsOps
+	jobIndexOps        *objectmocks.MockJobIndexOps
+	jobNameToIDOps     *objectmocks.MockJobNameToIDOps
+	jobConfigOps       *objectmocks.MockJobConfigOps
+	jobRuntimeOps      *objectmocks.MockJobRuntimeOps
+	jobUpdateEventsOps *objectmocks.MockJobUpdateEventsOps
+	taskConfigV2Ops    *objectmocks.MockTaskConfigV2Ops
+
+	jobID     *peloton.JobID
+	job       *job
+	listeners []*FakeJobListener
 }
 
 func TestJob(t *testing.T) {
-	suite.Run(t, new(JobTestSuite))
+	suite.Run(t, new(jobTestSuite))
 }
 
-func (suite *JobTestSuite) SetupTest() {
+func (suite *jobTestSuite) SetupTest() {
 	suite.ctrl = gomock.NewController(suite.T())
 	suite.jobStore = storemocks.NewMockJobStore(suite.ctrl)
 	suite.taskStore = storemocks.NewMockTaskStore(suite.ctrl)
 	suite.updateStore = storemocks.NewMockUpdateStore(suite.ctrl)
+	suite.activeJobsOps = objectmocks.NewMockActiveJobsOps(suite.ctrl)
 	suite.jobIndexOps = objectmocks.NewMockJobIndexOps(suite.ctrl)
 	suite.jobNameToIDOps = objectmocks.NewMockJobNameToIDOps(suite.ctrl)
 	suite.jobConfigOps = objectmocks.NewMockJobConfigOps(suite.ctrl)
 	suite.jobRuntimeOps = objectmocks.NewMockJobRuntimeOps(suite.ctrl)
+	suite.jobUpdateEventsOps = objectmocks.NewMockJobUpdateEventsOps(suite.ctrl)
+	suite.taskConfigV2Ops = objectmocks.NewMockTaskConfigV2Ops(suite.ctrl)
 	suite.jobID = &peloton.JobID{Value: uuid.NewRandom().String()}
 	suite.listeners = append(suite.listeners,
 		new(FakeJobListener),
@@ -83,40 +97,49 @@ func (suite *JobTestSuite) SetupTest() {
 		suite.jobStore,
 		suite.taskStore,
 		suite.updateStore,
+		suite.activeJobsOps,
 		suite.jobIndexOps,
 		suite.jobNameToIDOps,
 		suite.jobConfigOps,
 		suite.jobRuntimeOps,
+		suite.jobUpdateEventsOps,
+		suite.taskConfigV2Ops,
 		suite.jobID)
 }
 
-func (suite *JobTestSuite) TearDownTest() {
+func (suite *jobTestSuite) TearDownTest() {
 	suite.listeners = nil
 	suite.ctrl.Finish()
 }
 
-func (suite *JobTestSuite) initializeJob(
+func (suite *jobTestSuite) initializeJob(
 	jobStore *storemocks.MockJobStore,
 	taskStore *storemocks.MockTaskStore,
 	updateStore *storemocks.MockUpdateStore,
+	activeJobsOps *objectmocks.MockActiveJobsOps,
 	jobIndexOps *objectmocks.MockJobIndexOps,
 	jobNameToIDOps *objectmocks.MockJobNameToIDOps,
 	jobConfigOps *objectmocks.MockJobConfigOps,
 	jobRuntimeOps *objectmocks.MockJobRuntimeOps,
+	jobUpdateEventsOps *objectmocks.MockJobUpdateEventsOps,
+	taskConfigV2Ops *objectmocks.MockTaskConfigV2Ops,
 	jobID *peloton.JobID) *job {
 	j := &job{
 		id: jobID,
 		jobFactory: &jobFactory{
-			mtx:            NewMetrics(tally.NoopScope),
-			jobStore:       jobStore,
-			taskStore:      taskStore,
-			updateStore:    updateStore,
-			jobIndexOps:    jobIndexOps,
-			jobNameToIDOps: jobNameToIDOps,
-			jobConfigOps:   jobConfigOps,
-			jobRuntimeOps:  jobRuntimeOps,
-			running:        true,
-			jobs:           map[string]*job{},
+			mtx:                NewMetrics(tally.NoopScope),
+			jobStore:           jobStore,
+			taskStore:          taskStore,
+			updateStore:        updateStore,
+			activeJobsOps:      activeJobsOps,
+			jobIndexOps:        jobIndexOps,
+			jobNameToIDOps:     jobNameToIDOps,
+			jobConfigOps:       jobConfigOps,
+			jobRuntimeOps:      jobRuntimeOps,
+			jobUpdateEventsOps: jobUpdateEventsOps,
+			taskConfigV2Ops:    taskConfigV2Ops,
+			running:            true,
+			jobs:               map[string]*job{},
 		},
 		tasks: map[uint32]*task{},
 		config: &cachedConfig{
@@ -202,7 +225,7 @@ func initializeDiffs(instanceCount uint32, state pbtask.TaskState) map[uint32]jo
 }
 
 // checkListeners verifies that listeners received the correct data
-func (suite *JobTestSuite) checkListeners() {
+func (suite *jobTestSuite) checkListeners() {
 	suite.NotZero(len(suite.listeners))
 	for i, l := range suite.listeners {
 		msg := fmt.Sprintf("Listener %d", i)
@@ -213,7 +236,7 @@ func (suite *JobTestSuite) checkListeners() {
 }
 
 // checkListenersNotCalled verifies that listeners did not get invoked
-func (suite *JobTestSuite) checkListenersNotCalled() {
+func (suite *jobTestSuite) checkListenersNotCalled() {
 	suite.NotZero(len(suite.listeners))
 	for i, l := range suite.listeners {
 		msg := fmt.Sprintf("Listener %d", i)
@@ -223,13 +246,13 @@ func (suite *JobTestSuite) checkListenersNotCalled() {
 }
 
 // TestJobFetchID tests fetching job ID.
-func (suite *JobTestSuite) TestJobFetchID() {
+func (suite *jobTestSuite) TestJobFetchID() {
 	// Test fetching ID
 	suite.Equal(suite.jobID, suite.job.ID())
 }
 
 // TestJobAddTask tests adding a task and recovering it as well
-func (suite *JobTestSuite) TestJobAddTask() {
+func (suite *jobTestSuite) TestJobAddTask() {
 	instID := uint32(1)
 	runtime := &pbtask.RuntimeInfo{
 		State: pbtask.TaskState_RUNNING,
@@ -247,7 +270,7 @@ func (suite *JobTestSuite) TestJobAddTask() {
 
 // TestJobAddTaskDBError tests returning error from DB while fetching the
 // task runtime when adding a task and recovering it
-func (suite *JobTestSuite) TestJobAddTaskDBError() {
+func (suite *jobTestSuite) TestJobAddTaskDBError() {
 	instID := uint32(1)
 	suite.taskStore.EXPECT().
 		GetTaskRuntime(gomock.Any(), suite.jobID, instID).
@@ -260,7 +283,7 @@ func (suite *JobTestSuite) TestJobAddTaskDBError() {
 }
 
 // TestJobAddTaskNotFound tests adding a task not in DB
-func (suite *JobTestSuite) TestJobAddTaskNotFound() {
+func (suite *jobTestSuite) TestJobAddTaskNotFound() {
 	instID := uint32(5)
 	suite.job.config = nil
 	jobConfig := &pbjob.JobConfig{
@@ -284,7 +307,7 @@ func (suite *JobTestSuite) TestJobAddTaskNotFound() {
 
 // TestJobAddTaskJobConfigGetError tests returning error from DB during
 // the fetch of job configuration when adding and recovering a task
-func (suite *JobTestSuite) TestJobAddTaskJobConfigGetError() {
+func (suite *jobTestSuite) TestJobAddTaskJobConfigGetError() {
 	instID := uint32(5)
 	suite.job.config = nil
 	suite.taskStore.EXPECT().
@@ -304,7 +327,7 @@ func (suite *JobTestSuite) TestJobAddTaskJobConfigGetError() {
 
 // TestJobSetAndFetchConfigAndRuntime tests setting and fetching
 // job configuration and runtime.
-func (suite *JobTestSuite) TestJobSetAndFetchConfigAndRuntime() {
+func (suite *jobTestSuite) TestJobSetAndFetchConfigAndRuntime() {
 	// Test setting and fetching job config and runtime
 	instanceCount := uint32(10)
 	maxRunningInstances := uint32(2)
@@ -339,6 +362,7 @@ func (suite *JobTestSuite) TestJobSetAndFetchConfigAndRuntime() {
 		context.Background(),
 		jobInfo,
 		&models.ConfigAddOn{},
+		nil,
 		UpdateCacheOnly)
 	actJobRuntime, _ := suite.job.GetRuntime(context.Background())
 	actJobConfig, _ := suite.job.GetConfig(context.Background())
@@ -354,7 +378,7 @@ func (suite *JobTestSuite) TestJobSetAndFetchConfigAndRuntime() {
 }
 
 // TestJobDBError tests DB errors during job operations.
-func (suite *JobTestSuite) TestJobDBError() {
+func (suite *jobTestSuite) TestJobDBError() {
 	jobRuntime := &pbjob.RuntimeInfo{
 		State:     pbjob.JobState_RUNNING,
 		GoalState: pbjob.JobState_SUCCEEDED,
@@ -390,6 +414,7 @@ func (suite *JobTestSuite) TestJobDBError() {
 		context.Background(),
 		&pbjob.JobInfo{Runtime: jobRuntime},
 		nil,
+		nil,
 		UpdateCacheAndDB)
 	suite.NoError(err)
 	actJobRuntime, err = suite.job.GetRuntime(context.Background())
@@ -407,6 +432,7 @@ func (suite *JobTestSuite) TestJobDBError() {
 		context.Background(),
 		&pbjob.JobInfo{Runtime: jobRuntime},
 		nil,
+		nil,
 		UpdateCacheAndDB)
 	suite.Error(err)
 	suite.Nil(suite.job.runtime)
@@ -415,7 +441,7 @@ func (suite *JobTestSuite) TestJobDBError() {
 
 // TestJobUpdateRuntimeWithNoRuntimeCache tests update job which has
 // no existing cache
-func (suite *JobTestSuite) TestJobUpdateRuntimeWithNoCache() {
+func (suite *jobTestSuite) TestJobUpdateRuntimeWithNoCache() {
 	jobRuntime := &pbjob.RuntimeInfo{
 		State:     pbjob.JobState_RUNNING,
 		GoalState: pbjob.JobState_SUCCEEDED,
@@ -444,6 +470,7 @@ func (suite *JobTestSuite) TestJobUpdateRuntimeWithNoCache() {
 		context.Background(),
 		&pbjob.JobInfo{Runtime: jobRuntime},
 		nil,
+		nil,
 		UpdateCacheAndDB)
 	suite.NoError(err)
 	suite.Equal(suite.job.runtime.State, jobRuntime.State)
@@ -453,7 +480,7 @@ func (suite *JobTestSuite) TestJobUpdateRuntimeWithNoCache() {
 
 // TestJobUpdateRuntimeWithNoRuntimeCache tests update job which has
 // existing cache
-func (suite *JobTestSuite) TestJobUpdateRuntimeWithCache() {
+func (suite *jobTestSuite) TestJobUpdateRuntimeWithCache() {
 	jobRuntime := &pbjob.RuntimeInfo{
 		State:     pbjob.JobState_RUNNING,
 		GoalState: pbjob.JobState_SUCCEEDED,
@@ -468,6 +495,7 @@ func (suite *JobTestSuite) TestJobUpdateRuntimeWithCache() {
 		context.Background(),
 		&pbjob.JobInfo{Runtime: jobRuntime},
 		nil,
+		nil,
 		UpdateCacheOnly)
 	suite.NoError(err)
 	suite.Equal(suite.job.runtime.State, jobRuntime.State)
@@ -477,7 +505,7 @@ func (suite *JobTestSuite) TestJobUpdateRuntimeWithCache() {
 
 // TestJobCompareAndSetRuntimeWithCache tests replace job runtime which has
 // existing cache
-func (suite *JobTestSuite) TestJobCompareAndSetRuntimeWithCache() {
+func (suite *jobTestSuite) TestJobCompareAndSetRuntimeWithCache() {
 	revision := &peloton.ChangeLog{
 		Version: 1,
 	}
@@ -522,7 +550,7 @@ func (suite *JobTestSuite) TestJobCompareAndSetRuntimeWithCache() {
 
 // TestJobUpdateCompareAndSetRuntimeMixedUsage tests using CompareAndSetRuntime
 // and update together
-func (suite *JobTestSuite) TestJobUpdateCompareAndSetRuntimeMixedUsage() {
+func (suite *jobTestSuite) TestJobUpdateCompareAndSetRuntimeMixedUsage() {
 	revision := &peloton.ChangeLog{
 		Version: 1,
 	}
@@ -553,6 +581,7 @@ func (suite *JobTestSuite) TestJobUpdateCompareAndSetRuntimeMixedUsage() {
 		context.Background(),
 		&pbjob.JobInfo{Runtime: jobRuntimeUpdate},
 		nil,
+		nil,
 		UpdateCacheAndDB)
 	suite.NoError(err)
 	suite.checkListeners()
@@ -569,7 +598,7 @@ func (suite *JobTestSuite) TestJobUpdateCompareAndSetRuntimeMixedUsage() {
 
 // TestJobCompareAndSetRuntimeUnexpectedVersionError tests replace job runtime
 // which fails due to incorrect version number
-func (suite *JobTestSuite) TestJobCompareAndSetRuntimeUnexpectedVersionError() {
+func (suite *jobTestSuite) TestJobCompareAndSetRuntimeUnexpectedVersionError() {
 	jobRuntime := &pbjob.RuntimeInfo{
 		State:     pbjob.JobState_RUNNING,
 		GoalState: pbjob.JobState_KILLED,
@@ -595,7 +624,7 @@ func (suite *JobTestSuite) TestJobCompareAndSetRuntimeUnexpectedVersionError() {
 
 // TestJobCompareAndSetRuntimeNoCache tests replace job runtime which has
 // no existing cache
-func (suite *JobTestSuite) TestJobCompareAndSetRuntimeNoCache() {
+func (suite *jobTestSuite) TestJobCompareAndSetRuntimeNoCache() {
 	revision := &peloton.ChangeLog{
 		Version: 1,
 	}
@@ -637,14 +666,14 @@ func (suite *JobTestSuite) TestJobCompareAndSetRuntimeNoCache() {
 
 // TestJobUpdateCompareAndSetRuntimeNilInput tests the case of calling
 // CompareAndSetRuntime with nil input
-func (suite *JobTestSuite) TestJobUpdateCompareAndSetRuntimeNilInput() {
+func (suite *jobTestSuite) TestJobUpdateCompareAndSetRuntimeNilInput() {
 	_, err := suite.job.CompareAndSetRuntime(context.Background(), nil)
 	suite.Error(err)
 }
 
 // TestJobCompareAndSetRuntimeUpdateRuntimeFailure tests replace
 // job runtime failed due to job_runtime update failure
-func (suite *JobTestSuite) TestJobCompareAndSetRuntimeUpdateRuntimeFailure() {
+func (suite *jobTestSuite) TestJobCompareAndSetRuntimeUpdateRuntimeFailure() {
 	revision := &peloton.ChangeLog{
 		Version: 1,
 	}
@@ -680,7 +709,7 @@ func (suite *JobTestSuite) TestJobCompareAndSetRuntimeUpdateRuntimeFailure() {
 
 // TestJobCompareAndSetRuntimeWithGoalStateDeleted tests replace job runtime
 // which fails due to job goal state is deleted
-func (suite *JobTestSuite) TestJobCompareAndSetRuntimeWithGoalStateDeleted() {
+func (suite *jobTestSuite) TestJobCompareAndSetRuntimeWithGoalStateDeleted() {
 	jobRuntime := &pbjob.RuntimeInfo{
 		State:     pbjob.JobState_RUNNING,
 		GoalState: pbjob.JobState_RUNNING,
@@ -703,7 +732,7 @@ func (suite *JobTestSuite) TestJobCompareAndSetRuntimeWithGoalStateDeleted() {
 }
 
 // TestJobUpdateConfig tests update job which new config
-func (suite *JobTestSuite) TestJobUpdateConfig() {
+func (suite *jobTestSuite) TestJobUpdateConfig() {
 	jobConfig := &pbjob.JobConfig{
 		InstanceCount: 10,
 		RespoolID:     &peloton.ResourcePoolID{Value: uuid.NewRandom().String()},
@@ -735,11 +764,13 @@ func (suite *JobTestSuite) TestJobUpdateConfig() {
 			suite.jobID,
 			gomock.Any(),
 			gomock.Any(),
+			gomock.Any(),
 			gomock.Any()).
 		Do(func(_ context.Context,
 			_ *peloton.JobID,
 			config *pbjob.JobConfig,
 			_ *models.ConfigAddOn,
+			_ *stateless.JobSpec,
 			_ uint64,
 		) {
 			suite.Equal(config.InstanceCount, uint32(10))
@@ -758,6 +789,7 @@ func (suite *JobTestSuite) TestJobUpdateConfig() {
 		context.Background(),
 		&pbjob.JobInfo{Config: jobConfig},
 		&models.ConfigAddOn{},
+		nil,
 		UpdateCacheAndDB)
 	suite.NoError(err)
 	suite.Equal(suite.job.config.instanceCount, jobConfig.InstanceCount)
@@ -769,6 +801,7 @@ func (suite *JobTestSuite) TestJobUpdateConfig() {
 		&pbjob.JobInfo{Runtime: &pbjob.RuntimeInfo{
 			ConfigurationVersion: 2,
 		}}, nil,
+		nil,
 		UpdateCacheAndDB)
 	suite.NoError(err)
 	suite.checkListeners()
@@ -778,7 +811,7 @@ func (suite *JobTestSuite) TestJobUpdateConfig() {
 }
 
 // TestJobUpdateConfig tests update job which new config
-func (suite *JobTestSuite) TestJobUpdateConfigIncorectChangeLog() {
+func (suite *jobTestSuite) TestJobUpdateConfigIncorectChangeLog() {
 	jobConfig := &pbjob.JobConfig{
 		InstanceCount: 10,
 		RespoolID:     &peloton.ResourcePoolID{Value: uuid.NewRandom().String()},
@@ -798,6 +831,7 @@ func (suite *JobTestSuite) TestJobUpdateConfigIncorectChangeLog() {
 		context.Background(),
 		&pbjob.JobInfo{Config: jobConfig},
 		&models.ConfigAddOn{},
+		nil,
 		UpdateCacheAndDB)
 	suite.True(yarpcerrors.IsInvalidArgument(err))
 	suite.EqualError(err,
@@ -808,7 +842,7 @@ func (suite *JobTestSuite) TestJobUpdateConfigIncorectChangeLog() {
 
 // TestJobUpdateRuntimeAndConfig tests update both runtime
 // and config at the same time
-func (suite *JobTestSuite) TestJobUpdateRuntimeAndConfig() {
+func (suite *jobTestSuite) TestJobUpdateRuntimeAndConfig() {
 	instanceCount := uint32(10)
 	configVersion := uint64(1)
 	configStateStats := make(map[uint64]*pbjob.RuntimeInfo_TaskStateStats)
@@ -853,11 +887,13 @@ func (suite *JobTestSuite) TestJobUpdateRuntimeAndConfig() {
 			suite.jobID,
 			gomock.Any(),
 			gomock.Any(),
+			gomock.Any(),
 			gomock.Any()).
 		Do(func(_ context.Context,
 			_ *peloton.JobID,
 			config *pbjob.JobConfig,
 			_ *models.ConfigAddOn,
+			_ *stateless.JobSpec,
 			_ uint64,
 		) {
 			suite.Equal(config.InstanceCount, uint32(10))
@@ -880,6 +916,7 @@ func (suite *JobTestSuite) TestJobUpdateRuntimeAndConfig() {
 		Runtime: jobRuntime,
 		Config:  jobConfig,
 	}, &models.ConfigAddOn{},
+		nil,
 		UpdateCacheAndDB)
 	suite.NoError(err)
 	suite.checkListeners()
@@ -897,7 +934,7 @@ func (suite *JobTestSuite) TestJobUpdateRuntimeAndConfig() {
 // Test the case job update config when there is no config in cache,
 // and later recover the config in cache which should not
 // overwrite updated cache
-func (suite *JobTestSuite) TestJobUpdateConfigAndRecoverConfig() {
+func (suite *jobTestSuite) TestJobUpdateConfigAndRecoverConfig() {
 	suite.job.config = nil
 	suite.job.runtime = nil
 
@@ -928,11 +965,13 @@ func (suite *JobTestSuite) TestJobUpdateConfigAndRecoverConfig() {
 			suite.jobID,
 			gomock.Any(),
 			gomock.Any(),
+			gomock.Any(),
 			gomock.Any()).
 		Do(func(_ context.Context,
 			_ *peloton.JobID,
 			config *pbjob.JobConfig,
 			addOn *models.ConfigAddOn,
+			_ *stateless.JobSpec,
 			_ uint64,
 		) {
 			suite.Equal(config.ChangeLog.Version, uint64(2))
@@ -949,6 +988,7 @@ func (suite *JobTestSuite) TestJobUpdateConfigAndRecoverConfig() {
 	err := suite.job.Update(context.Background(), &pbjob.JobInfo{
 		Config: &updatedConfig,
 	}, &models.ConfigAddOn{},
+		nil,
 		UpdateCacheAndDB)
 	suite.NoError(err)
 	suite.Equal(suite.job.config.instanceCount, uint32(10))
@@ -956,6 +996,7 @@ func (suite *JobTestSuite) TestJobUpdateConfigAndRecoverConfig() {
 	err = suite.job.Update(context.Background(), &pbjob.JobInfo{
 		Config: &initialConfig,
 	}, &models.ConfigAddOn{},
+		nil,
 		UpdateCacheOnly)
 	suite.NoError(err)
 	suite.Equal(suite.job.config.instanceCount, uint32(10))
@@ -963,7 +1004,7 @@ func (suite *JobTestSuite) TestJobUpdateConfigAndRecoverConfig() {
 
 // Test the case job update config when there is no config in cache,
 // and later recover the runtime which should not interfere with each other
-func (suite *JobTestSuite) TestJobUpdateConfigAndRecoverRuntime() {
+func (suite *jobTestSuite) TestJobUpdateConfigAndRecoverRuntime() {
 	suite.job.config = nil
 	suite.job.runtime = nil
 
@@ -1003,11 +1044,13 @@ func (suite *JobTestSuite) TestJobUpdateConfigAndRecoverRuntime() {
 			suite.jobID,
 			gomock.Any(),
 			gomock.Any(),
+			gomock.Any(),
 			gomock.Any()).
 		Do(func(_ context.Context,
 			_ *peloton.JobID,
 			config *pbjob.JobConfig,
 			addOn *models.ConfigAddOn,
+			_ *stateless.JobSpec,
 			_ uint64,
 		) {
 			suite.Equal(config.ChangeLog.Version, uint64(2))
@@ -1024,6 +1067,7 @@ func (suite *JobTestSuite) TestJobUpdateConfigAndRecoverRuntime() {
 	err := suite.job.Update(context.Background(), &pbjob.JobInfo{
 		Config: &updatedConfig,
 	}, &models.ConfigAddOn{},
+		nil,
 		UpdateCacheAndDB)
 	suite.NoError(err)
 	suite.Equal(suite.job.config.instanceCount, uint32(10))
@@ -1031,6 +1075,7 @@ func (suite *JobTestSuite) TestJobUpdateConfigAndRecoverRuntime() {
 	err = suite.job.Update(context.Background(), &pbjob.JobInfo{
 		Runtime: &initialRuntime,
 	}, nil,
+		nil,
 		UpdateCacheOnly)
 	suite.NoError(err)
 	suite.Equal(suite.job.config.instanceCount, uint32(10))
@@ -1040,7 +1085,7 @@ func (suite *JobTestSuite) TestJobUpdateConfigAndRecoverRuntime() {
 
 // Test the case job update config when there is no config in cache,
 // and later recover the runtime and config
-func (suite *JobTestSuite) TestJobUpdateConfigAndRecoverConfigPlusRuntime() {
+func (suite *jobTestSuite) TestJobUpdateConfigAndRecoverConfigPlusRuntime() {
 	suite.job.config = nil
 	suite.job.runtime = nil
 
@@ -1080,11 +1125,13 @@ func (suite *JobTestSuite) TestJobUpdateConfigAndRecoverConfigPlusRuntime() {
 			suite.jobID,
 			gomock.Any(),
 			gomock.Any(),
+			gomock.Any(),
 			gomock.Any()).
 		Do(func(_ context.Context,
 			_ *peloton.JobID,
 			config *pbjob.JobConfig,
 			addOn *models.ConfigAddOn,
+			_ *stateless.JobSpec,
 			_ uint64,
 		) {
 			suite.Equal(config.ChangeLog.Version, uint64(2))
@@ -1101,6 +1148,7 @@ func (suite *JobTestSuite) TestJobUpdateConfigAndRecoverConfigPlusRuntime() {
 	err := suite.job.Update(context.Background(), &pbjob.JobInfo{
 		Config: &updatedConfig,
 	}, &models.ConfigAddOn{},
+		nil,
 		UpdateCacheAndDB)
 	suite.NoError(err)
 	suite.Equal(suite.job.config.instanceCount, uint32(10))
@@ -1110,6 +1158,7 @@ func (suite *JobTestSuite) TestJobUpdateConfigAndRecoverConfigPlusRuntime() {
 		Config:  &initialConfig,
 		Runtime: &initialRuntime,
 	}, nil,
+		nil,
 		UpdateCacheOnly)
 	suite.Error(err)
 
@@ -1117,6 +1166,7 @@ func (suite *JobTestSuite) TestJobUpdateConfigAndRecoverConfigPlusRuntime() {
 		Config:  &initialConfig,
 		Runtime: &initialRuntime,
 	}, &models.ConfigAddOn{},
+		nil,
 		UpdateCacheOnly)
 	suite.NoError(err)
 	suite.Equal(suite.job.config.instanceCount, uint32(10))
@@ -1126,7 +1176,7 @@ func (suite *JobTestSuite) TestJobUpdateConfigAndRecoverConfigPlusRuntime() {
 // Test the case job update runtime when there is no runtime in cache,
 // and later recover the runtime in cache which should not
 // overwrite updated cache
-func (suite *JobTestSuite) TestJobUpdateRuntimeAndRecoverRuntime() {
+func (suite *jobTestSuite) TestJobUpdateRuntimeAndRecoverRuntime() {
 	suite.job.config = nil
 	suite.job.runtime = nil
 
@@ -1162,6 +1212,7 @@ func (suite *JobTestSuite) TestJobUpdateRuntimeAndRecoverRuntime() {
 	err := suite.job.Update(context.Background(), &pbjob.JobInfo{
 		Runtime: &updateRuntime,
 	}, nil,
+		nil,
 		UpdateCacheAndDB)
 	suite.NoError(err)
 	suite.Equal(suite.job.runtime.ConfigurationVersion, uint64(1))
@@ -1171,6 +1222,7 @@ func (suite *JobTestSuite) TestJobUpdateRuntimeAndRecoverRuntime() {
 	err = suite.job.Update(context.Background(), &pbjob.JobInfo{
 		Runtime: &initialRuntime,
 	}, nil,
+		nil,
 		UpdateCacheOnly)
 	suite.NoError(err)
 	suite.Equal(suite.job.runtime.ConfigurationVersion, uint64(1))
@@ -1180,7 +1232,7 @@ func (suite *JobTestSuite) TestJobUpdateRuntimeAndRecoverRuntime() {
 
 // Test the case job update runtime when there is no runtime in cache,
 // and later recover the config which should not interfere with each other
-func (suite *JobTestSuite) TestJobUpdateRuntimeAndRecoverConfig() {
+func (suite *jobTestSuite) TestJobUpdateRuntimeAndRecoverConfig() {
 	suite.job.config = nil
 	suite.job.runtime = nil
 
@@ -1228,6 +1280,7 @@ func (suite *JobTestSuite) TestJobUpdateRuntimeAndRecoverConfig() {
 	err := suite.job.Update(context.Background(), &pbjob.JobInfo{
 		Runtime: &updateRuntime,
 	}, nil,
+		nil,
 		UpdateCacheAndDB)
 	suite.NoError(err)
 	suite.Equal(suite.job.runtime.ConfigurationVersion, uint64(1))
@@ -1237,6 +1290,7 @@ func (suite *JobTestSuite) TestJobUpdateRuntimeAndRecoverConfig() {
 	err = suite.job.Update(context.Background(), &pbjob.JobInfo{
 		Config: &initialConfig,
 	}, &models.ConfigAddOn{},
+		nil,
 		UpdateCacheOnly)
 	suite.NoError(err)
 	suite.Equal(suite.job.runtime.ConfigurationVersion, uint64(1))
@@ -1246,7 +1300,7 @@ func (suite *JobTestSuite) TestJobUpdateRuntimeAndRecoverConfig() {
 
 // Test the case job update runtime when there is no runtime in cache,
 // and later recover the runtime and config
-func (suite *JobTestSuite) TestJobUpdateRuntimeAndRecoverConfigPlusRuntime() {
+func (suite *jobTestSuite) TestJobUpdateRuntimeAndRecoverConfigPlusRuntime() {
 	suite.job.config = nil
 	suite.job.runtime = nil
 
@@ -1294,6 +1348,7 @@ func (suite *JobTestSuite) TestJobUpdateRuntimeAndRecoverConfigPlusRuntime() {
 	err := suite.job.Update(context.Background(), &pbjob.JobInfo{
 		Runtime: &updateRuntime,
 	}, nil,
+		nil,
 		UpdateCacheAndDB)
 	suite.NoError(err)
 	suite.Equal(suite.job.runtime.ConfigurationVersion, uint64(1))
@@ -1304,6 +1359,7 @@ func (suite *JobTestSuite) TestJobUpdateRuntimeAndRecoverConfigPlusRuntime() {
 		Config:  &initialConfig,
 		Runtime: &initialRuntime,
 	}, &models.ConfigAddOn{},
+		nil,
 		UpdateCacheOnly)
 	suite.NoError(err)
 	suite.Equal(suite.job.runtime.ConfigurationVersion, uint64(1))
@@ -1311,7 +1367,7 @@ func (suite *JobTestSuite) TestJobUpdateRuntimeAndRecoverConfigPlusRuntime() {
 	suite.Equal(suite.job.runtime.State, pbjob.JobState_SUCCEEDED)
 }
 
-func (suite *JobTestSuite) TestJobUpdateRuntimePlusConfigAndRecover() {
+func (suite *jobTestSuite) TestJobUpdateRuntimePlusConfigAndRecover() {
 	suite.job.config = nil
 	suite.job.runtime = nil
 
@@ -1360,11 +1416,13 @@ func (suite *JobTestSuite) TestJobUpdateRuntimePlusConfigAndRecover() {
 			suite.jobID,
 			gomock.Any(),
 			gomock.Any(),
+			gomock.Any(),
 			gomock.Any()).
 		Do(func(_ context.Context,
 			_ *peloton.JobID,
 			config *pbjob.JobConfig,
 			_ *models.ConfigAddOn,
+			_ *stateless.JobSpec,
 			_ uint64,
 		) {
 			suite.Equal(config.ChangeLog.Version, uint64(2))
@@ -1386,6 +1444,7 @@ func (suite *JobTestSuite) TestJobUpdateRuntimePlusConfigAndRecover() {
 		Config:  &updatedConfig,
 		Runtime: &updateRuntime,
 	}, &models.ConfigAddOn{},
+		nil,
 		UpdateCacheAndDB)
 	suite.NoError(err)
 	suite.Equal(suite.job.config.instanceCount, uint32(10))
@@ -1395,6 +1454,7 @@ func (suite *JobTestSuite) TestJobUpdateRuntimePlusConfigAndRecover() {
 	err = suite.job.Update(context.Background(), &pbjob.JobInfo{
 		Runtime: &initialRuntime,
 	}, nil,
+		nil,
 		UpdateCacheOnly)
 	suite.NoError(err)
 	suite.Equal(suite.job.config.instanceCount, uint32(10))
@@ -1404,6 +1464,7 @@ func (suite *JobTestSuite) TestJobUpdateRuntimePlusConfigAndRecover() {
 	err = suite.job.Update(context.Background(), &pbjob.JobInfo{
 		Config: &initialConfig,
 	}, &models.ConfigAddOn{},
+		nil,
 		UpdateCacheOnly)
 	suite.NoError(err)
 	suite.Equal(suite.job.config.instanceCount, uint32(10))
@@ -1414,6 +1475,7 @@ func (suite *JobTestSuite) TestJobUpdateRuntimePlusConfigAndRecover() {
 		Config:  &initialConfig,
 		Runtime: &initialRuntime,
 	}, &models.ConfigAddOn{},
+		nil,
 		UpdateCacheOnly)
 	suite.NoError(err)
 	suite.Equal(suite.job.config.instanceCount, uint32(10))
@@ -1421,7 +1483,7 @@ func (suite *JobTestSuite) TestJobUpdateRuntimePlusConfigAndRecover() {
 }
 
 // TestJobCreate tests job create in cache and db
-func (suite *JobTestSuite) TestJobCreate() {
+func (suite *jobTestSuite) TestJobCreate() {
 	jobConfig := &pbjob.JobConfig{
 		InstanceCount:     10,
 		Type:              pbjob.JobType_BATCH,
@@ -1455,13 +1517,14 @@ func (suite *JobTestSuite) TestJobCreate() {
 			suite.jobID,
 			gomock.Any(),
 			gomock.Any(),
+			gomock.Any(),
 			gomock.Any()).
 		Do(func(_ context.Context,
 			_ *peloton.JobID,
 			config *pbjob.JobConfig,
 			addOn *models.ConfigAddOn,
-			version uint64,
-		) {
+			_ *stateless.JobSpec,
+			version uint64) {
 			suite.Equal(version, uint64(1))
 			suite.Equal(config.ChangeLog.Version, uint64(1))
 			suite.Equal(config.InstanceCount, jobConfig.InstanceCount)
@@ -1480,8 +1543,8 @@ func (suite *JobTestSuite) TestJobCreate() {
 		}).
 		Return(nil)
 
-	suite.jobStore.EXPECT().
-		AddActiveJob(gomock.Any(), suite.jobID).Return(nil)
+	suite.activeJobsOps.EXPECT().
+		Create(gomock.Any(), suite.jobID).Return(nil)
 
 	suite.jobRuntimeOps.EXPECT().
 		Upsert(gomock.Any(), suite.jobID, gomock.Any()).
@@ -1514,7 +1577,7 @@ func (suite *JobTestSuite) TestJobCreate() {
 			suite.Equal(runtime.GetState(), pbjob.JobState_INITIALIZED)
 		}).Return(nil)
 
-	err := suite.job.Create(context.Background(), jobConfig, configAddOn)
+	err := suite.job.Create(context.Background(), jobConfig, configAddOn, nil)
 	suite.NoError(err)
 	config, err := suite.job.GetConfig(context.Background())
 	suite.NoError(err)
@@ -1534,7 +1597,7 @@ func (suite *JobTestSuite) TestJobCreate() {
 
 // TestJobGetRuntimeRefillCache tests job would refill runtime cache
 // if cache is missing
-func (suite *JobTestSuite) TestJobGetRuntimeRefillCache() {
+func (suite *jobTestSuite) TestJobGetRuntimeRefillCache() {
 	jobRuntime := &pbjob.RuntimeInfo{
 		State:     pbjob.JobState_INITIALIZED,
 		GoalState: pbjob.JobState_SUCCEEDED,
@@ -1549,7 +1612,7 @@ func (suite *JobTestSuite) TestJobGetRuntimeRefillCache() {
 	suite.Equal(runtime.GetGoalState(), jobRuntime.GoalState)
 }
 
-func (suite *JobTestSuite) TestJobGetConfigDBError() {
+func (suite *jobTestSuite) TestJobGetConfigDBError() {
 	suite.job.config = nil
 	// Test the case there is no config cache and db returns err
 	suite.jobConfigOps.EXPECT().Get(
@@ -1563,7 +1626,7 @@ func (suite *JobTestSuite) TestJobGetConfigDBError() {
 	suite.Nil(config)
 }
 
-func (suite *JobTestSuite) TestJobGetConfigSuccess() {
+func (suite *jobTestSuite) TestJobGetConfigSuccess() {
 	suite.job.config = nil
 	testName := "testName"
 	testLabels := []*peloton.Label{{Key: "key1", Value: "val1"}, {Key: "key2", Value: "val2"}}
@@ -1601,7 +1664,7 @@ func (suite *JobTestSuite) TestJobGetConfigSuccess() {
 	suite.Nil(config.GetSLA())
 }
 
-func (suite *JobTestSuite) TestJobIsControllerTask() {
+func (suite *jobTestSuite) TestJobIsControllerTask() {
 	tests := []struct {
 		config         *pbjob.JobConfig
 		expectedResult bool
@@ -1639,7 +1702,7 @@ func (suite *JobTestSuite) TestJobIsControllerTask() {
 }
 
 // TestJobSetJobUpdateTime tests update the task update time coming from mesos.
-func (suite *JobTestSuite) TestJobSetJobUpdateTime() {
+func (suite *jobTestSuite) TestJobSetJobUpdateTime() {
 	// Test setting and fetching job update time
 	updateTime := float64(time.Now().UnixNano())
 	suite.job.SetTaskUpdateTime(&updateTime)
@@ -1648,7 +1711,7 @@ func (suite *JobTestSuite) TestJobSetJobUpdateTime() {
 }
 
 // TestJobCreateTaskRuntimes tests creating task runtimes in cache and DB
-func (suite *JobTestSuite) TestJobCreateTaskRuntimes() {
+func (suite *jobTestSuite) TestJobCreateTaskRuntimes() {
 	instanceCount := uint32(10)
 	runtimes := initializeRuntimes(instanceCount, pbtask.TaskState_INITIALIZED)
 
@@ -1672,7 +1735,7 @@ func (suite *JobTestSuite) TestJobCreateTaskRuntimes() {
 				suite.Equal(uint64(1), runtime.GetRevision().GetVersion())
 			}).Return(nil)
 
-		suite.taskStore.EXPECT().
+		suite.taskConfigV2Ops.EXPECT().
 			GetTaskConfig(
 				gomock.Any(),
 				suite.jobID,
@@ -1696,7 +1759,7 @@ func (suite *JobTestSuite) TestJobCreateTaskRuntimes() {
 }
 
 // TestJobCreateTaskRuntimesWithDBError tests getting DB error while creating task runtimes
-func (suite *JobTestSuite) TestJobCreateTaskRuntimesWithDBError() {
+func (suite *jobTestSuite) TestJobCreateTaskRuntimesWithDBError() {
 	instanceCount := uint32(10)
 
 	runtimes := initializeRuntimes(instanceCount, pbtask.TaskState_INITIALIZED)
@@ -1716,7 +1779,7 @@ func (suite *JobTestSuite) TestJobCreateTaskRuntimesWithDBError() {
 }
 
 // TestSetGetTasksInJobInCacheSingle tests setting and getting single task in job in cache.
-func (suite *JobTestSuite) TestSetGetTasksInJobInCacheSingle() {
+func (suite *jobTestSuite) TestSetGetTasksInJobInCacheSingle() {
 	instanceCount := uint32(10)
 	taskInfo := &pbtask.TaskInfo{
 		Runtime: &pbtask.RuntimeInfo{
@@ -1742,7 +1805,7 @@ func (suite *JobTestSuite) TestSetGetTasksInJobInCacheSingle() {
 }
 
 // TestSetGetTasksInJobInCacheBlock tests setting and getting tasks as a chunk in a job in cache.
-func (suite *JobTestSuite) TestSetGetTasksInJobInCacheBlock() {
+func (suite *jobTestSuite) TestSetGetTasksInJobInCacheBlock() {
 	instanceCount := uint32(10)
 	// Test updating tasks in one call in cache
 	taskInfos := initializeTaskInfos(instanceCount, pbtask.TaskState_SUCCEEDED)
@@ -1757,7 +1820,7 @@ func (suite *JobTestSuite) TestSetGetTasksInJobInCacheBlock() {
 }
 
 // TestTasksGetAllTasks tests getting all tasks.
-func (suite *JobTestSuite) TestTasksGetAllTasks() {
+func (suite *jobTestSuite) TestTasksGetAllTasks() {
 	instanceCount := uint32(10)
 	taskInfos := initializeTaskInfos(instanceCount, pbtask.TaskState_RUNNING)
 	suite.job.ReplaceTasks(taskInfos, false)
@@ -1768,7 +1831,7 @@ func (suite *JobTestSuite) TestTasksGetAllTasks() {
 }
 
 // TestTasksGetAllWorkflows tests getting all workflows.
-func (suite *JobTestSuite) TestTasksGetAllWorkflows() {
+func (suite *jobTestSuite) TestTasksGetAllWorkflows() {
 	suite.job.AddWorkflow(&peloton.UpdateID{Value: uuid.New()})
 	suite.job.AddWorkflow(&peloton.UpdateID{Value: uuid.New()})
 
@@ -1778,7 +1841,7 @@ func (suite *JobTestSuite) TestTasksGetAllWorkflows() {
 }
 
 // TestPartialJobCheck checks the partial job check.
-func (suite *JobTestSuite) TestPartialJobCheck() {
+func (suite *jobTestSuite) TestPartialJobCheck() {
 	instanceCount := uint32(10)
 
 	taskInfos := initializeTaskInfos(instanceCount, pbtask.TaskState_RUNNING)
@@ -1790,7 +1853,7 @@ func (suite *JobTestSuite) TestPartialJobCheck() {
 }
 
 // TestPatchTasks_SetGetTasksSingle tests setting and getting single task in job in cache.
-func (suite *JobTestSuite) TestPatchTasks_SetGetTasksSingle() {
+func (suite *jobTestSuite) TestPatchTasks_SetGetTasksSingle() {
 	instanceCount := uint32(10)
 	RuntimeDiff := jobmgrcommon.RuntimeDiff{
 		jobmgrcommon.StateField: pbtask.TaskState_RUNNING,
@@ -1810,14 +1873,18 @@ func (suite *JobTestSuite) TestPatchTasks_SetGetTasksSingle() {
 			Revision: &peloton.ChangeLog{Version: 1},
 			State:    pbtask.TaskState_INITIALIZED,
 		}, nil).Times(int(instanceCount))
-	suite.taskStore.EXPECT().
+	suite.taskConfigV2Ops.EXPECT().
 		GetTaskConfig(gomock.Any(), suite.jobID, gomock.Any(), gomock.Any()).
 		Return(nil, nil, nil).
 		Times(int(instanceCount))
 
 	// Test updating tasks one at a time in cache
 	for i := uint32(0); i < instanceCount; i++ {
-		suite.job.PatchTasks(context.Background(), map[uint32]jobmgrcommon.RuntimeDiff{i: RuntimeDiff})
+		suite.job.PatchTasks(
+			context.Background(),
+			map[uint32]jobmgrcommon.RuntimeDiff{i: RuntimeDiff},
+			false,
+		)
 	}
 	suite.Equal(instanceCount, uint32(len(suite.job.tasks)))
 
@@ -1830,7 +1897,7 @@ func (suite *JobTestSuite) TestPatchTasks_SetGetTasksSingle() {
 }
 
 // TestReplaceTasks tests setting and getting tasks as a chunk in a job in cache.
-func (suite *JobTestSuite) TestReplaceTasks() {
+func (suite *jobTestSuite) TestReplaceTasks() {
 	instanceCount := uint32(10)
 	// Test updating tasks in one call in cache
 	taskInfos := initializeTaskInfos(instanceCount, pbtask.TaskState_SUCCEEDED)
@@ -1852,7 +1919,7 @@ func (suite *JobTestSuite) TestReplaceTasks() {
 
 //
 // TestPatchTasks_SetGetTasksMultiple tests patching runtime in multiple
-func (suite *JobTestSuite) TestPatchTasksSetGetTasksMultiple() {
+func (suite *jobTestSuite) TestPatchTasksSetGetTasksMultiple() {
 	instanceCount := uint32(10)
 
 	diffs := initializeDiffs(instanceCount, pbtask.TaskState_RUNNING)
@@ -1868,12 +1935,12 @@ func (suite *JobTestSuite) TestPatchTasksSetGetTasksMultiple() {
 				i,
 				gomock.Any(),
 				gomock.Any()).Return(nil)
-		suite.taskStore.EXPECT().
+		suite.taskConfigV2Ops.EXPECT().
 			GetTaskConfig(gomock.Any(), suite.jobID, i, gomock.Any()).
 			Return(nil, nil, nil)
 	}
 
-	err := suite.job.PatchTasks(context.Background(), diffs)
+	_, _, err := suite.job.PatchTasks(context.Background(), diffs, false)
 	suite.NoError(err)
 
 	// Validate the state of the tasks in cache is correct
@@ -1888,7 +1955,7 @@ func (suite *JobTestSuite) TestPatchTasksSetGetTasksMultiple() {
 }
 
 // TestPatchTasks_DBError tests getting DB error during update task runtimes.
-func (suite *JobTestSuite) TestPatchTasksDBError() {
+func (suite *jobTestSuite) TestPatchTasksDBError() {
 	instanceCount := uint32(10)
 	diffs := initializeDiffs(instanceCount, pbtask.TaskState_RUNNING)
 
@@ -1907,12 +1974,12 @@ func (suite *JobTestSuite) TestPatchTasksDBError() {
 				gomock.Any()).
 			Return(dbError)
 	}
-	err := suite.job.PatchTasks(context.Background(), diffs)
+	_, _, err := suite.job.PatchTasks(context.Background(), diffs, false)
 	suite.Error(err)
 }
 
 // TestPatchTasks_SingleTask tests updating task runtime of a single task in DB.
-func (suite *JobTestSuite) TestPatchTasksSingleTask() {
+func (suite *jobTestSuite) TestPatchTasksSingleTask() {
 	var labels []*peloton.Label
 
 	labels = append(labels, initializeLabel("key", "value"))
@@ -1933,7 +2000,7 @@ func (suite *JobTestSuite) TestPatchTasksSingleTask() {
 			gomock.Any(),
 			gomock.Any()).
 		Return(nil)
-	err := suite.job.PatchTasks(context.Background(), diffs)
+	_, _, err := suite.job.PatchTasks(context.Background(), diffs, false)
 	suite.NoError(err)
 
 	// Validate the state of the task in cache is correct
@@ -1943,8 +2010,658 @@ func (suite *JobTestSuite) TestPatchTasksSingleTask() {
 	suite.Equal(uint64(2), actRuntime.GetRevision().GetVersion())
 }
 
+// TestPatchTasksSLAAwareNoViolation tests the success case of
+// patching tasks in SLA aware manner, when SLA is not violated
+func (suite *jobTestSuite) TestPatchTasksSLAAwareNoViolation() {
+	suite.job.jobType = pbjob.JobType_SERVICE
+	suite.job.config.sla = &pbjob.SlaConfig{
+		MaximumUnavailableInstances: 2,
+	}
+
+	suite.job.instanceAvailabilityInfo = &instanceAvailabilityInfo{
+		unavailableInstances: make(map[uint32]bool),
+		killedInstances:      make(map[uint32]bool),
+	}
+
+	diffs := make(map[uint32]jobmgrcommon.RuntimeDiff)
+	diffs[0] = jobmgrcommon.RuntimeDiff{
+		jobmgrcommon.DesiredMesosTaskIDField: &mesos.TaskID{
+			Value: &[]string{testNewMesosTaskID}[0],
+		},
+		jobmgrcommon.TerminationStatusField: &pbtask.TerminationStatus{
+			Reason: pbtask.TerminationStatus_TERMINATION_STATUS_REASON_KILLED_HOST_MAINTENANCE,
+		},
+	}
+
+	oldRuntime := &pbtask.RuntimeInfo{
+		State:     pbtask.TaskState_RUNNING,
+		GoalState: pbtask.TaskState_RUNNING,
+		MesosTaskId: &mesos.TaskID{
+			Value: &[]string{testMesosTaskID}[0],
+		},
+		DesiredMesosTaskId: &mesos.TaskID{
+			Value: &[]string{testMesosTaskID}[0],
+		},
+	}
+	tt := suite.job.addTaskToJobMap(0)
+	tt.runtime = oldRuntime
+	tt.config = &taskConfigCache{}
+
+	// Update task runtime of only one task
+	suite.taskStore.EXPECT().
+		UpdateTaskRuntime(
+			gomock.Any(),
+			gomock.Any(),
+			gomock.Any(),
+			gomock.Any(),
+			gomock.Any()).
+		Return(nil)
+	s, r, err := suite.job.PatchTasks(context.Background(), diffs, false)
+	suite.NoError(err)
+	suite.Nil(r)
+	suite.Len(s, 1)
+	suite.Equal(uint32(0), s[0])
+
+	// Validate the state of the task in cache is correct
+	att := suite.job.GetTask(0)
+	actRuntime, err := att.GetRuntime(context.Background())
+	suite.NoError(err)
+	suite.Equal(testNewMesosTaskID, actRuntime.GetDesiredMesosTaskId().GetValue())
+}
+
+// TestPatchTasksSLAAwareViolation tests the case of skipping
+// the patching tasks which violate the job SLA
+func (suite *jobTestSuite) TestPatchTasksSLAAwareViolation() {
+	suite.job.jobType = pbjob.JobType_SERVICE
+	suite.job.config.sla = &pbjob.SlaConfig{
+		MaximumUnavailableInstances: 1,
+	}
+
+	unavailableInstances := make(map[uint32]bool)
+	unavailableInstances[1] = true
+	suite.job.instanceAvailabilityInfo = &instanceAvailabilityInfo{
+		unavailableInstances: unavailableInstances,
+		killedInstances:      make(map[uint32]bool),
+	}
+
+	diffs := make(map[uint32]jobmgrcommon.RuntimeDiff)
+	diffs[0] = jobmgrcommon.RuntimeDiff{
+		jobmgrcommon.DesiredMesosTaskIDField: &mesos.TaskID{
+			Value: &[]string{testNewMesosTaskID}[0],
+		},
+		jobmgrcommon.TerminationStatusField: &pbtask.TerminationStatus{
+			Reason: pbtask.TerminationStatus_TERMINATION_STATUS_REASON_KILLED_HOST_MAINTENANCE,
+		},
+	}
+
+	oldRuntime := &pbtask.RuntimeInfo{
+		State:     pbtask.TaskState_RUNNING,
+		GoalState: pbtask.TaskState_RUNNING,
+		MesosTaskId: &mesos.TaskID{
+			Value: &[]string{testMesosTaskID}[0],
+		},
+		DesiredMesosTaskId: &mesos.TaskID{
+			Value: &[]string{testMesosTaskID}[0],
+		},
+	}
+	tt := suite.job.addTaskToJobMap(0)
+	tt.runtime = oldRuntime
+	tt.config = &taskConfigCache{}
+
+	s, r, err := suite.job.PatchTasks(context.Background(), diffs, false)
+	suite.NoError(err)
+	suite.Nil(r)
+	suite.Empty(s)
+
+	// Validate the state of the task in cache is correct
+	att := suite.job.GetTask(0)
+	actRuntime, err := att.GetRuntime(context.Background())
+	suite.NoError(err)
+	suite.Equal(testMesosTaskID, actRuntime.GetDesiredMesosTaskId().GetValue())
+}
+
+// TestPatchTasksForcePatch tests the case of force
+// patching tasks even though the job SLA will be violated
+func (suite *jobTestSuite) TestPatchTasksForcePatch() {
+	suite.job.jobType = pbjob.JobType_SERVICE
+	suite.job.config.sla = &pbjob.SlaConfig{
+		MaximumUnavailableInstances: 1,
+	}
+
+	unavailableInstances := make(map[uint32]bool)
+	unavailableInstances[1] = true
+	suite.job.instanceAvailabilityInfo = &instanceAvailabilityInfo{
+		unavailableInstances: unavailableInstances,
+		killedInstances:      make(map[uint32]bool),
+	}
+
+	diffs := make(map[uint32]jobmgrcommon.RuntimeDiff)
+	diffs[0] = jobmgrcommon.RuntimeDiff{
+		jobmgrcommon.DesiredMesosTaskIDField: &mesos.TaskID{
+			Value: &[]string{testNewMesosTaskID}[0],
+		},
+		jobmgrcommon.TerminationStatusField: &pbtask.TerminationStatus{
+			Reason: pbtask.TerminationStatus_TERMINATION_STATUS_REASON_KILLED_HOST_MAINTENANCE,
+		},
+	}
+
+	oldRuntime := &pbtask.RuntimeInfo{
+		State:     pbtask.TaskState_RUNNING,
+		GoalState: pbtask.TaskState_RUNNING,
+		MesosTaskId: &mesos.TaskID{
+			Value: &[]string{testMesosTaskID}[0],
+		},
+		DesiredMesosTaskId: &mesos.TaskID{
+			Value: &[]string{testMesosTaskID}[0],
+		},
+	}
+	tt := suite.job.addTaskToJobMap(0)
+	tt.runtime = oldRuntime
+	tt.config = &taskConfigCache{}
+
+	// Update task runtime of only one task
+	suite.taskStore.EXPECT().
+		UpdateTaskRuntime(
+			gomock.Any(),
+			gomock.Any(),
+			gomock.Any(),
+			gomock.Any(),
+			gomock.Any()).
+		Return(nil)
+	s, r, err := suite.job.PatchTasks(context.Background(), diffs, true)
+	suite.NoError(err)
+	suite.Nil(r)
+	suite.Len(s, 1)
+	suite.Equal(uint32(0), s[0])
+
+	// Validate the state of the task in cache is correct
+	att := suite.job.GetTask(0)
+	actRuntime, err := att.GetRuntime(context.Background())
+	suite.NoError(err)
+	suite.Equal(testNewMesosTaskID, actRuntime.GetDesiredMesosTaskId().GetValue())
+}
+
+// TestPatchTasksSLAAwareInstanceRestart tests the success case
+// of patching tasks when the instances are restarted
+func (suite *jobTestSuite) TestPatchTasksSLAAwareInstanceRestart() {
+	suite.job.jobType = pbjob.JobType_SERVICE
+	suite.job.config.sla = &pbjob.SlaConfig{
+		MaximumUnavailableInstances: 1,
+	}
+
+	unavailableInstances := make(map[uint32]bool)
+	unavailableInstances[1] = true
+	suite.job.instanceAvailabilityInfo = &instanceAvailabilityInfo{
+		unavailableInstances: unavailableInstances,
+		killedInstances:      make(map[uint32]bool),
+	}
+
+	diffs := make(map[uint32]jobmgrcommon.RuntimeDiff)
+	diffs[0] = jobmgrcommon.RuntimeDiff{
+		jobmgrcommon.DesiredMesosTaskIDField: &mesos.TaskID{
+			Value: &[]string{testNewMesosTaskID}[0],
+		},
+		jobmgrcommon.TerminationStatusField: &pbtask.TerminationStatus{
+			Reason: pbtask.TerminationStatus_TERMINATION_STATUS_REASON_KILLED_FOR_RESTART,
+		},
+	}
+
+	oldRuntime := &pbtask.RuntimeInfo{
+		State:     pbtask.TaskState_RUNNING,
+		GoalState: pbtask.TaskState_RUNNING,
+		MesosTaskId: &mesos.TaskID{
+			Value: &[]string{testMesosTaskID}[0],
+		},
+		DesiredMesosTaskId: &mesos.TaskID{
+			Value: &[]string{testMesosTaskID}[0],
+		},
+	}
+	tt := suite.job.addTaskToJobMap(0)
+	tt.runtime = oldRuntime
+	tt.config = &taskConfigCache{}
+
+	// Update task runtime of only one task
+	suite.taskStore.EXPECT().
+		UpdateTaskRuntime(
+			gomock.Any(),
+			gomock.Any(),
+			gomock.Any(),
+			gomock.Any(),
+			gomock.Any()).
+		Return(nil)
+	s, r, err := suite.job.PatchTasks(context.Background(), diffs, false)
+	suite.NoError(err)
+	suite.Nil(r)
+	suite.Len(s, 1)
+	suite.Equal(uint32(0), s[0])
+
+	// Validate the state of the task in cache is correct
+	att := suite.job.GetTask(0)
+	actRuntime, err := att.GetRuntime(context.Background())
+	suite.NoError(err)
+	suite.Equal(testNewMesosTaskID, actRuntime.GetDesiredMesosTaskId().GetValue())
+}
+
+// TestPatchTasksSLAAwareMesosTaskIDChange tests the success case
+// of patching tasks when the desired mesos task id has changed
+func (suite *jobTestSuite) TestPatchTasksSLAAwareMesosTaskIDChange() {
+	suite.job.jobType = pbjob.JobType_SERVICE
+	suite.job.config.sla = &pbjob.SlaConfig{
+		MaximumUnavailableInstances: 1,
+	}
+
+	unavailableInstances := make(map[uint32]bool)
+	unavailableInstances[1] = true
+	suite.job.instanceAvailabilityInfo = &instanceAvailabilityInfo{
+		unavailableInstances: unavailableInstances,
+		killedInstances:      make(map[uint32]bool),
+	}
+
+	diffs := make(map[uint32]jobmgrcommon.RuntimeDiff)
+	diffs[0] = jobmgrcommon.RuntimeDiff{
+		jobmgrcommon.DesiredMesosTaskIDField: &mesos.TaskID{
+			Value: &[]string{testNewMesosTaskID}[0],
+		},
+	}
+
+	oldRuntime := &pbtask.RuntimeInfo{
+		State:     pbtask.TaskState_RUNNING,
+		GoalState: pbtask.TaskState_RUNNING,
+		MesosTaskId: &mesos.TaskID{
+			Value: &[]string{testMesosTaskID}[0],
+		},
+		DesiredMesosTaskId: &mesos.TaskID{
+			Value: &[]string{testMesosTaskID}[0],
+		},
+	}
+	tt := suite.job.addTaskToJobMap(0)
+	tt.runtime = oldRuntime
+	tt.config = &taskConfigCache{}
+
+	// Update task runtime of only one task
+	suite.taskStore.EXPECT().
+		UpdateTaskRuntime(
+			gomock.Any(),
+			gomock.Any(),
+			gomock.Any(),
+			gomock.Any(),
+			gomock.Any()).
+		Return(nil)
+	s, r, err := suite.job.PatchTasks(context.Background(), diffs, false)
+	suite.NoError(err)
+	suite.Nil(r)
+	suite.Len(s, 1)
+	suite.Equal(uint32(0), s[0])
+
+	// Validate the state of the task in cache is correct
+	att := suite.job.GetTask(0)
+	actRuntime, err := att.GetRuntime(context.Background())
+	suite.NoError(err)
+	suite.Equal(testNewMesosTaskID, actRuntime.GetDesiredMesosTaskId().GetValue())
+	suite.True(suite.job.instanceAvailabilityInfo.killedInstances[0])
+}
+
+// TestPatchTasksSLAAwareDesiredConfigVersionChange tests the success case
+// of patching tasks when the desired config version has changed
+func (suite *jobTestSuite) TestPatchTasksSLAAwareDesiredConfigVersionChange() {
+	suite.job.jobType = pbjob.JobType_SERVICE
+	suite.job.config.sla = &pbjob.SlaConfig{
+		MaximumUnavailableInstances: 1,
+	}
+
+	unavailableInstances := make(map[uint32]bool)
+	unavailableInstances[1] = true
+	suite.job.instanceAvailabilityInfo = &instanceAvailabilityInfo{
+		unavailableInstances: unavailableInstances,
+		killedInstances:      make(map[uint32]bool),
+	}
+
+	desiredConfigVersion := uint64(2)
+	diffs := make(map[uint32]jobmgrcommon.RuntimeDiff)
+	diffs[0] = jobmgrcommon.RuntimeDiff{
+		jobmgrcommon.DesiredConfigVersionField: desiredConfigVersion,
+	}
+
+	oldRuntime := &pbtask.RuntimeInfo{
+		State:                pbtask.TaskState_RUNNING,
+		GoalState:            pbtask.TaskState_RUNNING,
+		ConfigVersion:        1,
+		DesiredConfigVersion: 1,
+	}
+	tt := suite.job.addTaskToJobMap(0)
+	tt.runtime = oldRuntime
+	tt.config = &taskConfigCache{}
+
+	// Update task runtime of only one task
+	suite.taskStore.EXPECT().
+		UpdateTaskRuntime(
+			gomock.Any(),
+			gomock.Any(),
+			gomock.Any(),
+			gomock.Any(),
+			gomock.Any()).
+		Return(nil)
+	suite.taskConfigV2Ops.EXPECT().
+		GetTaskConfig(
+			gomock.Any(),
+			gomock.Any(),
+			gomock.Any(),
+			gomock.Any()).
+		Return(nil, nil, nil)
+	s, r, err := suite.job.PatchTasks(context.Background(), diffs, false)
+	suite.NoError(err)
+	suite.Nil(r)
+	suite.Len(s, 1)
+	suite.Equal(uint32(0), s[0])
+
+	// Validate the state of the task in cache is correct
+	att := suite.job.GetTask(0)
+	actRuntime, err := att.GetRuntime(context.Background())
+	suite.NoError(err)
+	suite.Equal(desiredConfigVersion, actRuntime.GetDesiredConfigVersion())
+	suite.True(suite.job.instanceAvailabilityInfo.killedInstances[0])
+}
+
+// TestPatchTasksSLAAwareInstanceDelete tests the success case
+// of patching tasks when the instances are deleted
+func (suite *jobTestSuite) TestPatchTasksSLAAwareInstanceDelete() {
+	suite.job.jobType = pbjob.JobType_SERVICE
+	suite.job.config.sla = &pbjob.SlaConfig{
+		MaximumUnavailableInstances: 1,
+	}
+
+	unavailableInstances := make(map[uint32]bool)
+	unavailableInstances[0] = true
+	suite.job.instanceAvailabilityInfo = &instanceAvailabilityInfo{
+		unavailableInstances: unavailableInstances,
+		killedInstances:      make(map[uint32]bool),
+	}
+
+	diffs := make(map[uint32]jobmgrcommon.RuntimeDiff)
+	diffs[0] = jobmgrcommon.RuntimeDiff{
+		jobmgrcommon.GoalStateField: pbtask.TaskState_DELETED,
+	}
+
+	oldRuntime := &pbtask.RuntimeInfo{
+		State:     pbtask.TaskState_PENDING,
+		GoalState: pbtask.TaskState_RUNNING,
+		MesosTaskId: &mesos.TaskID{
+			Value: &[]string{testMesosTaskID}[0],
+		},
+		DesiredMesosTaskId: &mesos.TaskID{
+			Value: &[]string{testMesosTaskID}[0],
+		},
+	}
+	tt := suite.job.addTaskToJobMap(0)
+	tt.runtime = oldRuntime
+	tt.config = &taskConfigCache{}
+
+	// Update task runtime of only one task
+	suite.taskStore.EXPECT().
+		UpdateTaskRuntime(
+			gomock.Any(),
+			gomock.Any(),
+			gomock.Any(),
+			gomock.Any(),
+			gomock.Any()).
+		Return(nil)
+	s, r, err := suite.job.PatchTasks(context.Background(), diffs, false)
+	suite.NoError(err)
+	suite.Nil(r)
+	suite.Len(s, 1)
+	suite.Equal(uint32(0), s[0])
+
+	// Validate the state of the task in cache is correct
+	att := suite.job.GetTask(0)
+	actRuntime, err := att.GetRuntime(context.Background())
+	suite.NoError(err)
+	suite.Equal(pbtask.TaskState_DELETED, actRuntime.GetGoalState())
+	suite.Empty(suite.job.instanceAvailabilityInfo.unavailableInstances)
+	suite.Empty(suite.job.instanceAvailabilityInfo.killedInstances)
+}
+
+// TestPatchTasksSLAAwareInstanceKill tests the success case
+// of patching tasks when the instances are killed
+func (suite *jobTestSuite) TestPatchTasksSLAAwareInstanceKill() {
+	suite.job.jobType = pbjob.JobType_SERVICE
+	suite.job.config.sla = &pbjob.SlaConfig{
+		MaximumUnavailableInstances: 1,
+	}
+
+	unavailableInstances := make(map[uint32]bool)
+	unavailableInstances[0] = true
+	suite.job.instanceAvailabilityInfo = &instanceAvailabilityInfo{
+		unavailableInstances: unavailableInstances,
+		killedInstances:      make(map[uint32]bool),
+	}
+
+	diffs := make(map[uint32]jobmgrcommon.RuntimeDiff)
+	diffs[0] = jobmgrcommon.RuntimeDiff{
+		jobmgrcommon.GoalStateField: pbtask.TaskState_KILLED,
+	}
+
+	oldRuntime := &pbtask.RuntimeInfo{
+		State:     pbtask.TaskState_PENDING,
+		GoalState: pbtask.TaskState_RUNNING,
+		MesosTaskId: &mesos.TaskID{
+			Value: &[]string{testMesosTaskID}[0],
+		},
+		DesiredMesosTaskId: &mesos.TaskID{
+			Value: &[]string{testMesosTaskID}[0],
+		},
+	}
+	tt := suite.job.addTaskToJobMap(0)
+	tt.runtime = oldRuntime
+	tt.config = &taskConfigCache{}
+
+	// Update task runtime of only one task
+	suite.taskStore.EXPECT().
+		UpdateTaskRuntime(
+			gomock.Any(),
+			gomock.Any(),
+			gomock.Any(),
+			gomock.Any(),
+			gomock.Any()).
+		Return(nil)
+	s, r, err := suite.job.PatchTasks(context.Background(), diffs, false)
+	suite.NoError(err)
+	suite.Nil(r)
+	suite.Len(s, 1)
+	suite.Equal(uint32(0), s[0])
+
+	// Validate the state of the task in cache is correct
+	att := suite.job.GetTask(0)
+	actRuntime, err := att.GetRuntime(context.Background())
+	suite.NoError(err)
+	suite.Equal(pbtask.TaskState_KILLED, actRuntime.GetGoalState())
+	suite.Empty(suite.job.instanceAvailabilityInfo.unavailableInstances)
+	suite.True(suite.job.instanceAvailabilityInfo.killedInstances[0])
+}
+
+// TestPatchTasksSLAAwareUnknownTaskState tests the case of patching
+// tasks in a SLA aware manner when the instance state is unknown.
+func (suite *jobTestSuite) TestPatchTasksSLAAwareUnknownTaskState() {
+	suite.job.jobType = pbjob.JobType_SERVICE
+	suite.job.config.sla = &pbjob.SlaConfig{
+		MaximumUnavailableInstances: 2,
+	}
+
+	suite.job.instanceAvailabilityInfo = &instanceAvailabilityInfo{
+		unavailableInstances: make(map[uint32]bool),
+		killedInstances:      make(map[uint32]bool),
+	}
+
+	diffs := make(map[uint32]jobmgrcommon.RuntimeDiff)
+	diffs[0] = jobmgrcommon.RuntimeDiff{
+		jobmgrcommon.DesiredMesosTaskIDField: &mesos.TaskID{
+			Value: &[]string{testNewMesosTaskID}[0],
+		},
+	}
+
+	oldRuntime := &pbtask.RuntimeInfo{
+		State:     pbtask.TaskState_UNKNOWN,
+		GoalState: pbtask.TaskState_UNKNOWN,
+		MesosTaskId: &mesos.TaskID{
+			Value: &[]string{testMesosTaskID}[0],
+		},
+		DesiredMesosTaskId: &mesos.TaskID{
+			Value: &[]string{testMesosTaskID}[0],
+		},
+	}
+	tt := suite.job.addTaskToJobMap(0)
+	tt.runtime = oldRuntime
+	tt.config = &taskConfigCache{}
+
+	s, r, err := suite.job.PatchTasks(context.Background(), diffs, false)
+	suite.NoError(err)
+	suite.Empty(s)
+	suite.Len(r, 1)
+	suite.Equal(uint32(0), r[0])
+
+	// Validate the state of the task in cache is correct
+	att := suite.job.GetTask(0)
+	actRuntime, err := att.GetRuntime(context.Background())
+	suite.NoError(err)
+	suite.Equal(testMesosTaskID, actRuntime.GetDesiredMesosTaskId().GetValue())
+}
+
+// TestPatchTasksSLAAwareInstanceReinitialize tests the success case
+// of patching tasks when the instances are re-initialized
+func (suite *jobTestSuite) TestPatchTasksSLAAwareInstanceReinitialize() {
+	suite.job.jobType = pbjob.JobType_SERVICE
+	suite.job.config.sla = &pbjob.SlaConfig{
+		MaximumUnavailableInstances: 1,
+	}
+
+	killedInstances := make(map[uint32]bool)
+	killedInstances[0] = true
+	suite.job.instanceAvailabilityInfo = &instanceAvailabilityInfo{
+		unavailableInstances: make(map[uint32]bool),
+		killedInstances:      killedInstances,
+	}
+
+	diffs := make(map[uint32]jobmgrcommon.RuntimeDiff)
+	diffs[0] = jobmgrcommon.RuntimeDiff{
+		jobmgrcommon.StateField:     pbtask.TaskState_INITIALIZED,
+		jobmgrcommon.GoalStateField: pbtask.TaskState_RUNNING,
+		jobmgrcommon.MesosTaskIDField: &mesos.TaskID{
+			Value: &[]string{testNewMesosTaskID}[0],
+		},
+		jobmgrcommon.DesiredMesosTaskIDField: &mesos.TaskID{
+			Value: &[]string{testNewMesosTaskID}[0],
+		},
+	}
+
+	oldRuntime := &pbtask.RuntimeInfo{
+		State:     pbtask.TaskState_KILLED,
+		GoalState: pbtask.TaskState_RUNNING,
+		MesosTaskId: &mesos.TaskID{
+			Value: &[]string{testMesosTaskID}[0],
+		},
+		DesiredMesosTaskId: &mesos.TaskID{
+			Value: &[]string{testNewMesosTaskID}[0],
+		},
+	}
+	tt := suite.job.addTaskToJobMap(0)
+	tt.runtime = oldRuntime
+	tt.config = &taskConfigCache{}
+
+	// Update task runtime of only one task
+	suite.taskStore.EXPECT().
+		UpdateTaskRuntime(
+			gomock.Any(),
+			gomock.Any(),
+			gomock.Any(),
+			gomock.Any(),
+			gomock.Any()).
+		Return(nil)
+	s, r, err := suite.job.PatchTasks(context.Background(), diffs, false)
+	suite.NoError(err)
+	suite.Nil(r)
+	suite.Len(s, 1)
+	suite.Equal(uint32(0), s[0])
+
+	// Validate the state of the task in cache is correct
+	att := suite.job.GetTask(0)
+	actRuntime, err := att.GetRuntime(context.Background())
+	suite.NoError(err)
+	suite.Equal(pbtask.TaskState_INITIALIZED, actRuntime.GetState())
+	suite.True(suite.job.instanceAvailabilityInfo.unavailableInstances[0])
+	suite.Empty(suite.job.instanceAvailabilityInfo.killedInstances)
+}
+
+// TestPatchTasksSLAAwarePopulateJobConfigFailure tests the failure case of patching
+// tasks in a SLA aware manner due to error while populating job config.
+func (suite *jobTestSuite) TestPatchTasksSLAAwarePopulateJobConfigFailure() {
+	suite.job.jobType = pbjob.JobType_SERVICE
+	suite.job.config = nil
+
+	diffs := make(map[uint32]jobmgrcommon.RuntimeDiff)
+	diffs[0] = jobmgrcommon.RuntimeDiff{
+		jobmgrcommon.DesiredMesosTaskIDField: &mesos.TaskID{
+			Value: &[]string{testNewMesosTaskID}[0],
+		},
+		jobmgrcommon.TerminationStatusField: &pbtask.TerminationStatus{
+			Reason: pbtask.TerminationStatus_TERMINATION_STATUS_REASON_KILLED_HOST_MAINTENANCE,
+		},
+	}
+
+	oldRuntime := &pbtask.RuntimeInfo{
+		State:     pbtask.TaskState_UNKNOWN,
+		GoalState: pbtask.TaskState_UNKNOWN,
+		MesosTaskId: &mesos.TaskID{
+			Value: &[]string{testMesosTaskID}[0],
+		},
+		DesiredMesosTaskId: &mesos.TaskID{
+			Value: &[]string{testMesosTaskID}[0],
+		},
+	}
+	tt := suite.job.addTaskToJobMap(0)
+	tt.runtime = oldRuntime
+	tt.config = &taskConfigCache{}
+
+	suite.jobConfigOps.EXPECT().
+		Get(
+			gomock.Any(),
+			suite.jobID,
+			suite.job.runtime.GetConfigurationVersion(),
+		).Return(nil, nil, fmt.Errorf("test error"))
+	s, r, err := suite.job.PatchTasks(context.Background(), diffs, false)
+	suite.Error(err)
+	suite.Nil(s)
+	suite.Nil(r)
+}
+
+// TestPatchTasksSLAAwareGetTaskRuntimeFailure tests the failure case of patching
+// tasks in a SLA aware manner due to error while getting task runtime.
+func (suite *jobTestSuite) TestPatchTasksSLAAwareGetTaskRuntimeFailure() {
+	suite.job.jobType = pbjob.JobType_SERVICE
+	suite.job.config.sla = &pbjob.SlaConfig{
+		MaximumUnavailableInstances: 2,
+	}
+
+	diffs := make(map[uint32]jobmgrcommon.RuntimeDiff)
+	diffs[0] = jobmgrcommon.RuntimeDiff{
+		jobmgrcommon.DesiredMesosTaskIDField: &mesos.TaskID{
+			Value: &[]string{testNewMesosTaskID}[0],
+		},
+		jobmgrcommon.TerminationStatusField: &pbtask.TerminationStatus{
+			Reason: pbtask.TerminationStatus_TERMINATION_STATUS_REASON_KILLED_HOST_MAINTENANCE,
+		},
+	}
+
+	suite.job.addTaskToJobMap(0)
+
+	suite.taskStore.EXPECT().GetTaskRuntime(gomock.Any(), suite.jobID, uint32(0)).
+		Return(nil, fmt.Errorf("fake error"))
+	s, r, err := suite.job.PatchTasks(context.Background(), diffs, false)
+	suite.Error(err)
+	suite.Nil(s)
+	suite.Nil(r)
+}
+
 // TestJobUpdateResourceUsage tests updating the resource usage for job
-func (suite *JobTestSuite) TestJobUpdateResourceUsage() {
+func (suite *jobTestSuite) TestJobUpdateResourceUsage() {
 	taskResourceUsage := map[string]float64{
 		common.CPU:    float64(1),
 		common.GPU:    float64(0),
@@ -1964,22 +2681,22 @@ func (suite *JobTestSuite) TestJobUpdateResourceUsage() {
 }
 
 // TestDelete tests deleting a job
-func (suite *JobTestSuite) TestDelete() {
+func (suite *jobTestSuite) TestDelete() {
 	suite.jobStore.EXPECT().
 		DeleteJob(gomock.Any(), suite.jobID.GetValue()).
 		Return(nil)
 	suite.jobIndexOps.EXPECT().
 		Delete(gomock.Any(), suite.jobID).
 		Return(nil)
-	suite.jobStore.EXPECT().
-		DeleteActiveJob(gomock.Any(), suite.jobID).
+	suite.activeJobsOps.EXPECT().
+		Delete(gomock.Any(), suite.jobID).
 		Return(nil)
 
 	suite.job.Delete(context.Background())
 }
 
 // TestDelete tests failure deleting a job
-func (suite *JobTestSuite) TestDeleteFailure() {
+func (suite *jobTestSuite) TestDeleteFailure() {
 	// DeleteJob failure
 	suite.jobIndexOps.EXPECT().
 		Delete(gomock.Any(), suite.jobID).
@@ -1999,24 +2716,24 @@ func (suite *JobTestSuite) TestDeleteFailure() {
 	suite.Error(err)
 	suite.Equal("jobIndexOps error", yarpcerrors.ErrorMessage(err))
 
-	// DeleteActiveJob error
+	// Delete active job error.
 	suite.jobStore.EXPECT().
 		DeleteJob(gomock.Any(), suite.jobID.GetValue()).
 		Return(nil)
 	suite.jobIndexOps.EXPECT().
 		Delete(gomock.Any(), suite.jobID).
 		Return(nil)
-	suite.jobStore.EXPECT().
-		DeleteActiveJob(gomock.Any(), suite.jobID).
-		Return(yarpcerrors.InternalErrorf("DeleteActiveJob error"))
+	suite.activeJobsOps.EXPECT().
+		Delete(gomock.Any(), suite.jobID).
+		Return(yarpcerrors.InternalErrorf("Delete active jobs error"))
 	err = suite.job.Delete(context.Background())
 	suite.Error(err)
-	suite.Equal("DeleteActiveJob error", yarpcerrors.ErrorMessage(err))
+	suite.Equal("Delete active jobs error", yarpcerrors.ErrorMessage(err))
 }
 
 // TestRecalculateResourceUsage tests recalculating the resource usage for job
 // on recovery
-func (suite *JobTestSuite) TestRecalculateResourceUsage() {
+func (suite *jobTestSuite) TestRecalculateResourceUsage() {
 	var oldRuntime *pbtask.RuntimeInfo
 
 	instanceCount := uint32(5)
@@ -2059,7 +2776,7 @@ func (suite *JobTestSuite) TestRecalculateResourceUsage() {
 
 // TestRecalculateResourceUsageError tests DB error in recalculating the
 // resource usage for job on recovery
-func (suite *JobTestSuite) TestRecalculateResourceUsageError() {
+func (suite *jobTestSuite) TestRecalculateResourceUsageError() {
 	initialResourceMap := map[string]float64{
 		common.CPU:    float64(5),
 		common.GPU:    float64(0),
@@ -2078,7 +2795,7 @@ func (suite *JobTestSuite) TestRecalculateResourceUsageError() {
 	suite.Equal(createEmptyResourceUsageMap(), suite.job.GetResourceUsage())
 }
 
-func (suite *JobTestSuite) TestJobRemoveTask() {
+func (suite *jobTestSuite) TestJobRemoveTask() {
 	suite.job.addTaskToJobMap(0)
 	suite.NotNil(suite.job.GetTask(0))
 	suite.job.RemoveTask(0)
@@ -2087,7 +2804,7 @@ func (suite *JobTestSuite) TestJobRemoveTask() {
 
 // TestJobCompareAndSetConfigSuccess tests the success case of
 // CompareAndSetConfig
-func (suite *JobTestSuite) TestJobCompareAndSetConfigSuccess() {
+func (suite *jobTestSuite) TestJobCompareAndSetConfigSuccess() {
 	suite.jobStore.EXPECT().
 		GetMaxJobConfigVersion(gomock.Any(), suite.jobID.GetValue()).
 		Return(suite.job.config.changeLog.Version, nil)
@@ -2096,6 +2813,7 @@ func (suite *JobTestSuite) TestJobCompareAndSetConfigSuccess() {
 		Create(
 			gomock.Any(),
 			suite.jobID,
+			gomock.Any(),
 			gomock.Any(),
 			gomock.Any(),
 			gomock.Any()).
@@ -2112,14 +2830,111 @@ func (suite *JobTestSuite) TestJobCompareAndSetConfigSuccess() {
 				Version: suite.job.config.changeLog.Version,
 			},
 		}, &models.ConfigAddOn{},
+		nil,
 	)
 	suite.NoError(err)
 	suite.Equal(newConfig.GetInstanceCount(), uint32(100))
 }
 
+// TestJobCompareAndSetTaskSuccess tests the success case of
+// CompareAndSetTask
+func (suite *jobTestSuite) TestCompareAndSetTaskSuccess() {
+	var labels []*peloton.Label
+
+	labels = append(labels, initializeLabel("key", "value"))
+	version := uint64(3)
+	runtime := initializeTaskRuntime(pbtask.TaskState_LAUNCHED, 2)
+	runtime.GoalState = pbtask.TaskState_SUCCEEDED
+	runtime.ConfigVersion = version - 1
+	tt := &task{
+		id:      0,
+		jobID:   suite.jobID,
+		runtime: runtime,
+		jobFactory: &jobFactory{
+			mtx:             NewMetrics(tally.NoopScope),
+			taskMetrics:     NewTaskMetrics(tally.NoopScope),
+			taskStore:       suite.taskStore,
+			taskConfigV2Ops: suite.taskConfigV2Ops,
+			running:         true,
+			jobs:            map[string]*job{},
+		},
+		jobType: pbjob.JobType_BATCH,
+	}
+	for _, l := range suite.listeners {
+		tt.jobFactory.listeners = append(tt.jobFactory.listeners, l)
+	}
+
+	tt.jobFactory.jobs[suite.jobID.GetValue()] = suite.job
+	suite.job.tasks[0] = tt
+
+	newRuntime := initializeTaskRuntime(pbtask.TaskState_RUNNING, 2)
+	newRuntime.GoalState = pbtask.TaskState_SUCCEEDED
+	newRuntime.ConfigVersion = version
+
+	taskConfig := &pbtask.TaskConfig{
+		Labels: labels,
+	}
+
+	suite.taskStore.EXPECT().
+		UpdateTaskRuntime(
+			gomock.Any(),
+			suite.jobID,
+			uint32(0),
+			gomock.Any(),
+			gomock.Any()).
+		Do(func(
+			ctx context.Context,
+			jobID *peloton.JobID,
+			instanceID uint32,
+			runtime *pbtask.RuntimeInfo,
+			jobType pbjob.JobType) {
+			suite.Equal(runtime.GetState(), pbtask.TaskState_RUNNING)
+			suite.Equal(runtime.Revision.Version, uint64(3))
+			suite.Equal(runtime.GetGoalState(), pbtask.TaskState_SUCCEEDED)
+		}).
+		Return(nil)
+
+	suite.taskConfigV2Ops.EXPECT().
+		GetTaskConfig(
+			gomock.Any(),
+			suite.jobID,
+			uint32(0),
+			version).
+		Return(taskConfig, nil, nil)
+
+	_, err := suite.job.CompareAndSetTask(
+		context.Background(),
+		0,
+		newRuntime,
+		false,
+	)
+	suite.NoError(err)
+}
+
+// TestCompareAndSetTaskAddTaskError tests failure case of
+// CompareAndSetTask due to error getting task runtime from DB
+func (suite *jobTestSuite) TestCompareAndSetTaskAddTaskError() {
+	newRuntime := initializeTaskRuntime(pbtask.TaskState_RUNNING, 2)
+	newRuntime.GoalState = pbtask.TaskState_SUCCEEDED
+	newRuntime.ConfigVersion = 0
+
+	suite.taskStore.EXPECT().
+		GetTaskRuntime(gomock.Any(), suite.jobID, uint32(0)).
+		Return(nil, fmt.Errorf("fake db error"))
+
+	runtimeCopy, err := suite.job.CompareAndSetTask(
+		context.Background(),
+		0,
+		newRuntime,
+		false,
+	)
+	suite.Nil(runtimeCopy)
+	suite.Error(err)
+}
+
 // TestJobCompareAndSetConfigInvalidConfigVersion tests CompareAndSetConfig
 // fails due to invalid version
-func (suite *JobTestSuite) TestJobCompareAndSetConfigInvalidConfigVersion() {
+func (suite *jobTestSuite) TestJobCompareAndSetConfigInvalidConfigVersion() {
 	newConfig, err := suite.job.CompareAndSetConfig(
 		context.Background(),
 		&pbjob.JobConfig{
@@ -2128,14 +2943,63 @@ func (suite *JobTestSuite) TestJobCompareAndSetConfigInvalidConfigVersion() {
 				Version: suite.job.config.changeLog.Version - 1,
 			},
 		}, &models.ConfigAddOn{},
+		nil,
 	)
 	suite.Error(err)
 	suite.Nil(newConfig)
 }
 
+// TestRepopulateSLAInfoStatelessJob tests repopulating
+// the instance availability info of a stateless job
+func (suite *jobTestSuite) TestRepopulateInstanceAvailabilityInfoStatelessJob() {
+	suite.job.jobType = pbjob.JobType_SERVICE
+	suite.job.addTaskToJobMap(0)
+	suite.job.addTaskToJobMap(1)
+	suite.job.addTaskToJobMap(2)
+
+	suite.taskStore.EXPECT().GetTaskRuntime(gomock.Any(), suite.jobID, uint32(0)).
+		Return(&pbtask.RuntimeInfo{
+			State:     pbtask.TaskState_RUNNING,
+			GoalState: pbtask.TaskState_RUNNING,
+			TerminationStatus: &pbtask.TerminationStatus{
+				Reason: pbtask.TerminationStatus_TERMINATION_STATUS_REASON_KILLED_HOST_MAINTENANCE,
+			},
+		}, nil)
+
+	suite.taskStore.EXPECT().GetTaskRuntime(gomock.Any(), suite.jobID, uint32(1)).
+		Return(&pbtask.RuntimeInfo{
+			State:     pbtask.TaskState_RUNNING,
+			GoalState: pbtask.TaskState_RUNNING,
+			TerminationStatus: &pbtask.TerminationStatus{
+				Reason: pbtask.TerminationStatus_TERMINATION_STATUS_REASON_DEADLINE_TIMEOUT_EXCEEDED,
+			},
+		}, nil)
+
+	suite.taskStore.EXPECT().GetTaskRuntime(gomock.Any(), suite.jobID, uint32(2)).
+		Return(&pbtask.RuntimeInfo{
+			State:     pbtask.TaskState_RUNNING,
+			GoalState: pbtask.TaskState_KILLED,
+		}, nil)
+
+	suite.Nil(suite.job.RepopulateInstanceAvailabilityInfo(context.Background()))
+	suite.NotNil(suite.job.instanceAvailabilityInfo)
+	suite.Len(suite.job.instanceAvailabilityInfo.unavailableInstances, 1)
+	suite.True(suite.job.instanceAvailabilityInfo.unavailableInstances[0])
+	suite.Len(suite.job.instanceAvailabilityInfo.killedInstances, 2)
+	suite.True(suite.job.instanceAvailabilityInfo.killedInstances[1])
+	suite.True(suite.job.instanceAvailabilityInfo.killedInstances[2])
+}
+
+// TestRepopulateSLAInfoBatchJob tests repopulating
+// the SLA i nstance availability of a batch job
+func (suite *jobTestSuite) TestRepopulateInstanceAvailabilityInfoBatchJob() {
+	suite.Nil(suite.job.RepopulateInstanceAvailabilityInfo(context.Background()))
+	suite.Nil(suite.job.instanceAvailabilityInfo)
+}
+
 // TestJobCreateWorkflowWithSameConfigSuccess tests create a workflow
 // with same config succeeds and is noop
-func (suite *JobTestSuite) TestJobCreateWorkflowWithSameConfigSuccess() {
+func (suite *jobTestSuite) TestJobCreateWorkflowWithSameConfigSuccess() {
 	opaque := "test"
 	updateID := &peloton.UpdateID{Value: uuid.NewRandom().String()}
 
@@ -2179,6 +3043,7 @@ func (suite *JobTestSuite) TestJobCreateWorkflowWithSameConfigSuccess() {
 			jobConfig,
 			prevConfig,
 			configAddOn,
+			nil,
 		),
 		WithOpaqueData(&peloton.OpaqueData{Data: opaque}),
 	)
@@ -2195,7 +3060,7 @@ func (suite *JobTestSuite) TestJobCreateWorkflowWithSameConfigSuccess() {
 
 // TestJobCreateWorkflowWithDifferntOpaqueDateSuccess tests create a workflow
 // with same config but different opaque data succeeds
-func (suite *JobTestSuite) TestJobCreateWorkflowWithDifferentOpaqueDateSuccess() {
+func (suite *jobTestSuite) TestJobCreateWorkflowWithDifferentOpaqueDateSuccess() {
 	opaque := "test"
 	updatedOpaque := "test2"
 	updateID := &peloton.UpdateID{Value: uuid.NewRandom().String()}
@@ -2248,6 +3113,7 @@ func (suite *JobTestSuite) TestJobCreateWorkflowWithDifferentOpaqueDateSuccess()
 			jobConfig,
 			prevConfig,
 			configAddOn,
+			nil,
 		),
 		WithOpaqueData(&peloton.OpaqueData{Data: updatedOpaque}),
 	)
@@ -2264,7 +3130,7 @@ func (suite *JobTestSuite) TestJobCreateWorkflowWithDifferentOpaqueDateSuccess()
 
 // TestJobCreateWorkflowSuccess tests the success case of
 // creating workflow
-func (suite *JobTestSuite) TestJobCreateWorkflowSuccess() {
+func (suite *jobTestSuite) TestJobCreateWorkflowSuccess() {
 	var instancesAdded []uint32
 	var instnacesRemoved []uint32
 	instancesUpdated := []uint32{0, 1, 2}
@@ -2288,6 +3154,10 @@ func (suite *JobTestSuite) TestJobCreateWorkflowSuccess() {
 	}
 	jobConfig := prevConfig
 	configAddOn := &models.ConfigAddOn{}
+	jobSpec := &stateless.JobSpec{
+		DefaultSpec: &pbpod.PodSpec{},
+		Revision:    &v1alphapeloton.Revision{Version: 1},
+	}
 
 	for _, i := range instancesUpdated {
 		suite.updateStore.EXPECT().
@@ -2310,23 +3180,29 @@ func (suite *JobTestSuite) TestJobCreateWorkflowSuccess() {
 				suite.jobID,
 				gomock.Any(),
 				gomock.Any(),
+				gomock.Any(),
 				gomock.Any()).
 			Do(func(_ context.Context,
 				_ *peloton.JobID,
 				config *pbjob.JobConfig,
 				_ *models.ConfigAddOn,
+				spec *stateless.JobSpec,
 				_ uint64,
 			) {
 				suite.Equal(
 					config.GetChangeLog().GetVersion(),
 					prevConfig.GetChangeLog().GetVersion()+1)
+				suite.Equal(
+					config.GetChangeLog().GetVersion(),
+					spec.GetRevision().GetVersion())
 			}).
 			Return(nil),
 		suite.jobIndexOps.EXPECT().
 			Update(gomock.Any(), suite.jobID, gomock.Any(), gomock.Any()).
 			Return(nil),
-		suite.updateStore.EXPECT().
-			AddJobUpdateEvent(
+
+		suite.jobUpdateEventsOps.EXPECT().
+			Create(
 				gomock.Any(),
 				gomock.Any(),
 				gomock.Any(),
@@ -2367,6 +3243,7 @@ func (suite *JobTestSuite) TestJobCreateWorkflowSuccess() {
 			jobConfig,
 			prevConfig,
 			configAddOn,
+			jobSpec,
 		),
 		WithInstanceToProcess(
 			instancesAdded,
@@ -2388,7 +3265,7 @@ func (suite *JobTestSuite) TestJobCreateWorkflowSuccess() {
 
 // TestJobCreateWorkflowWithStartTasksForStoppedJobSuccess tests the success case of
 // creating workflow with StartTasks flag on for a stopped job
-func (suite *JobTestSuite) TestJobCreateWorkflowWithStartTasksForStoppedJobSuccess() {
+func (suite *jobTestSuite) TestJobCreateWorkflowWithStartTasksForStoppedJobSuccess() {
 	var instancesAdded []uint32
 	var instnacesRemoved []uint32
 	instancesUpdated := []uint32{0, 1, 2}
@@ -2435,11 +3312,13 @@ func (suite *JobTestSuite) TestJobCreateWorkflowWithStartTasksForStoppedJobSucce
 				suite.jobID,
 				gomock.Any(),
 				gomock.Any(),
+				gomock.Any(),
 				gomock.Any()).
 			Do(func(_ context.Context,
 				_ *peloton.JobID,
 				config *pbjob.JobConfig,
 				_ *models.ConfigAddOn,
+				_ *stateless.JobSpec,
 				_ uint64,
 			) {
 				suite.Equal(
@@ -2450,8 +3329,8 @@ func (suite *JobTestSuite) TestJobCreateWorkflowWithStartTasksForStoppedJobSucce
 		suite.jobIndexOps.EXPECT().
 			Update(gomock.Any(), suite.jobID, gomock.Any(), gomock.Any()).
 			Return(nil),
-		suite.updateStore.EXPECT().
-			AddJobUpdateEvent(
+		suite.jobUpdateEventsOps.EXPECT().
+			Create(
 				gomock.Any(),
 				gomock.Any(),
 				gomock.Any(),
@@ -2495,6 +3374,7 @@ func (suite *JobTestSuite) TestJobCreateWorkflowWithStartTasksForStoppedJobSucce
 			jobConfig,
 			prevConfig,
 			configAddOn,
+			nil,
 		),
 		WithInstanceToProcess(
 			instancesAdded,
@@ -2516,7 +3396,7 @@ func (suite *JobTestSuite) TestJobCreateWorkflowWithStartTasksForStoppedJobSucce
 
 // TestJobCreateWorkflowUpdateConfigFailure tests the failure case of
 // creating workflow due to update config failure
-func (suite *JobTestSuite) TestJobCreateWorkflowUpdateConfigFailure() {
+func (suite *jobTestSuite) TestJobCreateWorkflowUpdateConfigFailure() {
 	var instancesAdded []uint32
 	var instnacesRemoved []uint32
 	instancesUpdated := []uint32{0, 1, 2}
@@ -2547,11 +3427,13 @@ func (suite *JobTestSuite) TestJobCreateWorkflowUpdateConfigFailure() {
 				suite.jobID,
 				gomock.Any(),
 				gomock.Any(),
+				gomock.Any(),
 				gomock.Any()).
 			Do(func(_ context.Context,
 				_ *peloton.JobID,
 				config *pbjob.JobConfig,
 				_ *models.ConfigAddOn,
+				_ *stateless.JobSpec,
 				_ uint64,
 			) {
 				suite.Equal(
@@ -2570,6 +3452,7 @@ func (suite *JobTestSuite) TestJobCreateWorkflowUpdateConfigFailure() {
 			jobConfig,
 			prevConfig,
 			configAddOn,
+			nil,
 		),
 		WithInstanceToProcess(
 			instancesAdded,
@@ -2586,7 +3469,7 @@ func (suite *JobTestSuite) TestJobCreateWorkflowUpdateConfigFailure() {
 
 // TestJobCreateWorkflowWorkflowCreationFailure tests the failure case of
 // creating workflow due to failure of creating update workflow in db
-func (suite *JobTestSuite) TestJobCreateWorkflowWorkflowCreationFailure() {
+func (suite *jobTestSuite) TestJobCreateWorkflowWorkflowCreationFailure() {
 	var instancesAdded []uint32
 	var instnacesRemoved []uint32
 	instancesUpdated := []uint32{0, 1, 2}
@@ -2628,11 +3511,13 @@ func (suite *JobTestSuite) TestJobCreateWorkflowWorkflowCreationFailure() {
 				suite.jobID,
 				gomock.Any(),
 				gomock.Any(),
+				gomock.Any(),
 				gomock.Any()).
 			Do(func(_ context.Context,
 				_ *peloton.JobID,
 				config *pbjob.JobConfig,
 				_ *models.ConfigAddOn,
+				_ *stateless.JobSpec,
 				_ uint64,
 			) {
 				suite.Equal(
@@ -2643,8 +3528,8 @@ func (suite *JobTestSuite) TestJobCreateWorkflowWorkflowCreationFailure() {
 		suite.jobIndexOps.EXPECT().
 			Update(gomock.Any(), suite.jobID, gomock.Any(), gomock.Any()).
 			Return(nil),
-		suite.updateStore.EXPECT().
-			AddJobUpdateEvent(
+		suite.jobUpdateEventsOps.EXPECT().
+			Create(
 				gomock.Any(),
 				gomock.Any(),
 				gomock.Any(),
@@ -2676,6 +3561,7 @@ func (suite *JobTestSuite) TestJobCreateWorkflowWorkflowCreationFailure() {
 			jobConfig,
 			prevConfig,
 			configAddOn,
+			nil,
 		),
 		WithInstanceToProcess(
 			instancesAdded,
@@ -2692,7 +3578,7 @@ func (suite *JobTestSuite) TestJobCreateWorkflowWorkflowCreationFailure() {
 
 // TestJobCreateWorkflowUpdateRuntimeFailure tests the failure case of
 // creating workflow due to update runtime failure
-func (suite *JobTestSuite) TestJobCreateWorkflowUpdateRuntimeFailure() {
+func (suite *jobTestSuite) TestJobCreateWorkflowUpdateRuntimeFailure() {
 	var instancesAdded []uint32
 	var instnacesRemoved []uint32
 	instancesUpdated := []uint32{0, 1, 2}
@@ -2733,11 +3619,13 @@ func (suite *JobTestSuite) TestJobCreateWorkflowUpdateRuntimeFailure() {
 				suite.jobID,
 				gomock.Any(),
 				gomock.Any(),
+				gomock.Any(),
 				gomock.Any()).
 			Do(func(_ context.Context,
 				_ *peloton.JobID,
 				config *pbjob.JobConfig,
 				_ *models.ConfigAddOn,
+				_ *stateless.JobSpec,
 				_ uint64,
 			) {
 				suite.Equal(
@@ -2748,8 +3636,8 @@ func (suite *JobTestSuite) TestJobCreateWorkflowUpdateRuntimeFailure() {
 		suite.jobIndexOps.EXPECT().
 			Update(gomock.Any(), suite.jobID, gomock.Any(), gomock.Any()).
 			Return(nil),
-		suite.updateStore.EXPECT().
-			AddJobUpdateEvent(
+		suite.jobUpdateEventsOps.EXPECT().
+			Create(
 				gomock.Any(),
 				gomock.Any(),
 				gomock.Any(),
@@ -2785,6 +3673,7 @@ func (suite *JobTestSuite) TestJobCreateWorkflowUpdateRuntimeFailure() {
 			jobConfig,
 			prevConfig,
 			configAddOn,
+			nil,
 		),
 		WithInstanceToProcess(
 			instancesAdded,
@@ -2805,7 +3694,7 @@ func (suite *JobTestSuite) TestJobCreateWorkflowUpdateRuntimeFailure() {
 
 // TestJobCreateWorkflowOnDeletedJobError tests the failure case of
 // creating workflow for a deleted job
-func (suite *JobTestSuite) TestJobCreateWorkflowOnDeletedJobError() {
+func (suite *jobTestSuite) TestJobCreateWorkflowOnDeletedJobError() {
 	var instancesAdded []uint32
 	var instnacesRemoved []uint32
 	instancesUpdated := []uint32{0, 1, 2}
@@ -2847,11 +3736,13 @@ func (suite *JobTestSuite) TestJobCreateWorkflowOnDeletedJobError() {
 				suite.jobID,
 				gomock.Any(),
 				gomock.Any(),
+				gomock.Any(),
 				gomock.Any()).
 			Do(func(_ context.Context,
 				_ *peloton.JobID,
 				config *pbjob.JobConfig,
 				_ *models.ConfigAddOn,
+				_ *stateless.JobSpec,
 				_ uint64,
 			) {
 				suite.Equal(
@@ -2862,8 +3753,8 @@ func (suite *JobTestSuite) TestJobCreateWorkflowOnDeletedJobError() {
 		suite.jobIndexOps.EXPECT().
 			Update(gomock.Any(), suite.jobID, gomock.Any(), gomock.Any()).
 			Return(nil),
-		suite.updateStore.EXPECT().
-			AddJobUpdateEvent(
+		suite.jobUpdateEventsOps.EXPECT().
+			Create(
 				gomock.Any(),
 				gomock.Any(),
 				gomock.Any(),
@@ -2895,6 +3786,7 @@ func (suite *JobTestSuite) TestJobCreateWorkflowOnDeletedJobError() {
 			jobConfig,
 			prevConfig,
 			configAddOn,
+			nil,
 		),
 		WithInstanceToProcess(
 			instancesAdded,
@@ -2915,7 +3807,7 @@ func (suite *JobTestSuite) TestJobCreateWorkflowOnDeletedJobError() {
 
 // TestJobCreateWorkflowOnTerminatingJobError tests the failure case of
 // creating workflow for a job actively being terminated
-func (suite *JobTestSuite) TestJobCreateWorkflowOnTerminatingJobError() {
+func (suite *jobTestSuite) TestJobCreateWorkflowOnTerminatingJobError() {
 	suite.job.runtime.State = pbjob.JobState_KILLING
 	suite.job.runtime.GoalState = pbjob.JobState_KILLED
 
@@ -2944,7 +3836,7 @@ func (suite *JobTestSuite) TestJobCreateWorkflowOnTerminatingJobError() {
 
 // TestResumeWorkflowSuccess tests the success case
 // of resuming a workflow
-func (suite *JobTestSuite) TestResumeWorkflowSuccess() {
+func (suite *jobTestSuite) TestResumeWorkflowSuccess() {
 	oldConfigVersion := suite.job.runtime.GetConfigurationVersion()
 	oldWorkflowVersion := suite.job.runtime.GetWorkflowVersion()
 	opaque := "test"
@@ -2974,8 +3866,8 @@ func (suite *JobTestSuite) TestResumeWorkflowSuccess() {
 		suite.jobIndexOps.EXPECT().
 			Update(gomock.Any(), suite.jobID, gomock.Any(), gomock.Any()).
 			Return(nil),
-		suite.updateStore.EXPECT().
-			AddJobUpdateEvent(
+		suite.jobUpdateEventsOps.EXPECT().
+			Create(
 				gomock.Any(),
 				gomock.Any(),
 				gomock.Any(),
@@ -3006,7 +3898,7 @@ func (suite *JobTestSuite) TestResumeWorkflowSuccess() {
 
 // TestResumeWorkflowNilEntityVersionFailure tests the failure case
 // of resuming a workflow due to nil entity version provided
-func (suite *JobTestSuite) TestResumeWorkflowNilEntityVersionFailure() {
+func (suite *jobTestSuite) TestResumeWorkflowNilEntityVersionFailure() {
 	updateID := &peloton.UpdateID{Value: testUpdateID}
 	suite.job.runtime.UpdateID = updateID
 	suite.job.workflows[updateID.GetValue()] = &update{
@@ -3024,7 +3916,7 @@ func (suite *JobTestSuite) TestResumeWorkflowNilEntityVersionFailure() {
 
 // TestResumeWorkflowWrongEntityVersionFailure tests the failure case
 // of resuming a workflow due to wrong entity version provided
-func (suite *JobTestSuite) TestResumeWorkflowWrongEntityVersionFailure() {
+func (suite *jobTestSuite) TestResumeWorkflowWrongEntityVersionFailure() {
 	updateID := &peloton.UpdateID{Value: testUpdateID}
 	suite.job.runtime.UpdateID = updateID
 	suite.job.workflows[updateID.GetValue()] = &update{
@@ -3048,7 +3940,7 @@ func (suite *JobTestSuite) TestResumeWorkflowWrongEntityVersionFailure() {
 
 // TestResumeWorkflowNotExistInCacheSuccess tests the success case
 // of resuming a workflow when the workflow is not in cache
-func (suite *JobTestSuite) TestResumeWorkflowNotExistInCacheSuccess() {
+func (suite *jobTestSuite) TestResumeWorkflowNotExistInCacheSuccess() {
 	oldConfigVersion := suite.job.runtime.GetConfigurationVersion()
 	oldWorkflowVersion := suite.job.runtime.GetWorkflowVersion()
 	desiredStateVersion := suite.job.runtime.GetDesiredStateVersion()
@@ -3073,8 +3965,8 @@ func (suite *JobTestSuite) TestResumeWorkflowNotExistInCacheSuccess() {
 				PrevState: pbupdate.State_ROLLING_FORWARD,
 				State:     pbupdate.State_PAUSED,
 			}, nil),
-		suite.updateStore.EXPECT().
-			AddJobUpdateEvent(
+		suite.jobUpdateEventsOps.EXPECT().
+			Create(
 				gomock.Any(),
 				gomock.Any(),
 				gomock.Any(),
@@ -3099,7 +3991,7 @@ func (suite *JobTestSuite) TestResumeWorkflowNotExistInCacheSuccess() {
 
 // TestResumeWorkflowNoUpdate the case of update pause
 // when there is no update
-func (suite *JobTestSuite) TestResumeWorkflowNoUpdate() {
+func (suite *jobTestSuite) TestResumeWorkflowNoUpdate() {
 	entityVersion := versionutil.GetJobEntityVersion(
 		suite.job.runtime.GetConfigurationVersion(),
 		suite.job.runtime.GetDesiredStateVersion(),
@@ -3114,7 +4006,7 @@ func (suite *JobTestSuite) TestResumeWorkflowNoUpdate() {
 
 // TestPauseWorkflowSuccess tests the success case
 // of pausing a workflow
-func (suite *JobTestSuite) TestPauseWorkflowSuccess() {
+func (suite *jobTestSuite) TestPauseWorkflowSuccess() {
 	oldConfigVersion := suite.job.runtime.GetConfigurationVersion()
 	oldWorkflowVersion := suite.job.runtime.GetWorkflowVersion()
 	opaque := "test"
@@ -3139,8 +4031,8 @@ func (suite *JobTestSuite) TestPauseWorkflowSuccess() {
 		suite.jobIndexOps.EXPECT().
 			Update(gomock.Any(), suite.jobID, gomock.Any(), gomock.Any()).
 			Return(nil),
-		suite.updateStore.EXPECT().
-			AddJobUpdateEvent(
+		suite.jobUpdateEventsOps.EXPECT().
+			Create(
 				gomock.Any(),
 				gomock.Any(),
 				gomock.Any(),
@@ -3170,7 +4062,7 @@ func (suite *JobTestSuite) TestPauseWorkflowSuccess() {
 
 // TestPauseWorkflowNilEntityVersionFailure tests the failure case
 // of pausing a workflow due to nil entity version provided
-func (suite *JobTestSuite) TestPauseWorkflowNilEntityVersionFailure() {
+func (suite *jobTestSuite) TestPauseWorkflowNilEntityVersionFailure() {
 	updateID := &peloton.UpdateID{Value: testUpdateID}
 	suite.job.runtime.UpdateID = updateID
 	suite.job.workflows[updateID.GetValue()] = &update{
@@ -3187,7 +4079,7 @@ func (suite *JobTestSuite) TestPauseWorkflowNilEntityVersionFailure() {
 
 // TestPauseWorkflowWrongEntityVersionFailure tests the failure case
 // of pausing a workflow due to wrong entity version provided
-func (suite *JobTestSuite) TestPauseWorkflowWrongEntityVersionFailure() {
+func (suite *jobTestSuite) TestPauseWorkflowWrongEntityVersionFailure() {
 	updateID := &peloton.UpdateID{Value: testUpdateID}
 	suite.job.runtime.UpdateID = updateID
 	suite.job.workflows[updateID.GetValue()] = &update{
@@ -3211,7 +4103,7 @@ func (suite *JobTestSuite) TestPauseWorkflowWrongEntityVersionFailure() {
 
 // TestPauseWorkflowNotExistInCacheSuccess tests the success case
 // of pausing a workflow when the workflow is not in cache
-func (suite *JobTestSuite) TestPauseWorkflowNotExistInCacheSuccess() {
+func (suite *jobTestSuite) TestPauseWorkflowNotExistInCacheSuccess() {
 	oldConfigVersion := suite.job.runtime.GetConfigurationVersion()
 	oldWorkflowVersion := suite.job.runtime.GetWorkflowVersion()
 	desiredStateVersion := suite.job.runtime.GetDesiredStateVersion()
@@ -3235,8 +4127,8 @@ func (suite *JobTestSuite) TestPauseWorkflowNotExistInCacheSuccess() {
 			Return(&models.UpdateModel{
 				State: pbupdate.State_ROLLING_FORWARD,
 			}, nil),
-		suite.updateStore.EXPECT().
-			AddJobUpdateEvent(
+		suite.jobUpdateEventsOps.EXPECT().
+			Create(
 				gomock.Any(),
 				gomock.Any(),
 				gomock.Any(),
@@ -3261,7 +4153,7 @@ func (suite *JobTestSuite) TestPauseWorkflowNotExistInCacheSuccess() {
 
 // TestPauseWorkflowNoUpdate tests the case of update pause
 // when there is no update
-func (suite *JobTestSuite) TestPauseWorkflowNoUpdate() {
+func (suite *jobTestSuite) TestPauseWorkflowNoUpdate() {
 	entityVersion := versionutil.GetJobEntityVersion(
 		suite.job.runtime.GetConfigurationVersion(),
 		suite.job.runtime.GetDesiredStateVersion(),
@@ -3276,7 +4168,7 @@ func (suite *JobTestSuite) TestPauseWorkflowNoUpdate() {
 
 // TestAbortWorkflowSuccess tests the success case
 // of aborting a workflow
-func (suite *JobTestSuite) TestAbortWorkflowSuccess() {
+func (suite *jobTestSuite) TestAbortWorkflowSuccess() {
 	oldConfigVersion := suite.job.runtime.GetConfigurationVersion()
 	oldWorkflowVersion := suite.job.runtime.GetWorkflowVersion()
 	opaque := "test"
@@ -3301,8 +4193,8 @@ func (suite *JobTestSuite) TestAbortWorkflowSuccess() {
 		suite.jobIndexOps.EXPECT().
 			Update(gomock.Any(), suite.jobID, gomock.Any(), gomock.Any()).
 			Return(nil),
-		suite.updateStore.EXPECT().
-			AddJobUpdateEvent(
+		suite.jobUpdateEventsOps.EXPECT().
+			Create(
 				gomock.Any(),
 				gomock.Any(),
 				gomock.Any(),
@@ -3333,7 +4225,7 @@ func (suite *JobTestSuite) TestAbortWorkflowSuccess() {
 
 // TestAbortWorkflowWrongEntityVersionFailure tests the failure case
 // of aborting a workflow due to wrong entity version provided
-func (suite *JobTestSuite) TestAbortWorkflowWrongEntityVersionFailure() {
+func (suite *jobTestSuite) TestAbortWorkflowWrongEntityVersionFailure() {
 	updateID := &peloton.UpdateID{Value: testUpdateID}
 	suite.job.runtime.UpdateID = updateID
 	suite.job.workflows[updateID.GetValue()] = &update{
@@ -3357,7 +4249,7 @@ func (suite *JobTestSuite) TestAbortWorkflowWrongEntityVersionFailure() {
 
 // TestAbortWorkflowNilEntityVersionFailure tests the failure case
 // of aborting a workflow due to nil entity version provided
-func (suite *JobTestSuite) TestAbortWorkflowNilEntityVersionFailure() {
+func (suite *jobTestSuite) TestAbortWorkflowNilEntityVersionFailure() {
 	updateID := &peloton.UpdateID{Value: testUpdateID}
 	suite.job.runtime.UpdateID = updateID
 	suite.job.workflows[updateID.GetValue()] = &update{
@@ -3375,7 +4267,7 @@ func (suite *JobTestSuite) TestAbortWorkflowNilEntityVersionFailure() {
 
 // TestAbortWorkflowNotExistInCacheSuccess tests the success case
 // of aborting a workflow when the workflow is not in cache
-func (suite *JobTestSuite) TestAbortWorkflowNotExistInCacheSuccess() {
+func (suite *jobTestSuite) TestAbortWorkflowNotExistInCacheSuccess() {
 	oldConfigVersion := suite.job.runtime.GetConfigurationVersion()
 	oldWorkflowVersion := suite.job.runtime.GetWorkflowVersion()
 	desiredStateVersion := suite.job.runtime.GetDesiredStateVersion()
@@ -3404,8 +4296,8 @@ func (suite *JobTestSuite) TestAbortWorkflowNotExistInCacheSuccess() {
 				State: pbupdate.State_ROLLING_FORWARD,
 			}, nil),
 
-		suite.updateStore.EXPECT().
-			AddJobUpdateEvent(
+		suite.jobUpdateEventsOps.EXPECT().
+			Create(
 				gomock.Any(),
 				gomock.Any(),
 				gomock.Any(),
@@ -3435,7 +4327,7 @@ func (suite *JobTestSuite) TestAbortWorkflowNotExistInCacheSuccess() {
 
 // TestAbortWorkflowNoUpdate tests the case of update pause
 // when there is no update
-func (suite *JobTestSuite) TestAbortWorkflowNoUpdate() {
+func (suite *jobTestSuite) TestAbortWorkflowNoUpdate() {
 	entityVersion := versionutil.GetJobEntityVersion(
 		suite.job.runtime.GetConfigurationVersion(),
 		suite.job.runtime.GetDesiredStateVersion(),
@@ -3449,7 +4341,7 @@ func (suite *JobTestSuite) TestAbortWorkflowNoUpdate() {
 }
 
 // TestAddExistingWorkflow tests adding an already exist workflow
-func (suite *JobTestSuite) TestAddExistingWorkflow() {
+func (suite *jobTestSuite) TestAddExistingWorkflow() {
 	cachedUpdate := &update{
 		id:         &peloton.UpdateID{Value: testUpdateID},
 		jobFactory: suite.job.jobFactory,
@@ -3464,14 +4356,14 @@ func (suite *JobTestSuite) TestAddExistingWorkflow() {
 
 // TestAddExistingWorkflow tests adding a workflow
 // that does not exist
-func (suite *JobTestSuite) TestAddNonExistingWorkflow() {
+func (suite *jobTestSuite) TestAddNonExistingWorkflow() {
 	cachedUpdate := suite.job.AddWorkflow(&peloton.UpdateID{Value: testUpdateID})
 	suite.Equal(cachedUpdate.GetState().State, pbupdate.State_INVALID)
 	suite.NotNil(suite.job.workflows[testUpdateID])
 }
 
 // TestGetExistingWorkflow tests getting an already exist workflow
-func (suite *JobTestSuite) TestGetExistingWorkflow() {
+func (suite *jobTestSuite) TestGetExistingWorkflow() {
 	cachedUpdate := &update{
 		id:         &peloton.UpdateID{Value: testUpdateID},
 		jobFactory: suite.job.jobFactory,
@@ -3486,13 +4378,13 @@ func (suite *JobTestSuite) TestGetExistingWorkflow() {
 
 // TestGetNonExistingWorkflow tests getting a workflow
 // that does not exist
-func (suite *JobTestSuite) TestGetNonExistingWorkflow() {
+func (suite *jobTestSuite) TestGetNonExistingWorkflow() {
 	suite.Nil(suite.job.GetWorkflow(&peloton.UpdateID{Value: testUpdateID}))
 	suite.Nil(suite.job.workflows[testUpdateID])
 }
 
 // TestDeleteWorkflow tests clearing workflow
-func (suite *JobTestSuite) TestClearWorkflow() {
+func (suite *jobTestSuite) TestClearWorkflow() {
 	cachedUpdate := &update{
 		id:         &peloton.UpdateID{Value: testUpdateID},
 		jobFactory: suite.job.jobFactory,
@@ -3506,7 +4398,7 @@ func (suite *JobTestSuite) TestClearWorkflow() {
 
 // TestRollbackWorkflowSuccess tests the success case of
 // rollback a workflow
-func (suite *JobTestSuite) TestRollbackWorkflowSuccess() {
+func (suite *jobTestSuite) TestRollbackWorkflowSuccess() {
 	jobPrevVersion := uint64(1)
 	jobPrevConfig := &pbjob.JobConfig{
 		DefaultConfig: &pbtask.TaskConfig{
@@ -3550,8 +4442,11 @@ func (suite *JobTestSuite) TestRollbackWorkflowSuccess() {
 		taskRuntimes[i] = runtime
 	}
 
-	suite.jobConfigOps.EXPECT().Get(gomock.Any(), suite.jobID, jobPrevVersion).
-		Return(jobPrevConfig, nil, nil)
+	suite.jobConfigOps.EXPECT().GetResult(
+		gomock.Any(), suite.jobID, jobPrevVersion).
+		Return(&ormobjects.JobConfigOpsResult{
+			JobConfig: jobPrevConfig,
+		}, nil)
 
 	suite.jobStore.EXPECT().
 		GetMaxJobConfigVersion(gomock.Any(), suite.jobID.GetValue()).
@@ -3563,11 +4458,13 @@ func (suite *JobTestSuite) TestRollbackWorkflowSuccess() {
 			suite.jobID,
 			gomock.Any(),
 			gomock.Any(),
+			gomock.Any(),
 			gomock.Any()).
 		Do(func(_ context.Context,
 			_ *peloton.JobID,
 			config *pbjob.JobConfig,
 			_ *models.ConfigAddOn,
+			_ *stateless.JobSpec,
 			_ uint64,
 		) {
 			suite.Equal(config.ChangeLog.Version, jobVersion+1)
@@ -3577,10 +4474,11 @@ func (suite *JobTestSuite) TestRollbackWorkflowSuccess() {
 		Update(gomock.Any(), suite.jobID, gomock.Any(), gomock.Any()).
 		Return(nil)
 
-	suite.taskStore.EXPECT().
-		CreateTaskConfig(
+	suite.taskConfigV2Ops.EXPECT().
+		Create(
 			gomock.Any(),
 			suite.jobID,
+			gomock.Any(),
 			gomock.Any(),
 			gomock.Any(),
 			gomock.Any(),
@@ -3595,7 +4493,7 @@ func (suite *JobTestSuite) TestRollbackWorkflowSuccess() {
 		Return(taskRuntimes, nil)
 
 	for i := uint32(0); i < jobPrevConfig.GetInstanceCount(); i++ {
-		suite.taskStore.EXPECT().
+		suite.taskConfigV2Ops.EXPECT().
 			GetTaskConfig(gomock.Any(), suite.jobID, i, jobPrevVersion).
 			Return(&pbtask.TaskConfig{}, nil, nil)
 	}
@@ -3611,8 +4509,8 @@ func (suite *JobTestSuite) TestRollbackWorkflowSuccess() {
 			Return(nil)
 	}
 
-	suite.updateStore.EXPECT().
-		AddJobUpdateEvent(
+	suite.jobUpdateEventsOps.EXPECT().
+		Create(
 			gomock.Any(),
 			gomock.Any(),
 			gomock.Any(),
@@ -3652,7 +4550,7 @@ func (suite *JobTestSuite) TestRollbackWorkflowSuccess() {
 
 // TestRollbackWorkflowRecoverFailure tests the failure case of
 // rollback a workflow due to recover failure
-func (suite *JobTestSuite) TestRollbackWorkflowRecoverFailure() {
+func (suite *jobTestSuite) TestRollbackWorkflowRecoverFailure() {
 	cachedWorkflow := &update{}
 	cachedWorkflow.state = pbupdate.State_INVALID
 	cachedWorkflow.workflowType = models.WorkflowType_UPDATE
@@ -3670,14 +4568,8 @@ func (suite *JobTestSuite) TestRollbackWorkflowRecoverFailure() {
 
 // TestRollbackWorkflowGetPrevConfigFailure tests the failure case of
 // rollback a workflow due to unable get prev job config
-func (suite *JobTestSuite) TestRollbackWorkflowGetPrevConfigFailure() {
+func (suite *jobTestSuite) TestRollbackWorkflowGetPrevConfigFailure() {
 	jobPrevVersion := uint64(1)
-	jobPrevConfig := &pbjob.JobConfig{
-		ChangeLog: &peloton.ChangeLog{
-			Version: jobPrevVersion,
-		},
-		InstanceCount: 5,
-	}
 
 	jobVersion := uint64(2)
 	jobConfig := &pbjob.JobConfig{
@@ -3708,15 +4600,16 @@ func (suite *JobTestSuite) TestRollbackWorkflowGetPrevConfigFailure() {
 		taskRuntimes[i] = runtime
 	}
 
-	suite.jobConfigOps.EXPECT().Get(gomock.Any(), suite.jobID, jobPrevVersion).
-		Return(jobPrevConfig, nil, yarpcerrors.InternalErrorf("test error"))
+	suite.jobConfigOps.EXPECT().GetResult(
+		gomock.Any(), suite.jobID, jobPrevVersion).
+		Return(nil, yarpcerrors.InternalErrorf("test error"))
 
 	suite.Error(suite.job.RollbackWorkflow(context.Background()))
 }
 
 // TestRollbackWorkflowGetTargetConfigFailure tests the failure case of
 // rollback a workflow due to unable get target job config
-func (suite *JobTestSuite) TestRollbackWorkflowGetTargetConfigFailure() {
+func (suite *jobTestSuite) TestRollbackWorkflowGetTargetConfigFailure() {
 	jobPrevVersion := uint64(1)
 	jobPrevConfig := &pbjob.JobConfig{
 		DefaultConfig: &pbtask.TaskConfig{},
@@ -3756,8 +4649,11 @@ func (suite *JobTestSuite) TestRollbackWorkflowGetTargetConfigFailure() {
 		taskRuntimes[i] = runtime
 	}
 
-	suite.jobConfigOps.EXPECT().Get(gomock.Any(), suite.jobID, jobPrevVersion).
-		Return(jobPrevConfig, nil, nil)
+	suite.jobConfigOps.EXPECT().GetResult(
+		gomock.Any(), suite.jobID, jobPrevVersion).
+		Return(&ormobjects.JobConfigOpsResult{
+			JobConfig: jobPrevConfig,
+		}, nil)
 
 	suite.jobStore.EXPECT().
 		GetMaxJobConfigVersion(gomock.Any(), suite.jobID.GetValue()).
@@ -3769,11 +4665,13 @@ func (suite *JobTestSuite) TestRollbackWorkflowGetTargetConfigFailure() {
 			suite.jobID,
 			gomock.Any(),
 			gomock.Any(),
+			gomock.Any(),
 			gomock.Any()).
 		Do(func(_ context.Context,
 			_ *peloton.JobID,
 			config *pbjob.JobConfig,
 			_ *models.ConfigAddOn,
+			_ *stateless.JobSpec,
 			_ uint64,
 		) {
 			suite.Equal(config.ChangeLog.Version, jobVersion+1)
@@ -3783,10 +4681,11 @@ func (suite *JobTestSuite) TestRollbackWorkflowGetTargetConfigFailure() {
 		Update(gomock.Any(), suite.jobID, gomock.Any(), gomock.Any()).
 		Return(nil)
 
-	suite.taskStore.EXPECT().
-		CreateTaskConfig(
+	suite.taskConfigV2Ops.EXPECT().
+		Create(
 			gomock.Any(),
 			suite.jobID,
+			gomock.Any(),
 			gomock.Any(),
 			gomock.Any(),
 			gomock.Any(),
@@ -3794,14 +4693,14 @@ func (suite *JobTestSuite) TestRollbackWorkflowGetTargetConfigFailure() {
 		).Return(nil)
 
 	suite.jobConfigOps.EXPECT().Get(gomock.Any(), suite.jobID, jobVersion).
-		Return(jobConfig, nil, yarpcerrors.InternalErrorf("test error"))
+		Return(nil, nil, yarpcerrors.InternalErrorf("test error"))
 
 	suite.Error(suite.job.RollbackWorkflow(context.Background()))
 }
 
 // TestRollbackWorkflowCopyConfigFailure tests the failure case of
 // rollback a workflow due to config copy
-func (suite *JobTestSuite) TestRollbackWorkflowCopyConfigFailure() {
+func (suite *jobTestSuite) TestRollbackWorkflowCopyConfigFailure() {
 	jobPrevVersion := uint64(1)
 	jobPrevConfig := &pbjob.JobConfig{
 		DefaultConfig: &pbtask.TaskConfig{},
@@ -3841,8 +4740,11 @@ func (suite *JobTestSuite) TestRollbackWorkflowCopyConfigFailure() {
 		taskRuntimes[i] = runtime
 	}
 
-	suite.jobConfigOps.EXPECT().Get(gomock.Any(), suite.jobID, jobPrevVersion).
-		Return(jobPrevConfig, nil, nil)
+	suite.jobConfigOps.EXPECT().GetResult(
+		gomock.Any(), suite.jobID, jobPrevVersion).
+		Return(&ormobjects.JobConfigOpsResult{
+			JobConfig: jobPrevConfig,
+		}, nil)
 
 	suite.jobStore.EXPECT().
 		GetMaxJobConfigVersion(gomock.Any(), suite.jobID.GetValue()).
@@ -3854,11 +4756,13 @@ func (suite *JobTestSuite) TestRollbackWorkflowCopyConfigFailure() {
 			suite.jobID,
 			gomock.Any(),
 			gomock.Any(),
+			gomock.Any(),
 			gomock.Any()).
 		Do(func(_ context.Context,
 			_ *peloton.JobID,
 			config *pbjob.JobConfig,
 			_ *models.ConfigAddOn,
+			_ *stateless.JobSpec,
 			_ uint64,
 		) {
 			suite.Equal(config.ChangeLog.Version, jobVersion+1)
@@ -3868,10 +4772,11 @@ func (suite *JobTestSuite) TestRollbackWorkflowCopyConfigFailure() {
 		Update(gomock.Any(), suite.jobID, gomock.Any(), gomock.Any()).
 		Return(nil)
 
-	suite.taskStore.EXPECT().
-		CreateTaskConfig(
+	suite.taskConfigV2Ops.EXPECT().
+		Create(
 			gomock.Any(),
 			suite.jobID,
+			gomock.Any(),
 			gomock.Any(),
 			gomock.Any(),
 			gomock.Any(),
@@ -3883,7 +4788,7 @@ func (suite *JobTestSuite) TestRollbackWorkflowCopyConfigFailure() {
 
 // TestRollbackWorkflowNoWorkflow tests the case of
 // rollback a workflow whe the job does not have one
-func (suite *JobTestSuite) TestRollbackWorkflowNoWorkflow() {
+func (suite *jobTestSuite) TestRollbackWorkflowNoWorkflow() {
 	jobPrevVersion := uint64(1)
 
 	jobVersion := uint64(2)
@@ -3903,7 +4808,7 @@ func (suite *JobTestSuite) TestRollbackWorkflowNoWorkflow() {
 
 // TestRollbackWorkflowSuccessAfterModifyUpdateFails tests workflow rollback can
 // be retried successfully after it fails due to updateStore.ModifyUpdate
-func (suite *JobTestSuite) TestRollbackWorkflowSuccessAfterModifyUpdateFails() {
+func (suite *jobTestSuite) TestRollbackWorkflowSuccessAfterModifyUpdateFails() {
 	jobPrevVersion := uint64(1)
 	jobPrevConfig := &pbjob.JobConfig{
 		DefaultConfig: &pbtask.TaskConfig{
@@ -3947,8 +4852,11 @@ func (suite *JobTestSuite) TestRollbackWorkflowSuccessAfterModifyUpdateFails() {
 		taskRuntimes[i] = runtime
 	}
 
-	suite.jobConfigOps.EXPECT().Get(gomock.Any(), suite.jobID, jobPrevVersion).
-		Return(proto.Clone(jobPrevConfig).(*pbjob.JobConfig), nil, nil)
+	suite.jobConfigOps.EXPECT().GetResult(
+		gomock.Any(), suite.jobID, jobPrevVersion).
+		Return(&ormobjects.JobConfigOpsResult{
+			JobConfig: proto.Clone(jobPrevConfig).(*pbjob.JobConfig),
+		}, nil)
 
 	suite.jobStore.EXPECT().
 		GetMaxJobConfigVersion(gomock.Any(), suite.jobID.GetValue()).
@@ -3960,11 +4868,13 @@ func (suite *JobTestSuite) TestRollbackWorkflowSuccessAfterModifyUpdateFails() {
 			suite.jobID,
 			gomock.Any(),
 			gomock.Any(),
+			gomock.Any(),
 			gomock.Any()).
 		Do(func(_ context.Context,
 			_ *peloton.JobID,
 			config *pbjob.JobConfig,
 			_ *models.ConfigAddOn,
+			_ *stateless.JobSpec,
 			_ uint64,
 		) {
 			suite.Equal(config.ChangeLog.Version, jobVersion+1)
@@ -3974,10 +4884,11 @@ func (suite *JobTestSuite) TestRollbackWorkflowSuccessAfterModifyUpdateFails() {
 		Update(gomock.Any(), suite.jobID, gomock.Any(), gomock.Any()).
 		Return(nil)
 
-	suite.taskStore.EXPECT().
-		CreateTaskConfig(
+	suite.taskConfigV2Ops.EXPECT().
+		Create(
 			gomock.Any(),
 			suite.jobID,
+			gomock.Any(),
 			gomock.Any(),
 			gomock.Any(),
 			gomock.Any(),
@@ -3992,7 +4903,7 @@ func (suite *JobTestSuite) TestRollbackWorkflowSuccessAfterModifyUpdateFails() {
 		Return(taskRuntimes, nil)
 
 	for i := uint32(0); i < jobPrevConfig.GetInstanceCount(); i++ {
-		suite.taskStore.EXPECT().
+		suite.taskConfigV2Ops.EXPECT().
 			GetTaskConfig(gomock.Any(), suite.jobID, i, jobPrevVersion).
 			Return(&pbtask.TaskConfig{}, nil, nil)
 	}
@@ -4008,8 +4919,8 @@ func (suite *JobTestSuite) TestRollbackWorkflowSuccessAfterModifyUpdateFails() {
 			Return(nil)
 	}
 
-	suite.updateStore.EXPECT().
-		AddJobUpdateEvent(
+	suite.jobUpdateEventsOps.EXPECT().
+		Create(
 			gomock.Any(),
 			gomock.Any(),
 			gomock.Any(),
@@ -4053,10 +4964,14 @@ func (suite *JobTestSuite) TestRollbackWorkflowSuccessAfterModifyUpdateFails() {
 					Type:                 models.WorkflowType_UPDATE,
 				}, nil),
 
-		suite.jobConfigOps.EXPECT().Get(gomock.Any(), suite.jobID, jobPrevVersion).
-			Return(proto.Clone(jobPrevConfig).(*pbjob.JobConfig), nil, nil),
+		suite.jobConfigOps.EXPECT().GetResult(
+			gomock.Any(), suite.jobID, jobPrevVersion).
+			Return(&ormobjects.JobConfigOpsResult{
+				JobConfig: proto.Clone(jobPrevConfig).(*pbjob.JobConfig),
+			}, nil),
 
-		suite.jobConfigOps.EXPECT().Get(gomock.Any(), suite.jobID, jobPrevVersion).
+		suite.jobConfigOps.EXPECT().Get(
+			gomock.Any(), suite.jobID, jobPrevVersion).
 			Return(proto.Clone(jobPrevConfig).(*pbjob.JobConfig), nil, nil),
 
 		suite.jobStore.EXPECT().
@@ -4069,11 +4984,13 @@ func (suite *JobTestSuite) TestRollbackWorkflowSuccessAfterModifyUpdateFails() {
 				suite.jobID,
 				gomock.Any(),
 				gomock.Any(),
+				gomock.Any(),
 				gomock.Any()).
 			Do(func(_ context.Context,
 				_ *peloton.JobID,
 				config *pbjob.JobConfig,
 				_ *models.ConfigAddOn,
+				_ *stateless.JobSpec,
 				_ uint64,
 			) {
 				suite.Equal(config.ChangeLog.Version, newMaxJobVersion+1)
@@ -4083,25 +5000,27 @@ func (suite *JobTestSuite) TestRollbackWorkflowSuccessAfterModifyUpdateFails() {
 			Update(gomock.Any(), suite.jobID, gomock.Any(), gomock.Any()).
 			Return(nil),
 
-		suite.taskStore.EXPECT().
-			CreateTaskConfig(
+		suite.taskConfigV2Ops.EXPECT().
+			Create(
 				gomock.Any(),
 				suite.jobID,
 				gomock.Any(),
 				gomock.Any(),
 				gomock.Any(),
 				gomock.Any(),
+				gomock.Any(),
 			).Return(nil).AnyTimes(),
 
-		suite.jobConfigOps.EXPECT().Get(gomock.Any(), suite.jobID, jobVersion).
+		suite.jobConfigOps.EXPECT().Get(
+			gomock.Any(), suite.jobID, jobVersion).
 			Return(proto.Clone(jobConfig).(*pbjob.JobConfig), nil, nil),
 
 		suite.taskStore.EXPECT().
 			GetTaskRuntimesForJobByRange(gomock.Any(), suite.jobID, nil).
 			Return(taskRuntimes, nil),
 
-		suite.updateStore.EXPECT().
-			AddJobUpdateEvent(
+		suite.jobUpdateEventsOps.EXPECT().
+			Create(
 				gomock.Any(),
 				gomock.Any(),
 				gomock.Any(),
@@ -4131,11 +5050,12 @@ func (suite *JobTestSuite) TestRollbackWorkflowSuccessAfterModifyUpdateFails() {
 	)
 
 	suite.NoError(suite.job.RollbackWorkflow(context.Background()))
+
 }
 
 // TestRollbackWorkflowSuccessAfterJobRuntimeUpdateDBWriteFails tests workflow rollback can
 // be retried successfully after it fails due to job runtime update failure
-func (suite *JobTestSuite) TestRollbackWorkflowSuccessAfterJobRuntimeUpdateDBWriteFails() {
+func (suite *jobTestSuite) TestRollbackWorkflowSuccessAfterJobRuntimeUpdateDBWriteFails() {
 	jobPrevVersion := uint64(1)
 	jobPrevConfig := &pbjob.JobConfig{
 		DefaultConfig: &pbtask.TaskConfig{},
@@ -4175,8 +5095,11 @@ func (suite *JobTestSuite) TestRollbackWorkflowSuccessAfterJobRuntimeUpdateDBWri
 		taskRuntimes[i] = runtime
 	}
 
-	suite.jobConfigOps.EXPECT().Get(gomock.Any(), suite.jobID, jobPrevVersion).
-		Return(jobPrevConfig, nil, nil)
+	suite.jobConfigOps.EXPECT().GetResult(
+		gomock.Any(), suite.jobID, jobPrevVersion).
+		Return(&ormobjects.JobConfigOpsResult{
+			JobConfig: jobPrevConfig,
+		}, nil)
 
 	suite.jobStore.EXPECT().
 		GetMaxJobConfigVersion(gomock.Any(), suite.jobID.GetValue()).
@@ -4188,11 +5111,13 @@ func (suite *JobTestSuite) TestRollbackWorkflowSuccessAfterJobRuntimeUpdateDBWri
 			suite.jobID,
 			gomock.Any(),
 			gomock.Any(),
+			gomock.Any(),
 			gomock.Any()).
 		Do(func(_ context.Context,
 			_ *peloton.JobID,
 			config *pbjob.JobConfig,
 			_ *models.ConfigAddOn,
+			_ *stateless.JobSpec,
 			_ uint64,
 		) {
 			suite.Equal(config.ChangeLog.Version, jobVersion+1)
@@ -4202,17 +5127,19 @@ func (suite *JobTestSuite) TestRollbackWorkflowSuccessAfterJobRuntimeUpdateDBWri
 		Update(gomock.Any(), suite.jobID, gomock.Any(), gomock.Any()).
 		Return(nil)
 
-	suite.taskStore.EXPECT().
-		CreateTaskConfig(
+	suite.taskConfigV2Ops.EXPECT().
+		Create(
 			gomock.Any(),
 			suite.jobID,
+			gomock.Any(),
 			gomock.Any(),
 			gomock.Any(),
 			gomock.Any(),
 			jobVersion+1,
 		).Return(nil)
 
-	suite.jobConfigOps.EXPECT().Get(gomock.Any(), suite.jobID, jobVersion).
+	suite.jobConfigOps.EXPECT().Get(
+		gomock.Any(), suite.jobID, jobVersion).
 		Return(jobConfig, nil, nil)
 
 	suite.taskStore.EXPECT().
@@ -4220,7 +5147,7 @@ func (suite *JobTestSuite) TestRollbackWorkflowSuccessAfterJobRuntimeUpdateDBWri
 		Return(taskRuntimes, nil)
 
 	for i := uint32(0); i < jobPrevConfig.GetInstanceCount(); i++ {
-		suite.taskStore.EXPECT().
+		suite.taskConfigV2Ops.EXPECT().
 			GetTaskConfig(gomock.Any(), suite.jobID, i, jobPrevVersion).
 			Return(&pbtask.TaskConfig{}, nil, nil)
 	}
@@ -4236,8 +5163,8 @@ func (suite *JobTestSuite) TestRollbackWorkflowSuccessAfterJobRuntimeUpdateDBWri
 			Return(nil).AnyTimes()
 	}
 
-	suite.updateStore.EXPECT().
-		AddJobUpdateEvent(
+	suite.jobUpdateEventsOps.EXPECT().
+		Create(
 			gomock.Any(),
 			gomock.Any(),
 			gomock.Any(),
@@ -4289,7 +5216,7 @@ func (suite *JobTestSuite) TestRollbackWorkflowSuccessAfterJobRuntimeUpdateDBWri
 // TestRollbackWorkflowSuccessAfterJobRuntimeDBWriteSucceedsWithError tests workflow rollback can
 // be retried successfully after it fails due to job runtime update failure, but the runtime
 // is actually persisted in db
-func (suite *JobTestSuite) TestRollbackWorkflowSuccessAfterJobRuntimeDBWriteSucceedsWithError() {
+func (suite *jobTestSuite) TestRollbackWorkflowSuccessAfterJobRuntimeDBWriteSucceedsWithError() {
 	jobPrevVersion := uint64(1)
 	jobPrevConfig := &pbjob.JobConfig{
 		DefaultConfig: &pbtask.TaskConfig{},
@@ -4329,8 +5256,11 @@ func (suite *JobTestSuite) TestRollbackWorkflowSuccessAfterJobRuntimeDBWriteSucc
 		taskRuntimes[i] = runtime
 	}
 
-	suite.jobConfigOps.EXPECT().Get(gomock.Any(), suite.jobID, jobPrevVersion).
-		Return(jobPrevConfig, nil, nil)
+	suite.jobConfigOps.EXPECT().GetResult(
+		gomock.Any(), suite.jobID, jobPrevVersion).
+		Return(&ormobjects.JobConfigOpsResult{
+			JobConfig: jobPrevConfig,
+		}, nil)
 
 	suite.jobStore.EXPECT().
 		GetMaxJobConfigVersion(gomock.Any(), suite.jobID.GetValue()).
@@ -4342,11 +5272,13 @@ func (suite *JobTestSuite) TestRollbackWorkflowSuccessAfterJobRuntimeDBWriteSucc
 			suite.jobID,
 			gomock.Any(),
 			gomock.Any(),
+			gomock.Any(),
 			gomock.Any()).
 		Do(func(_ context.Context,
 			_ *peloton.JobID,
 			config *pbjob.JobConfig,
 			_ *models.ConfigAddOn,
+			_ *stateless.JobSpec,
 			_ uint64,
 		) {
 			suite.Equal(config.ChangeLog.Version, jobVersion+1)
@@ -4356,17 +5288,19 @@ func (suite *JobTestSuite) TestRollbackWorkflowSuccessAfterJobRuntimeDBWriteSucc
 		Update(gomock.Any(), suite.jobID, gomock.Any(), gomock.Any()).
 		Return(nil)
 
-	suite.taskStore.EXPECT().
-		CreateTaskConfig(
+	suite.taskConfigV2Ops.EXPECT().
+		Create(
 			gomock.Any(),
 			suite.jobID,
+			gomock.Any(),
 			gomock.Any(),
 			gomock.Any(),
 			gomock.Any(),
 			jobVersion+1,
 		).Return(nil)
 
-	suite.jobConfigOps.EXPECT().Get(gomock.Any(), suite.jobID, jobVersion).
+	suite.jobConfigOps.EXPECT().Get(
+		gomock.Any(), suite.jobID, jobVersion).
 		Return(jobConfig, nil, nil)
 
 	suite.taskStore.EXPECT().
@@ -4374,7 +5308,7 @@ func (suite *JobTestSuite) TestRollbackWorkflowSuccessAfterJobRuntimeDBWriteSucc
 		Return(taskRuntimes, nil)
 
 	for i := uint32(0); i < jobPrevConfig.GetInstanceCount(); i++ {
-		suite.taskStore.EXPECT().
+		suite.taskConfigV2Ops.EXPECT().
 			GetTaskConfig(gomock.Any(), suite.jobID, i, jobPrevVersion).
 			Return(&pbtask.TaskConfig{}, nil, nil)
 	}
@@ -4390,8 +5324,8 @@ func (suite *JobTestSuite) TestRollbackWorkflowSuccessAfterJobRuntimeDBWriteSucc
 			Return(nil).AnyTimes()
 	}
 
-	suite.updateStore.EXPECT().
-		AddJobUpdateEvent(
+	suite.jobUpdateEventsOps.EXPECT().
+		Create(
 			gomock.Any(),
 			gomock.Any(),
 			gomock.Any(),
@@ -4431,7 +5365,7 @@ func (suite *JobTestSuite) TestRollbackWorkflowSuccessAfterJobRuntimeDBWriteSucc
 }
 
 // TestJobCreateTaskConfigsSuccess tests success case of creating task configurations
-func (suite *JobTestSuite) TestJobCreateTaskConfigsSuccess() {
+func (suite *jobTestSuite) TestJobCreateTaskConfigsSuccess() {
 	instanceCount := uint32(10)
 	jobConfig := &pbjob.JobConfig{
 		ChangeLog: &peloton.ChangeLog{
@@ -4469,24 +5403,26 @@ func (suite *JobTestSuite) TestJobCreateTaskConfigsSuccess() {
 		},
 	}
 
-	suite.taskStore.EXPECT().
-		CreateTaskConfig(
+	suite.taskConfigV2Ops.EXPECT().
+		Create(
 			gomock.Any(),
 			suite.jobID,
 			int64(-1),
 			jobConfig.GetDefaultConfig(),
 			gomock.Any(),
+			nil,
 			jobConfig.GetChangeLog().GetVersion()).
 		Return(nil)
 
 	for i, taskConfig := range jobConfig.GetInstanceConfig() {
-		suite.taskStore.EXPECT().
-			CreateTaskConfig(
+		suite.taskConfigV2Ops.EXPECT().
+			Create(
 				gomock.Any(),
 				suite.jobID,
 				int64(i),
 				taskConfig,
 				gomock.Any(),
+				nil,
 				jobConfig.GetChangeLog().GetVersion()).
 			Return(nil)
 	}
@@ -4497,13 +5433,99 @@ func (suite *JobTestSuite) TestJobCreateTaskConfigsSuccess() {
 			suite.jobID,
 			jobConfig,
 			&models.ConfigAddOn{},
+			nil,
+		),
+	)
+}
+
+// TestJobCreateTaskConfigsWithSpec tests success case of creating
+// task configs along with with pod spec
+func (suite *jobTestSuite) TestJobCreateTaskConfigsWithSpec() {
+	instanceCount := uint32(10)
+	jobConfig := &pbjob.JobConfig{
+		ChangeLog: &peloton.ChangeLog{
+			Version: 1,
+		},
+		DefaultConfig: &pbtask.TaskConfig{
+			Name: "instance",
+			Resource: &pbtask.ResourceConfig{
+				CpuLimit:    0.8,
+				MemLimitMb:  800,
+				DiskLimitMb: 1500,
+			},
+		},
+		InstanceCount: instanceCount,
+		InstanceConfig: map[uint32]*pbtask.TaskConfig{
+			2: {
+				Name: "instance2",
+				Resource: &pbtask.ResourceConfig{
+					CpuLimit:    1,
+					MemLimitMb:  500,
+					DiskLimitMb: 1000,
+				},
+			},
+			4: {
+				Name: "instance4",
+				Resource: &pbtask.ResourceConfig{
+					CpuLimit:    1,
+					MemLimitMb:  600,
+					DiskLimitMb: 1200,
+				},
+			},
+		},
+	}
+
+	podSpec := &pbpod.PodSpec{
+		PodName:    &v1alphapeloton.PodName{Value: "test-pod"},
+		Containers: []*pbpod.ContainerSpec{{}},
+	}
+	jobSpec := &stateless.JobSpec{
+		DefaultSpec: podSpec,
+		InstanceSpec: map[uint32]*pbpod.PodSpec{
+			2: podSpec,
+			4: podSpec,
+		},
+		Revision: &v1alphapeloton.Revision{Version: 1},
+	}
+
+	suite.taskConfigV2Ops.EXPECT().
+		Create(
+			gomock.Any(),
+			suite.jobID,
+			int64(-1),
+			jobConfig.GetDefaultConfig(),
+			gomock.Any(),
+			jobSpec.GetDefaultSpec(),
+			jobConfig.GetChangeLog().GetVersion()).
+		Return(nil)
+
+	for i, taskConfig := range jobConfig.GetInstanceConfig() {
+		suite.taskConfigV2Ops.EXPECT().
+			Create(
+				gomock.Any(),
+				suite.jobID,
+				int64(i),
+				taskConfig,
+				gomock.Any(),
+				podSpec,
+				jobConfig.GetChangeLog().GetVersion()).
+			Return(nil)
+	}
+
+	suite.NoError(
+		suite.job.CreateTaskConfigs(
+			context.Background(),
+			suite.jobID,
+			jobConfig,
+			&models.ConfigAddOn{},
+			jobSpec,
 		),
 	)
 }
 
 // TestJobCreateTaskConfigsNoDefaultConfigSuccess tests success case of
 // creating task configurations without task config
-func (suite *JobTestSuite) TestJobCreateTaskConfigsNoDefaultConfigSuccess() {
+func (suite *jobTestSuite) TestJobCreateTaskConfigsNoDefaultConfigSuccess() {
 	instanceCount := uint32(10)
 	jobConfig := &pbjob.JobConfig{
 		ChangeLog: &peloton.ChangeLog{
@@ -4534,13 +5556,14 @@ func (suite *JobTestSuite) TestJobCreateTaskConfigsNoDefaultConfigSuccess() {
 	}
 
 	for i, taskConfig := range jobConfig.GetInstanceConfig() {
-		suite.taskStore.EXPECT().
-			CreateTaskConfig(
+		suite.taskConfigV2Ops.EXPECT().
+			Create(
 				gomock.Any(),
 				suite.jobID,
 				int64(i),
 				taskConfig,
 				gomock.Any(),
+				nil,
 				jobConfig.GetChangeLog().GetVersion()).
 			Return(nil)
 	}
@@ -4551,13 +5574,14 @@ func (suite *JobTestSuite) TestJobCreateTaskConfigsNoDefaultConfigSuccess() {
 			suite.jobID,
 			jobConfig,
 			&models.ConfigAddOn{},
+			nil,
 		),
 	)
 }
 
 // TestJobCreateTaskConfigsFailureToCreateDefaultConfig tests failure
 // case of JobCreateTaskConfigs due to error while writing default config
-func (suite *JobTestSuite) TestJobCreateTaskConfigsFailureToCreateDefaultConfig() {
+func (suite *jobTestSuite) TestJobCreateTaskConfigsFailureToCreateDefaultConfig() {
 	instanceCount := uint32(10)
 	jobConfig := &pbjob.JobConfig{
 		ChangeLog: &peloton.ChangeLog{
@@ -4576,13 +5600,14 @@ func (suite *JobTestSuite) TestJobCreateTaskConfigsFailureToCreateDefaultConfig(
 		},
 	}
 
-	suite.taskStore.EXPECT().
-		CreateTaskConfig(
+	suite.taskConfigV2Ops.EXPECT().
+		Create(
 			gomock.Any(),
 			suite.jobID,
 			int64(-1),
 			jobConfig.GetDefaultConfig(),
 			gomock.Any(),
+			nil,
 			jobConfig.GetChangeLog().GetVersion()).
 		Return(yarpcerrors.InternalErrorf("test error"))
 
@@ -4592,11 +5617,12 @@ func (suite *JobTestSuite) TestJobCreateTaskConfigsFailureToCreateDefaultConfig(
 			suite.jobID,
 			jobConfig,
 			&models.ConfigAddOn{},
+			nil,
 		),
 	)
 }
 
-func (suite *JobTestSuite) TestGetCurrentAndGoalState() {
+func (suite *jobTestSuite) TestGetCurrentAndGoalState() {
 	currentState := suite.job.CurrentState()
 	suite.Equal(currentState.StateVersion, suite.job.runtime.GetStateVersion())
 	suite.Equal(currentState.State, suite.job.runtime.GetState())
@@ -4606,7 +5632,7 @@ func (suite *JobTestSuite) TestGetCurrentAndGoalState() {
 	suite.Equal(goalState.State, suite.job.runtime.GetGoalState())
 }
 
-func (suite *JobTestSuite) TestGetStateCount() {
+func (suite *jobTestSuite) TestGetStateCount() {
 	taskInfos := make(map[uint32]*pbtask.TaskInfo)
 	taskInfos[0] = &pbtask.TaskInfo{
 		Runtime: &pbtask.RuntimeInfo{
@@ -4663,7 +5689,7 @@ func (suite *JobTestSuite) TestGetStateCount() {
 
 // TestJobRollingCreateSuccess tests job
 // rolling create in cache and db
-func (suite *JobTestSuite) TestJobRollingCreateSuccess() {
+func (suite *jobTestSuite) TestJobRollingCreateSuccess() {
 	jobConfig := &pbjob.JobConfig{
 		InstanceCount: 10,
 		Type:          pbjob.JobType_SERVICE,
@@ -4690,8 +5716,8 @@ func (suite *JobTestSuite) TestJobRollingCreateSuccess() {
 		},
 	}
 
-	suite.jobStore.EXPECT().
-		AddActiveJob(gomock.Any(), suite.jobID).Return(nil)
+	suite.activeJobsOps.EXPECT().
+		Create(gomock.Any(), suite.jobID).Return(nil)
 
 	suite.jobRuntimeOps.EXPECT().
 		Upsert(gomock.Any(), suite.jobID, gomock.Any()).
@@ -4715,13 +5741,14 @@ func (suite *JobTestSuite) TestJobRollingCreateSuccess() {
 			suite.jobID,
 			gomock.Any(),
 			gomock.Any(),
+			gomock.Any(),
 			gomock.Any()).
 		Do(func(_ context.Context,
 			_ *peloton.JobID,
 			config *pbjob.JobConfig,
 			addOn *models.ConfigAddOn,
-			version uint64,
-		) {
+			_ *stateless.JobSpec,
+			version uint64) {
 			suite.Equal(version, uint64(jobmgrcommon.DummyConfigVersion))
 			suite.Equal(config.ChangeLog.Version, uint64(jobmgrcommon.DummyConfigVersion))
 			suite.Zero(config.InstanceCount)
@@ -4742,13 +5769,14 @@ func (suite *JobTestSuite) TestJobRollingCreateSuccess() {
 			suite.jobID,
 			gomock.Any(),
 			gomock.Any(),
+			gomock.Any(),
 			gomock.Any()).
 		Do(func(_ context.Context,
 			_ *peloton.JobID,
 			config *pbjob.JobConfig,
 			addOn *models.ConfigAddOn,
-			version uint64,
-		) {
+			_ *stateless.JobSpec,
+			version uint64) {
 			suite.Equal(version, uint64(1))
 			suite.Equal(config.ChangeLog.Version, uint64(1))
 			suite.Equal(config.InstanceCount, jobConfig.InstanceCount)
@@ -4768,10 +5796,12 @@ func (suite *JobTestSuite) TestJobRollingCreateSuccess() {
 		Return(nil).
 		Times(int(jobConfig.InstanceCount))
 
-	suite.updateStore.EXPECT().
-		AddJobUpdateEvent(
-			gomock.Any(), gomock.Any(),
-			gomock.Any(), gomock.Any()).
+	suite.jobUpdateEventsOps.EXPECT().
+		Create(
+			gomock.Any(),
+			gomock.Any(),
+			gomock.Any(),
+			gomock.Any()).
 		Return(nil)
 
 	suite.updateStore.EXPECT().
@@ -4793,6 +5823,7 @@ func (suite *JobTestSuite) TestJobRollingCreateSuccess() {
 		configAddOn,
 		nil,
 		nil,
+		nil,
 	)
 	suite.NoError(err)
 	config, err := suite.job.GetConfig(context.Background())
@@ -4812,7 +5843,7 @@ func (suite *JobTestSuite) TestJobRollingCreateSuccess() {
 // TestJobRollingCreateNilConfigFailure tests job
 // rolling create in cache and db fails due to nil
 // config
-func (suite *JobTestSuite) TestJobRollingCreateNilConfigFailure() {
+func (suite *jobTestSuite) TestJobRollingCreateNilConfigFailure() {
 	createdBy := "test"
 	configAddOn := &models.ConfigAddOn{
 		SystemLabels: []*peloton.Label{
@@ -4832,14 +5863,15 @@ func (suite *JobTestSuite) TestJobRollingCreateNilConfigFailure() {
 		configAddOn,
 		nil,
 		nil,
+		nil,
 	)
 	suite.Error(err)
 }
 
 // TestJobRollingCreateAddActiveJobFailure tests job
 // rolling create in cache and db fails due to call
-// to AddActiveJob fails
-func (suite *JobTestSuite) TestJobRollingCreateAddActiveJobFailure() {
+// to Create fails
+func (suite *jobTestSuite) TestJobRollingCreateAddActiveJobFailure() {
 	jobConfig := &pbjob.JobConfig{
 		InstanceCount: 10,
 		Type:          pbjob.JobType_SERVICE,
@@ -4866,14 +5898,15 @@ func (suite *JobTestSuite) TestJobRollingCreateAddActiveJobFailure() {
 		},
 	}
 
-	suite.jobStore.EXPECT().
-		AddActiveJob(gomock.Any(), suite.jobID).
+	suite.activeJobsOps.EXPECT().
+		Create(gomock.Any(), suite.jobID).
 		Return(yarpcerrors.InternalErrorf("test error"))
 
 	err := suite.job.RollingCreate(
 		context.Background(),
 		jobConfig,
 		configAddOn,
+		nil,
 		nil,
 		nil,
 	)
@@ -4883,7 +5916,7 @@ func (suite *JobTestSuite) TestJobRollingCreateAddActiveJobFailure() {
 // TestJobRollingCreateJobRuntimeFailure
 // tests job rolling create in cache and db fails due to
 // job_runtime create fails
-func (suite *JobTestSuite) TestJobRollingCreateJobRuntimeFailure() {
+func (suite *jobTestSuite) TestJobRollingCreateJobRuntimeFailure() {
 	jobConfig := &pbjob.JobConfig{
 		InstanceCount: 10,
 		Type:          pbjob.JobType_SERVICE,
@@ -4910,8 +5943,8 @@ func (suite *JobTestSuite) TestJobRollingCreateJobRuntimeFailure() {
 		},
 	}
 
-	suite.jobStore.EXPECT().
-		AddActiveJob(gomock.Any(), suite.jobID).Return(nil)
+	suite.activeJobsOps.EXPECT().
+		Create(gomock.Any(), suite.jobID).Return(nil)
 
 	suite.jobRuntimeOps.EXPECT().
 		Upsert(gomock.Any(), suite.jobID, gomock.Any()).
@@ -4931,12 +5964,13 @@ func (suite *JobTestSuite) TestJobRollingCreateJobRuntimeFailure() {
 		configAddOn,
 		nil,
 		nil,
+		nil,
 	)
 	suite.Error(err)
 }
 
 // TestGetTaskSpreadCounts tests JobSpreadCounts returned by GetTaskStateCounts
-func (suite *JobTestSuite) TestGetTaskSpreadCounts() {
+func (suite *jobTestSuite) TestGetTaskSpreadCounts() {
 	testcases := []struct {
 		isSpread                                bool
 		numTasksTotal, numTasksPlaced, numHosts uint32
@@ -4987,7 +6021,7 @@ func (suite *JobTestSuite) TestGetTaskSpreadCounts() {
 
 // TestGetCachedConfig tests getting the config for
 // the job when the job is present in the cache
-func (suite *JobTestSuite) TestGetCachedConfig() {
+func (suite *jobTestSuite) TestGetCachedConfig() {
 	cachedConfig := suite.job.GetCachedConfig()
 	suite.Equal(
 		suite.job.config.GetSLA().GetMaximumUnavailableInstances(),
@@ -5023,7 +6057,7 @@ func (suite *JobTestSuite) TestGetCachedConfig() {
 
 // TestGetCachedConfigNilConfig tests getting cached
 // job config when the job is not in cache
-func (suite *JobTestSuite) TestGetCachedConfigNilConfig() {
+func (suite *jobTestSuite) TestGetCachedConfigNilConfig() {
 	suite.job.config = nil
 	suite.Nil(suite.job.GetCachedConfig())
 }

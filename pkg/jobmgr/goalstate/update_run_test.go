@@ -60,6 +60,7 @@ type UpdateRunTestSuite struct {
 	cachedTask            *cachedmocks.MockTask
 	jobStore              *storemocks.MockJobStore
 	taskStore             *storemocks.MockTaskStore
+	mockedPodEventsOps    *objectmocks.MockPodEventsOps
 	jobConfigOps          *objectmocks.MockJobConfigOps
 	resmgrClient          *resmocks.MockResourceManagerServiceYARPCClient
 }
@@ -79,6 +80,7 @@ func (suite *UpdateRunTestSuite) SetupTest() {
 	suite.jobConfigOps = objectmocks.NewMockJobConfigOps(suite.ctrl)
 	suite.resmgrClient = resmocks.NewMockResourceManagerServiceYARPCClient(suite.ctrl)
 
+	suite.mockedPodEventsOps = objectmocks.NewMockPodEventsOps(suite.ctrl)
 	suite.goalStateDriver = &driver{
 		jobFactory:   suite.jobFactory,
 		updateEngine: suite.updateGoalStateEngine,
@@ -87,6 +89,7 @@ func (suite *UpdateRunTestSuite) SetupTest() {
 		jobStore:     suite.jobStore,
 		taskStore:    suite.taskStore,
 		jobConfigOps: suite.jobConfigOps,
+		podEventsOps: suite.mockedPodEventsOps,
 		mtx:          NewMetrics(tally.NoopScope),
 		cfg:          &Config{},
 		resmgrClient: suite.resmgrClient,
@@ -486,13 +489,14 @@ func (suite *UpdateRunTestSuite) TestRunningUpdateWithStartTasksOn() {
 	}
 
 	suite.cachedJob.EXPECT().
-		PatchTasks(gomock.Any(), gomock.Any()).
-		Do(func(_ context.Context, diffs map[uint32]jobmgrcommon.RuntimeDiff) {
+		PatchTasks(gomock.Any(), gomock.Any(), false).
+		Do(func(_ context.Context,
+			diffs map[uint32]jobmgrcommon.RuntimeDiff,
+			_ bool) {
 			suite.Equal(len(diffs), len(instancesTotal))
 			suite.Equal(diffs[0][jobmgrcommon.GoalStateField], pbtask.TaskState_RUNNING)
 			suite.Equal(diffs[1][jobmgrcommon.GoalStateField], pbtask.TaskState_RUNNING)
-		}).
-		Return(nil)
+		}).Return(nil, nil, nil)
 
 	suite.taskGoalStateEngine.EXPECT().
 		Enqueue(gomock.Any(), gomock.Any()).
@@ -713,13 +717,14 @@ func (suite *UpdateRunTestSuite) TestRunningInPlaceUpdate() {
 	}
 
 	suite.cachedJob.EXPECT().
-		PatchTasks(gomock.Any(), gomock.Any()).
-		Do(func(_ context.Context, diffs map[uint32]jobmgrcommon.RuntimeDiff) {
+		PatchTasks(gomock.Any(), gomock.Any(), false).
+		Do(func(_ context.Context,
+			diffs map[uint32]jobmgrcommon.RuntimeDiff,
+			_ bool) {
 			suite.Equal(len(diffs), len(instancesTotal))
 			suite.Equal(diffs[0][jobmgrcommon.DesiredHostField], "host1")
 			suite.Equal(diffs[1][jobmgrcommon.DesiredHostField], "host2")
-		}).
-		Return(nil)
+		}).Return(nil, nil, nil)
 
 	suite.taskGoalStateEngine.EXPECT().
 		Enqueue(gomock.Any(), gomock.Any()).
@@ -1196,8 +1201,8 @@ func (suite *UpdateRunTestSuite) TestUpdateRunFullyRunningAddInstances() {
 		suite.cachedTask.EXPECT().
 			GetRuntime(gomock.Any()).
 			Return(nil, yarpcerrors.NotFoundErrorf("not found"))
-		suite.taskStore.EXPECT().
-			GetPodEvents(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
+		suite.mockedPodEventsOps.EXPECT().
+			GetAll(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
 			Return(nil, nil)
 	}
 
@@ -1212,8 +1217,8 @@ func (suite *UpdateRunTestSuite) TestUpdateRunFullyRunningAddInstances() {
 		Return(&resmgrsvc.EnqueueGangsResponse{}, nil)
 
 	suite.cachedJob.EXPECT().
-		PatchTasks(gomock.Any(), gomock.Any()).
-		Return(nil)
+		PatchTasks(gomock.Any(), gomock.Any(), false).
+		Return(nil, nil, nil)
 
 	suite.cachedUpdate.EXPECT().
 		GetState().
@@ -1377,8 +1382,8 @@ func (suite *UpdateRunTestSuite) TestUpdateRunFullyRunningAddShrinkInstances() {
 		}
 		podEvents = append(podEvents, podEvent)
 
-		suite.taskStore.EXPECT().
-			GetPodEvents(gomock.Any(), suite.jobID.GetValue(), uint32(instID)).
+		suite.mockedPodEventsOps.EXPECT().
+			GetAll(gomock.Any(), suite.jobID.GetValue(), uint32(instID)).
 			Return(podEvents, nil)
 	}
 
@@ -1393,8 +1398,8 @@ func (suite *UpdateRunTestSuite) TestUpdateRunFullyRunningAddShrinkInstances() {
 		Return(&resmgrsvc.EnqueueGangsResponse{}, nil)
 
 	suite.cachedJob.EXPECT().
-		PatchTasks(gomock.Any(), gomock.Any()).
-		Return(nil)
+		PatchTasks(gomock.Any(), gomock.Any(), false).
+		Return(nil, nil, nil)
 
 	suite.cachedUpdate.EXPECT().
 		GetState().
@@ -1572,8 +1577,8 @@ func (suite *UpdateRunTestSuite) TestUpdateRunFullyRunningUpdateInstances() {
 		Times(int(batchSize))
 
 	suite.cachedJob.EXPECT().
-		PatchTasks(gomock.Any(), gomock.Any()).
-		Return(nil)
+		PatchTasks(gomock.Any(), gomock.Any(), false).
+		Return(nil, nil, nil)
 
 	suite.cachedUpdate.EXPECT().
 		GetState().
@@ -1718,8 +1723,8 @@ func (suite *UpdateRunTestSuite) TestUpdateRunContainsKilledTaskUpdateInstances(
 		}).Times(int(batchSize))
 
 	suite.cachedJob.EXPECT().
-		PatchTasks(gomock.Any(), gomock.Any()).
-		Return(nil)
+		PatchTasks(gomock.Any(), gomock.Any(), false).
+		Return(nil, nil, nil)
 
 	suite.cachedUpdate.EXPECT().
 		GetState().
@@ -1879,8 +1884,8 @@ func (suite *UpdateRunTestSuite) TestUpdateRunContainsTerminatedTaskInstances() 
 		}).Times(int(batchSize))
 
 	suite.cachedJob.EXPECT().
-		PatchTasks(gomock.Any(), gomock.Any()).
-		Return(nil)
+		PatchTasks(gomock.Any(), gomock.Any(), false).
+		Return(nil, nil, nil)
 
 	suite.cachedUpdate.EXPECT().
 		GetState().
@@ -2037,8 +2042,8 @@ func (suite *UpdateRunTestSuite) TestUpdateRunKilledJobAddInstances() {
 		suite.cachedJob.EXPECT().
 			GetTask(instID).
 			Return(nil)
-		suite.taskStore.EXPECT().
-			GetPodEvents(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
+		suite.mockedPodEventsOps.EXPECT().
+			GetAll(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
 			Return(nil, nil)
 	}
 
@@ -2182,8 +2187,8 @@ func (suite *UpdateRunTestSuite) TestUpdateRunDBErrorAddInstances() {
 		suite.cachedJob.EXPECT().
 			GetTask(instID).
 			Return(nil)
-		suite.taskStore.EXPECT().
-			GetPodEvents(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
+		suite.mockedPodEventsOps.EXPECT().
+			GetAll(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
 			Return(nil, nil)
 	}
 
@@ -2198,8 +2203,8 @@ func (suite *UpdateRunTestSuite) TestUpdateRunDBErrorAddInstances() {
 		Return(&resmgrsvc.EnqueueGangsResponse{}, nil)
 
 	suite.cachedJob.EXPECT().
-		PatchTasks(gomock.Any(), gomock.Any()).
-		Return(yarpcerrors.UnavailableErrorf("test error"))
+		PatchTasks(gomock.Any(), gomock.Any(), false).
+		Return(nil, nil, yarpcerrors.UnavailableErrorf("test error"))
 
 	err := UpdateRun(context.Background(), suite.updateEnt)
 	suite.Error(err)
@@ -2298,8 +2303,8 @@ func (suite *UpdateRunTestSuite) TestUpdateRunDBErrorUpdateInstances() {
 		}).Times(int(batchSize))
 
 	suite.cachedJob.EXPECT().
-		PatchTasks(gomock.Any(), gomock.Any()).
-		Return(yarpcerrors.UnavailableErrorf("test error"))
+		PatchTasks(gomock.Any(), gomock.Any(), false).
+		Return(nil, nil, yarpcerrors.UnavailableErrorf("test error"))
 
 	err := UpdateRun(context.Background(), suite.updateEnt)
 	suite.Error(err)
@@ -2408,8 +2413,8 @@ func (suite *UpdateRunTestSuite) TestRunningUpdateRemoveInstances() {
 		)
 
 	suite.cachedJob.EXPECT().
-		PatchTasks(gomock.Any(), gomock.Any()).
-		Do(func(_ context.Context, runtimes map[uint32]jobmgrcommon.RuntimeDiff) {
+		PatchTasks(gomock.Any(), gomock.Any(), false).
+		Do(func(_ context.Context, runtimes map[uint32]jobmgrcommon.RuntimeDiff, _ bool) {
 			suite.Equal(2, len(runtimes))
 			for _, runtime := range runtimes {
 				suite.Equal(pbtask.TaskState_DELETED, runtime[jobmgrcommon.GoalStateField])
@@ -2418,8 +2423,7 @@ func (suite *UpdateRunTestSuite) TestRunningUpdateRemoveInstances() {
 					Reason: pbtask.TerminationStatus_TERMINATION_STATUS_REASON_KILLED_FOR_UPDATE,
 				}, runtime[jobmgrcommon.TerminationStatusField])
 			}
-		}).
-		Return(nil)
+		}).Return(nil, nil, nil)
 
 	suite.cachedJob.EXPECT().
 		ID().
@@ -2552,8 +2556,8 @@ func (suite *UpdateRunTestSuite) TestRunningUpdateRemoveInstancesDBError() {
 		)
 
 	suite.cachedJob.EXPECT().
-		PatchTasks(gomock.Any(), gomock.Any()).
-		Return(fmt.Errorf("fake db error"))
+		PatchTasks(gomock.Any(), gomock.Any(), false).
+		Return(nil, nil, fmt.Errorf("fake db error"))
 
 	err := UpdateRun(context.Background(), suite.updateEnt)
 	suite.EqualError(err, "fake db error")
@@ -2823,14 +2827,15 @@ func (suite *UpdateRunTestSuite) TestRunningUpdateRolledBack() {
 		}, nil)
 
 	suite.cachedJob.EXPECT().
-		PatchTasks(gomock.Any(), gomock.Any()).
-		Do(func(_ context.Context, runtimeDiffs map[uint32]jobmgrcommon.RuntimeDiff) {
+		PatchTasks(gomock.Any(), gomock.Any(), false).
+		Do(func(_ context.Context,
+			runtimeDiffs map[uint32]jobmgrcommon.RuntimeDiff,
+			_ bool) {
 			suite.Len(runtimeDiffs, int(totalInstances)-len(totalInstancesToUpdate))
 			for i := uint32(len(totalInstancesToUpdate)); i < totalInstances; i++ {
 				suite.NotEmpty(runtimeDiffs[i])
 			}
-		}).
-		Return(nil)
+		}).Return(nil, nil, nil)
 
 	suite.cachedUpdate.EXPECT().
 		ID().

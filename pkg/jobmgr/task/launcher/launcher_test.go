@@ -35,13 +35,19 @@ import (
 	"github.com/uber/peloton/.gen/peloton/api/v0/peloton"
 	"github.com/uber/peloton/.gen/peloton/api/v0/task"
 	"github.com/uber/peloton/.gen/peloton/api/v0/volume"
+	v1alphapeloton "github.com/uber/peloton/.gen/peloton/api/v1alpha/peloton"
+	pbpod "github.com/uber/peloton/.gen/peloton/api/v1alpha/pod"
 	"github.com/uber/peloton/.gen/peloton/private/hostmgr/hostsvc"
 	host_mocks "github.com/uber/peloton/.gen/peloton/private/hostmgr/hostsvc/mocks"
+	pbhostmgr "github.com/uber/peloton/.gen/peloton/private/hostmgr/v1alpha"
+	"github.com/uber/peloton/.gen/peloton/private/hostmgr/v1alpha/svc"
+	v1host_mocks "github.com/uber/peloton/.gen/peloton/private/hostmgr/v1alpha/svc/mocks"
 	"github.com/uber/peloton/.gen/peloton/private/models"
 	"github.com/uber/peloton/.gen/peloton/private/resmgr"
 	"github.com/uber/peloton/pkg/storage/objects"
 	objectmocks "github.com/uber/peloton/pkg/storage/objects/mocks"
 
+	"github.com/uber/peloton/pkg/common/api"
 	"github.com/uber/peloton/pkg/common/backoff"
 	"github.com/uber/peloton/pkg/common/util"
 	cachedmocks "github.com/uber/peloton/pkg/jobmgr/cached/mocks"
@@ -74,12 +80,13 @@ type LauncherTestSuite struct {
 
 	ctrl            *gomock.Controller
 	mockHostMgr     *host_mocks.MockInternalHostServiceYARPCClient
-	mockTaskStore   *store_mocks.MockTaskStore
+	mockV1HostMgr   *v1host_mocks.MockHostManagerServiceYARPCClient
 	jobFactory      *cachedmocks.MockJobFactory
 	cachedJob       *cachedmocks.MockJob
 	cachedTask      *cachedmocks.MockTask
 	mockVolumeStore *store_mocks.MockPersistentVolumeStore
 	secretInfoOps   *objectmocks.MockSecretInfoOps
+	taskConfigV2Ops *objectmocks.MockTaskConfigV2Ops
 	testScope       tally.TestScope
 	metrics         *Metrics
 	taskLauncher    launcher
@@ -93,23 +100,28 @@ func (suite *LauncherTestSuite) SetupTest() {
 	suite.ctrl = gomock.NewController(suite.T())
 
 	suite.mockHostMgr = host_mocks.NewMockInternalHostServiceYARPCClient(suite.ctrl)
-	suite.mockTaskStore = store_mocks.NewMockTaskStore(suite.ctrl)
+	suite.mockV1HostMgr =
+		v1host_mocks.NewMockHostManagerServiceYARPCClient(suite.ctrl)
+	suite.taskConfigV2Ops = objectmocks.NewMockTaskConfigV2Ops(suite.ctrl)
+
 	suite.jobFactory = cachedmocks.NewMockJobFactory(suite.ctrl)
 	suite.cachedJob = cachedmocks.NewMockJob(suite.ctrl)
 	suite.cachedTask = cachedmocks.NewMockTask(suite.ctrl)
 	suite.mockVolumeStore = store_mocks.NewMockPersistentVolumeStore(suite.ctrl)
 	suite.secretInfoOps = objectmocks.NewMockSecretInfoOps(suite.ctrl)
+	suite.taskConfigV2Ops = objectmocks.NewMockTaskConfigV2Ops(suite.ctrl)
 
 	suite.testScope = tally.NewTestScope("", map[string]string{})
 	suite.metrics = NewMetrics(suite.testScope)
 	suite.taskLauncher = launcher{
-		hostMgrClient: suite.mockHostMgr,
-		jobFactory:    suite.jobFactory,
-		volumeStore:   suite.mockVolumeStore,
-		taskStore:     suite.mockTaskStore,
-		secretInfoOps: suite.secretInfoOps,
-		metrics:       suite.metrics,
-		retryPolicy:   backoff.NewRetryPolicy(5, 15*time.Millisecond),
+		hostMgrClient:        suite.mockHostMgr,
+		hostMgrV1AlphaClient: suite.mockV1HostMgr,
+		jobFactory:           suite.jobFactory,
+		volumeStore:          suite.mockVolumeStore,
+		taskConfigV2Ops:      suite.taskConfigV2Ops,
+		secretInfoOps:        suite.secretInfoOps,
+		metrics:              suite.metrics,
+		retryPolicy:          backoff.NewRetryPolicy(5, 15*time.Millisecond),
 	}
 }
 
@@ -139,6 +151,24 @@ func createTestTask(instanceID int) *LaunchableTaskInfo {
 			Runtime: &task.RuntimeInfo{
 				MesosTaskId: &mesos.TaskID{
 					Value: &tid,
+				},
+			},
+		},
+		Spec: &pbpod.PodSpec{
+			Containers: []*pbpod.ContainerSpec{
+				{
+					Name: tid,
+					Resource: &pbpod.ResourceSpec{
+						CpuLimit:   1.0,
+						MemLimitMb: 100.0,
+					},
+					Ports: []*pbpod.PortSpec{
+						{
+							Name:  "http",
+							Value: 8080,
+						},
+					},
+					Image: "test_image",
 				},
 			},
 		},
@@ -216,7 +246,7 @@ func (suite *LauncherTestSuite) TestGetLaunchableTasks() {
 		suite.cachedJob.EXPECT().
 			AddTask(gomock.Any(), uint32(instanceID)).
 			Return(suite.cachedTask, nil)
-		suite.mockTaskStore.EXPECT().
+		suite.taskConfigV2Ops.EXPECT().
 			GetTaskConfig(gomock.Any(), &peloton.JobID{Value: jobID}, uint32(instanceID), gomock.Any()).
 			Return(taskInfos[ptaskID].GetConfig(), &models.ConfigAddOn{}, nil)
 		suite.cachedTask.EXPECT().
@@ -318,7 +348,7 @@ func (suite *LauncherTestSuite) TestGetLaunchableTasksStateful() {
 		suite.cachedJob.EXPECT().
 			AddTask(gomock.Any(), uint32(instanceID)).
 			Return(suite.cachedTask, nil)
-		suite.mockTaskStore.EXPECT().
+		suite.taskConfigV2Ops.EXPECT().
 			GetTaskConfig(gomock.Any(), &peloton.JobID{Value: jobID}, uint32(instanceID), gomock.Any()).
 			Return(taskInfos[ptaskID].GetConfig(), &models.ConfigAddOn{}, nil)
 		suite.cachedTask.EXPECT().
@@ -413,6 +443,67 @@ func (suite *LauncherTestSuite) TestMultipleTasksLaunched() {
 	defer lock.Unlock()
 	suite.Equal(expectedLaunchedHosts, hostsLaunchedOn)
 	suite.Equal(taskConfigs, launchedTasks)
+}
+
+// TestLaunch tests the task launcher Launch API to launch pods
+func (suite *LauncherTestSuite) TestLaunch() {
+	// generate 25 test tasks
+	numTasks := 25
+	var launchablePods []*pbhostmgr.LaunchablePod
+	taskInfos := make(map[string]*LaunchableTaskInfo)
+	podSpecs := make(map[string]*pbpod.PodSpec)
+
+	for i := 0; i < numTasks; i++ {
+		tmp := createTestTask(i)
+		launchablePod := pbhostmgr.LaunchablePod{
+			PodId: &v1alphapeloton.PodID{
+				Value: tmp.GetRuntime().GetMesosTaskId().GetValue()},
+			Spec: tmp.Spec,
+		}
+
+		launchablePods = append(launchablePods, &launchablePod)
+		taskID := tmp.JobId.Value + "-" + fmt.Sprint(tmp.InstanceId)
+		taskInfos[taskID] = tmp
+		podSpecs[tmp.GetRuntime().GetMesosTaskId().GetValue()] = tmp.Spec
+	}
+
+	// generate 1 host offer, each can hold many tasks
+	rs := createResources(1)
+	hostOffer := createHostOffer(0, rs)
+	placement := createPlacementMultipleTasks(taskInfos, hostOffer)
+
+	// Capture LaunchTasks calls
+	hostsLaunchedOn := make(map[string]bool)
+	launchedPodSpecMap := make(map[string]*pbpod.PodSpec)
+
+	gomock.InOrder(
+		// Mock LaunchPods call.
+		suite.mockV1HostMgr.EXPECT().
+			LaunchPods(
+				gomock.Any(),
+				gomock.Any()).
+			Do(func(_ context.Context, reqBody interface{}) {
+				req := reqBody.(*svc.LaunchPodsRequest)
+				hostsLaunchedOn[req.Hostname] = true
+				for _, lp := range req.GetPods() {
+					launchedPodSpecMap[lp.PodId.GetValue()] = lp.Spec
+				}
+			}).
+			Return(&svc.LaunchPodsResponse{}, nil).
+			Times(1),
+	)
+
+	suite.taskLauncher.hmVersion = api.V1Alpha
+	skipped, err := suite.taskLauncher.Launch(
+		context.Background(), taskInfos, placement)
+	suite.NoError(err)
+	suite.Equal(0, len(skipped))
+	expectedLaunchedHosts := map[string]bool{
+		"hostname-0": true,
+	}
+	suite.Equal(expectedLaunchedHosts, hostsLaunchedOn)
+	suite.Equal(podSpecs, launchedPodSpecMap)
+	suite.taskLauncher.hmVersion = api.V0
 }
 
 // This test ensures that tasks got rescheduled when launched got invalid offer resp.
@@ -825,12 +916,11 @@ func (suite *LauncherTestSuite) TestCreateLaunchableTasks() {
 	}
 	suite.jobFactory.EXPECT().GetJob(tmp.JobId).Return(suite.cachedJob)
 	suite.cachedJob.EXPECT().
-		PatchTasks(gomock.Any(), gomock.Any()).
-		Do(func(ctx context.Context, runtimeDiffs map[uint32]jobmgrcommon.RuntimeDiff) {
+		PatchTasks(gomock.Any(), gomock.Any(), false).
+		Do(func(ctx context.Context, runtimeDiffs map[uint32]jobmgrcommon.RuntimeDiff, slaAware bool) {
 			suite.Equal(task.TaskState_KILLED, runtimeDiffs[0][jobmgrcommon.GoalStateField])
 			suite.Equal("REASON_SECRET_NOT_FOUND", runtimeDiffs[0][jobmgrcommon.ReasonField])
-		}).
-		Return(nil)
+		}).Return(nil, nil, nil)
 	suite.secretInfoOps.EXPECT().
 		GetSecret(gomock.Any(), idStr).
 		Return(nil, yarpcerrors.NotFoundErrorf(

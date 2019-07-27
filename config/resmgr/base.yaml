@@ -8,6 +8,7 @@ storage:
       contactPoints: ["127.0.0.1"]
       port: 9042
       consistency: LOCAL_QUORUM
+      serialConsistency: LOCAL_SERIAL
       hostPolicy: TokenAwareHostPolicy
       # Need to increase timeout from 10s to 20s to avoid recovery code from timing out
       # We saw recovery code timing out when peloton was recovering from a
@@ -28,6 +29,8 @@ resmgr:
     placing_timeout: 10m
     # Timeout for rm task in statemachine from launching to ready state
     launching_timeout: 20m
+    # Timeout for rm task in statemachine from preempting to running state
+    preempting_timeout: 10m
     # Timeout for rm task in statemachine from reserved to pending state
     reserving_timeout: 30m
     # This is the backoff period how much it will backoff

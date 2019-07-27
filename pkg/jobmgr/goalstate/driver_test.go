@@ -26,6 +26,7 @@ import (
 	"github.com/uber/peloton/.gen/peloton/api/v0/task"
 
 	"github.com/uber/peloton/pkg/common"
+	"github.com/uber/peloton/pkg/common/api"
 	"github.com/uber/peloton/pkg/common/goalstate"
 	goalstatemocks "github.com/uber/peloton/pkg/common/goalstate/mocks"
 	"github.com/uber/peloton/pkg/jobmgr/cached"
@@ -53,8 +54,10 @@ type DriverTestSuite struct {
 	taskGoalStateEngine   *goalstatemocks.MockEngine
 	jobStore              *storemocks.MockJobStore
 	taskStore             *storemocks.MockTaskStore
+	activeJobsOps         *objectmocks.MockActiveJobsOps
 	jobConfigOps          *objectmocks.MockJobConfigOps
 	jobRuntimeOps         *objectmocks.MockJobRuntimeOps
+	mockedPodEventsOps    *objectmocks.MockPodEventsOps
 	jobFactory            *cachedmocks.MockJobFactory
 	goalStateDriver       *driver
 	cachedJob             *cachedmocks.MockJob
@@ -74,17 +77,21 @@ func (suite *DriverTestSuite) SetupTest() {
 	suite.taskGoalStateEngine = goalstatemocks.NewMockEngine(suite.ctrl)
 	suite.jobStore = storemocks.NewMockJobStore(suite.ctrl)
 	suite.taskStore = storemocks.NewMockTaskStore(suite.ctrl)
+	suite.activeJobsOps = objectmocks.NewMockActiveJobsOps(suite.ctrl)
 	suite.jobConfigOps = objectmocks.NewMockJobConfigOps(suite.ctrl)
 	suite.jobRuntimeOps = objectmocks.NewMockJobRuntimeOps(suite.ctrl)
 	suite.jobFactory = cachedmocks.NewMockJobFactory(suite.ctrl)
+	suite.mockedPodEventsOps = objectmocks.NewMockPodEventsOps(suite.ctrl)
 	suite.goalStateDriver = &driver{
 		jobEngine:                     suite.jobGoalStateEngine,
 		taskEngine:                    suite.taskGoalStateEngine,
 		updateEngine:                  suite.updateGoalStateEngine,
 		jobStore:                      suite.jobStore,
 		taskStore:                     suite.taskStore,
+		activeJobsOps:                 suite.activeJobsOps,
 		jobConfigOps:                  suite.jobConfigOps,
 		jobRuntimeOps:                 suite.jobRuntimeOps,
+		podEventsOps:                  suite.mockedPodEventsOps,
 		jobFactory:                    suite.jobFactory,
 		mtx:                           NewMetrics(tally.NoopScope),
 		jobScope:                      tally.NoopScope,
@@ -133,6 +140,25 @@ func (suite *DriverTestSuite) TestNewDriver() {
 		tally.NoopScope,
 		config,
 		false,
+		api.V0,
+	)
+	suite.NotNil(dr)
+	suite.Equal(dr.(*driver).jobType, job.JobType_SERVICE)
+
+	dr = NewDriver(
+		dispatcher,
+		suite.jobStore,
+		suite.taskStore,
+		volumeStore,
+		updateStore,
+		&ormStore.Store{},
+		suite.jobFactory,
+		taskLauncher,
+		job.JobType_SERVICE,
+		tally.NoopScope,
+		config,
+		false,
+		api.V1Alpha,
 	)
 	suite.NotNil(dr)
 	suite.Equal(dr.(*driver).jobType, job.JobType_SERVICE)
@@ -237,8 +263,8 @@ func (suite *DriverTestSuite) prepareTestSyncDB(jobType job.JobType) {
 		InstanceCount: 1,
 	}
 
-	suite.jobStore.EXPECT().
-		GetActiveJobs(gomock.Any()).
+	suite.activeJobsOps.EXPECT().
+		GetAll(gomock.Any()).
 		Return([]*peloton.JobID{suite.jobID}, nil)
 
 	suite.jobRuntimeOps.EXPECT().
@@ -261,7 +287,12 @@ func (suite *DriverTestSuite) prepareTestSyncDB(jobType job.JobType) {
 		Return(suite.cachedJob)
 
 	suite.cachedJob.EXPECT().
-		Update(gomock.Any(), gomock.Any(), gomock.Any(), cached.UpdateCacheOnly).
+		Update(
+			gomock.Any(),
+			gomock.Any(),
+			gomock.Any(),
+			nil,
+			cached.UpdateCacheOnly).
 		Return(nil)
 
 	suite.jobGoalStateEngine.EXPECT().
@@ -356,8 +387,8 @@ func (suite *DriverTestSuite) TestSyncFromDBWithMaxRunningInstancesSLA() {
 		},
 	}
 
-	suite.jobStore.EXPECT().
-		GetActiveJobs(gomock.Any()).
+	suite.activeJobsOps.EXPECT().
+		GetAll(gomock.Any()).
 		Return([]*peloton.JobID{suite.jobID}, nil)
 
 	suite.jobRuntimeOps.EXPECT().
@@ -380,7 +411,12 @@ func (suite *DriverTestSuite) TestSyncFromDBWithMaxRunningInstancesSLA() {
 		Return(suite.cachedJob)
 
 	suite.cachedJob.EXPECT().
-		Update(gomock.Any(), gomock.Any(), gomock.Any(), cached.UpdateCacheOnly).
+		Update(
+			gomock.Any(),
+			gomock.Any(),
+			gomock.Any(),
+			nil,
+			cached.UpdateCacheOnly).
 		Return(nil)
 
 	suite.jobGoalStateEngine.EXPECT().
@@ -433,8 +469,8 @@ func (suite *DriverTestSuite) TestInitializedJobSyncFromDB() {
 		InstanceCount: 1,
 	}
 
-	suite.jobStore.EXPECT().
-		GetActiveJobs(gomock.Any()).
+	suite.activeJobsOps.EXPECT().
+		GetAll(gomock.Any()).
 		Return([]*peloton.JobID{suite.jobID}, nil)
 
 	suite.jobRuntimeOps.EXPECT().
@@ -457,7 +493,12 @@ func (suite *DriverTestSuite) TestInitializedJobSyncFromDB() {
 		Return(suite.cachedJob)
 
 	suite.cachedJob.EXPECT().
-		Update(gomock.Any(), gomock.Any(), gomock.Any(), cached.UpdateCacheOnly).
+		Update(
+			gomock.Any(),
+			gomock.Any(),
+			gomock.Any(),
+			nil,
+			cached.UpdateCacheOnly).
 		Return(nil)
 
 	suite.jobGoalStateEngine.EXPECT().
@@ -503,8 +544,8 @@ func (suite *DriverTestSuite) TestSyncFromDBRecoverUpdate() {
 		},
 	}
 
-	suite.jobStore.EXPECT().
-		GetActiveJobs(gomock.Any()).
+	suite.activeJobsOps.EXPECT().
+		GetAll(gomock.Any()).
 		Return([]*peloton.JobID{suite.jobID}, nil)
 
 	suite.jobRuntimeOps.EXPECT().
@@ -528,7 +569,12 @@ func (suite *DriverTestSuite) TestSyncFromDBRecoverUpdate() {
 		Return(suite.cachedJob)
 
 	suite.cachedJob.EXPECT().
-		Update(gomock.Any(), gomock.Any(), gomock.Any(), cached.UpdateCacheOnly).
+		Update(
+			gomock.Any(),
+			gomock.Any(),
+			gomock.Any(),
+			nil,
+			cached.UpdateCacheOnly).
 		Return(nil)
 
 	suite.jobGoalStateEngine.EXPECT().
@@ -587,8 +633,8 @@ func (suite *DriverTestSuite) TestEngineStartStop() {
 	suite.taskGoalStateEngine.EXPECT().Start()
 	suite.updateGoalStateEngine.EXPECT().Start()
 
-	suite.jobStore.EXPECT().
-		GetActiveJobs(gomock.Any()).
+	suite.activeJobsOps.EXPECT().
+		GetAll(gomock.Any()).
 		Return([]*peloton.JobID{}, nil)
 
 	suite.False(suite.goalStateDriver.Started())

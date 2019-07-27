@@ -101,9 +101,13 @@ func startStatefulTask(ctx context.Context, taskEnt *taskEntity, taskInfo *task.
 		return nil
 	}
 
-	err = cachedJob.PatchTasks(ctx, map[uint32]jobmgrcommon.RuntimeDiff{
-		taskEnt.instanceID: launchableTask.RuntimeDiff,
-	})
+	_, _, err = cachedJob.PatchTasks(
+		ctx,
+		map[uint32]jobmgrcommon.RuntimeDiff{
+			taskEnt.instanceID: launchableTask.RuntimeDiff,
+		},
+		false,
+	)
 	if err != nil {
 		log.WithError(err).
 			WithField("job_id", taskEnt.jobID).
@@ -247,12 +251,22 @@ func TaskStart(ctx context.Context, entity goalstate.Entity) error {
 	// Update task state to PENDING
 	runtime := taskInfo.GetRuntime()
 	if runtime.GetState() != task.TaskState_PENDING {
+		var instancesToRetry []uint32
 		runtimeDiff := jobmgrcommon.RuntimeDiff{
 			jobmgrcommon.StateField:   task.TaskState_PENDING,
 			jobmgrcommon.MessageField: "Task sent for placement",
 		}
-		err = cachedJob.PatchTasks(ctx,
-			map[uint32]jobmgrcommon.RuntimeDiff{taskEnt.instanceID: runtimeDiff})
+		_, instancesToRetry, err = cachedJob.PatchTasks(
+			ctx,
+			map[uint32]jobmgrcommon.RuntimeDiff{taskEnt.instanceID: runtimeDiff},
+			false,
+		)
+
+		if err == nil && len(instancesToRetry) != 0 {
+			// if the task needs to be reloaded into cache, throw error here
+			// so that the action is retried by goalstate engine
+			return _errTasksNotInCache
+		}
 	}
 	return err
 }

@@ -33,6 +33,7 @@ import (
 	"github.com/uber/peloton/pkg/placement/hosts"
 	tally_metrics "github.com/uber/peloton/pkg/placement/metrics"
 	"github.com/uber/peloton/pkg/placement/models"
+	"github.com/uber/peloton/pkg/placement/models/v0"
 	"github.com/uber/peloton/pkg/placement/tasks"
 
 	log "github.com/sirupsen/logrus"
@@ -60,7 +61,7 @@ var (
 // Reserver represents a placement engine's reservation module
 // It gets all the hosts based on filter passed to host manager
 // it chooses the random host from the list and call reserve the
-// choosen host based on the task.
+// chosen host based on the task.
 type Reserver interface {
 	// Adding daemon interface for Reserver
 	async.Daemon
@@ -72,7 +73,7 @@ type Reserver interface {
 	Reserve(ctx context.Context) (time.Duration, error)
 
 	// Places the assignments which are ready for host reservation into reservationQueue
-	ProcessHostReservation(ctx context.Context, assignments []*models.Assignment) error
+	ProcessHostReservation(ctx context.Context, assignments []models.Task) error
 
 	// EnqueueReservation enqueues the hostsvc.reservation to
 	// the reservation queue
@@ -103,7 +104,7 @@ type reserver struct {
 	// completed reservation queue
 	completedReservationQueue queue.Queue
 	// task-> reservation mapping
-	reservations map[string][]*models.Host
+	reservations map[string][]*models_v0.Host
 	// tasks map indexed by taskID
 	tasks map[string]*resmgr.Task
 }
@@ -131,7 +132,7 @@ func NewReserver(
 			reflect.TypeOf(hostsvc.CompletedReservation{}),
 			_maxReservationQueueSize,
 		),
-		reservations: make(map[string][]*models.Host),
+		reservations: make(map[string][]*models_v0.Host),
 		tasks:        make(map[string]*resmgr.Task),
 	}
 	reserver.daemon = async.NewDaemon("Placement Engine Reserver", reserver)
@@ -220,7 +221,7 @@ func (r *reserver) Reserve(ctx context.Context) (time.Duration, error) {
 		return _noHostsTimeoutPenalty, err
 	}
 
-	var hostToReserve []*models.Host
+	var hostToReserve []*models_v0.Host
 	// choose one random host from the list
 	hostToReserve = append(hostToReserve, r.findHost(hosts))
 	// reserve the host in host manager
@@ -245,12 +246,12 @@ func (r *reserver) Reserve(ctx context.Context) (time.Duration, error) {
 // findHost randomly chooses the number of hosts and then
 // out of those hosts choose the one which have lowest number
 // of tasks running
-func (r *reserver) findHost(hosts []*models.Host) *models.Host {
+func (r *reserver) findHost(hosts []*models_v0.Host) *models_v0.Host {
 	lenHosts := len(hosts)
 	lenRandomHosts := int(math.Min(
 		float64(_randomizedHosts), float64(lenHosts)))
 
-	randomHosts := make([]*models.Host, lenRandomHosts)
+	randomHosts := make([]*models_v0.Host, lenRandomHosts)
 	for i := 0; i < lenRandomHosts; i++ {
 		randomHosts[i] = hosts[random(0, lenHosts)+0]
 	}
@@ -259,7 +260,7 @@ func (r *reserver) findHost(hosts []*models.Host) *models.Host {
 
 // findHostWithMinTasks returns the host which has the minimun running task
 // from the list of hosts provided
-func (r *reserver) findHostWithMinTasks(hosts []*models.Host) *models.Host {
+func (r *reserver) findHostWithMinTasks(hosts []*models_v0.Host) *models_v0.Host {
 	min := taskLen(hosts[0])
 	minIndex := 0
 	for i, host := range hosts {
@@ -271,7 +272,7 @@ func (r *reserver) findHostWithMinTasks(hosts []*models.Host) *models.Host {
 	return hosts[minIndex]
 }
 
-func taskLen(host *models.Host) int {
+func taskLen(host *models_v0.Host) int {
 	if host.GetTasks() == nil {
 		return 0
 	}
@@ -300,14 +301,14 @@ func (r *reserver) getHostFilter(task *resmgr.Task) *hostsvc.HostFilter {
 // into reservationQueue
 func (r *reserver) ProcessHostReservation(
 	ctx context.Context,
-	assignments []*models.Assignment) error {
+	assignments []models.Task) error {
 
 	for _, assignment := range assignments {
-		if assignment.Task.GetTask().GetReadyForHostReservation() {
+		if assignment.IsReadyForHostReservation() {
 			log.WithField("assignment", assignment).
 				Debug("process host reservation")
 			err := r.EnqueueReservation(&hostsvc.Reservation{
-				Task: assignment.Task.GetTask(),
+				Task: assignment.GetResmgrTaskV0(),
 			})
 			if err != nil {
 				return err
@@ -411,16 +412,16 @@ func (r *reserver) processCompletedReservations(ctx context.Context) error {
 	deadline := now.Add(duration)
 	desiredHostPlacementDeadline := now.Add(r.config.MaxDesiredHostPlacementDuration)
 
-	assignments := make([]*models.Assignment, len(reservations))
+	assignments := make([]models.Task, len(reservations))
 	for i, res := range reservations {
-		task := models.NewTask(nil,
+		task := models_v0.NewTask(nil,
 			res.GetTask(),
 			deadline,
 			desiredHostPlacementDeadline,
 			maxRounds,
 		)
-		assignments[i] = models.NewAssignment(task)
-		assignments[i].SetHost(&models.HostOffers{Offer: res.HostOffer})
+		assignments[i] = models_v0.NewAssignment(task)
+		assignments[i].SetPlacement(&models_v0.HostOffers{Offer: res.HostOffer})
 	}
 
 	log.WithField("placements", assignments).

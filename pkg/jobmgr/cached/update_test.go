@@ -27,6 +27,7 @@ import (
 	pbupdate "github.com/uber/peloton/.gen/peloton/api/v0/update"
 	"github.com/uber/peloton/.gen/peloton/private/models"
 	storemocks "github.com/uber/peloton/pkg/storage/mocks"
+	objectmocks "github.com/uber/peloton/pkg/storage/objects/mocks"
 
 	"github.com/golang/mock/gomock"
 	"github.com/pborman/uuid"
@@ -38,13 +39,15 @@ import (
 type UpdateTestSuite struct {
 	suite.Suite
 
-	ctrl        *gomock.Controller
-	jobStore    *storemocks.MockJobStore
-	taskStore   *storemocks.MockTaskStore
-	updateStore *storemocks.MockUpdateStore
-	jobID       *peloton.JobID
-	updateID    *peloton.UpdateID
-	update      *update
+	ctrl               *gomock.Controller
+	jobStore           *storemocks.MockJobStore
+	taskStore          *storemocks.MockTaskStore
+	updateStore        *storemocks.MockUpdateStore
+	jobUpdateEventsOps *objectmocks.MockJobUpdateEventsOps
+	taskConfigV2Ops    *objectmocks.MockTaskConfigV2Ops
+	jobID              *peloton.JobID
+	updateID           *peloton.UpdateID
+	update             *update
 }
 
 func TestUpdate(t *testing.T) {
@@ -56,12 +59,16 @@ func (suite *UpdateTestSuite) SetupTest() {
 	suite.jobStore = storemocks.NewMockJobStore(suite.ctrl)
 	suite.taskStore = storemocks.NewMockTaskStore(suite.ctrl)
 	suite.updateStore = storemocks.NewMockUpdateStore(suite.ctrl)
+	suite.jobUpdateEventsOps = objectmocks.NewMockJobUpdateEventsOps(suite.ctrl)
+	suite.taskConfigV2Ops = objectmocks.NewMockTaskConfigV2Ops(suite.ctrl)
 	suite.jobID = &peloton.JobID{Value: uuid.NewRandom().String()}
 	suite.updateID = &peloton.UpdateID{Value: uuid.NewRandom().String()}
 	suite.update = initializeUpdate(
 		suite.jobStore,
 		suite.taskStore,
 		suite.updateStore,
+		suite.jobUpdateEventsOps,
+		suite.taskConfigV2Ops,
 		suite.updateID,
 	)
 }
@@ -75,14 +82,19 @@ func initializeUpdate(
 	jobStore *storemocks.MockJobStore,
 	taskStore *storemocks.MockTaskStore,
 	updateStore *storemocks.MockUpdateStore,
-	updateID *peloton.UpdateID) *update {
+	jobUpdateEventsOps *objectmocks.MockJobUpdateEventsOps,
+	taskConfigV2Ops *objectmocks.MockTaskConfigV2Ops,
+	updateID *peloton.UpdateID,
+) *update {
 	jobFactory := &jobFactory{
-		mtx:         NewMetrics(tally.NoopScope),
-		jobStore:    jobStore,
-		taskStore:   taskStore,
-		updateStore: updateStore,
-		jobs:        map[string]*job{},
-		running:     true,
+		mtx:                NewMetrics(tally.NoopScope),
+		jobStore:           jobStore,
+		taskStore:          taskStore,
+		updateStore:        updateStore,
+		jobUpdateEventsOps: jobUpdateEventsOps,
+		taskConfigV2Ops:    taskConfigV2Ops,
+		jobs:               map[string]*job{},
+		running:            true,
 	}
 
 	u := newUpdate(updateID, jobFactory)
@@ -122,8 +134,8 @@ func (suite *UpdateTestSuite) TestModifyValid() {
 		Return(nil).
 		Times(6)
 
-	suite.updateStore.EXPECT().
-		AddJobUpdateEvent(
+	suite.jobUpdateEventsOps.EXPECT().
+		Create(
 			gomock.Any(),
 			gomock.Any(),
 			gomock.Any(),
@@ -159,8 +171,8 @@ func (suite *UpdateTestSuite) TestModifyDBError() {
 			gomock.Any(),
 			pbupdate.State_ROLLING_FORWARD).
 		Return(nil).Times(6)
-	suite.updateStore.EXPECT().
-		AddJobUpdateEvent(
+	suite.jobUpdateEventsOps.EXPECT().
+		Create(
 			gomock.Any(),
 			gomock.Any(),
 			gomock.Any(),
@@ -307,8 +319,8 @@ func (suite *UpdateTestSuite) TestWriteJobUpdateEventError() {
 
 	suite.update.state = pbupdate.State_INITIALIZED
 
-	suite.updateStore.EXPECT().
-		AddJobUpdateEvent(
+	suite.jobUpdateEventsOps.EXPECT().
+		Create(
 			gomock.Any(),
 			gomock.Any(),
 			gomock.Any(),
@@ -365,8 +377,8 @@ func (suite *UpdateTestSuite) TestConsecutiveWriteProgressPrevState() {
 	suite.update.instancesAdded = []uint32{0, 1, 2, 3, 4, 5}
 	suite.update.workflowType = models.WorkflowType_UPDATE
 
-	suite.updateStore.EXPECT().
-		AddJobUpdateEvent(
+	suite.jobUpdateEventsOps.EXPECT().
+		Create(
 			gomock.Any(),
 			gomock.Any(),
 			gomock.Any(),
@@ -498,8 +510,8 @@ func (suite *UpdateTestSuite) TestConsecutiveWriteProgressPrevState() {
 			pbupdate.State_ROLLING_BACKWARD).
 		Return(nil)
 
-	suite.updateStore.EXPECT().
-		AddJobUpdateEvent(
+	suite.jobUpdateEventsOps.EXPECT().
+		Create(
 			gomock.Any(),
 			gomock.Any(),
 			gomock.Any(),
@@ -523,13 +535,14 @@ func (suite *UpdateTestSuite) TestPauseSuccess() {
 	suite.update.state = pbupdate.State_ROLLING_FORWARD
 	opaque := "test"
 
-	suite.updateStore.EXPECT().
-		AddJobUpdateEvent(
+	suite.jobUpdateEventsOps.EXPECT().
+		Create(
 			gomock.Any(),
 			suite.updateID,
 			gomock.Any(),
 			pbupdate.State_PAUSED).
 		Return(nil)
+
 	suite.updateStore.EXPECT().
 		WriteUpdateProgress(gomock.Any(), gomock.Any()).
 		Do(func(_ context.Context, updateModel *models.UpdateModel) {
@@ -564,8 +577,8 @@ func (suite *UpdateTestSuite) TestPausePausedUpdate() {
 // TestPauseResumeRollingForwardUpdate tests pause and resume a rolling
 // forward update
 func (suite *UpdateTestSuite) TestPauseResumeRollingForwardUpdate() {
-	suite.updateStore.EXPECT().
-		AddJobUpdateEvent(
+	suite.jobUpdateEventsOps.EXPECT().
+		Create(
 			gomock.Any(),
 			gomock.Any(),
 			gomock.Any(),
@@ -580,8 +593,8 @@ func (suite *UpdateTestSuite) TestPauseResumeRollingForwardUpdate() {
 	suite.NoError(suite.update.Pause(context.Background(), nil))
 	suite.Equal(pbupdate.State_PAUSED, suite.update.state)
 
-	suite.updateStore.EXPECT().
-		AddJobUpdateEvent(
+	suite.jobUpdateEventsOps.EXPECT().
+		Create(
 			gomock.Any(),
 			gomock.Any(),
 			gomock.Any(),
@@ -594,8 +607,8 @@ func (suite *UpdateTestSuite) TestPauseResumeRollingForwardUpdate() {
 // TestPauseResumeRollingBackwardUpdate tests pause and resume a rolling
 // backward update
 func (suite *UpdateTestSuite) TestPauseResumeRollingBackwardUpdate() {
-	suite.updateStore.EXPECT().
-		AddJobUpdateEvent(
+	suite.jobUpdateEventsOps.EXPECT().
+		Create(
 			gomock.Any(),
 			gomock.Any(),
 			gomock.Any(),
@@ -610,8 +623,8 @@ func (suite *UpdateTestSuite) TestPauseResumeRollingBackwardUpdate() {
 	suite.NoError(suite.update.Pause(context.Background(), nil))
 	suite.Equal(pbupdate.State_PAUSED, suite.update.state)
 
-	suite.updateStore.EXPECT().
-		AddJobUpdateEvent(
+	suite.jobUpdateEventsOps.EXPECT().
+		Create(
 			gomock.Any(),
 			gomock.Any(),
 			gomock.Any(),
@@ -624,8 +637,8 @@ func (suite *UpdateTestSuite) TestPauseResumeRollingBackwardUpdate() {
 // TestPauseResumeInitializedUpdate tests pause and resume an
 // initialized update
 func (suite *UpdateTestSuite) TestPauseResumeInitializedUpdate() {
-	suite.updateStore.EXPECT().
-		AddJobUpdateEvent(
+	suite.jobUpdateEventsOps.EXPECT().
+		Create(
 			gomock.Any(),
 			gomock.Any(),
 			gomock.Any(),
@@ -641,8 +654,8 @@ func (suite *UpdateTestSuite) TestPauseResumeInitializedUpdate() {
 	suite.NoError(suite.update.Pause(context.Background(), nil))
 	suite.Equal(pbupdate.State_PAUSED, suite.update.state)
 
-	suite.updateStore.EXPECT().
-		AddJobUpdateEvent(
+	suite.jobUpdateEventsOps.EXPECT().
+		Create(
 			gomock.Any(),
 			gomock.Any(),
 			gomock.Any(),
@@ -687,8 +700,8 @@ func (suite *UpdateTestSuite) TestCancelValid() {
 				pbupdate.State_ABORTED)
 	}
 
-	suite.updateStore.EXPECT().
-		AddJobUpdateEvent(
+	suite.jobUpdateEventsOps.EXPECT().
+		Create(
 			gomock.Any(),
 			gomock.Any(),
 			gomock.Any(),
@@ -723,8 +736,8 @@ func (suite *UpdateTestSuite) TestCancelDBError() {
 	suite.update.instancesDone = instancesDone
 	suite.update.instancesCurrent = instancesCurrent
 
-	suite.updateStore.EXPECT().
-		AddJobUpdateEvent(
+	suite.jobUpdateEventsOps.EXPECT().
+		Create(
 			gomock.Any(),
 			gomock.Any(),
 			gomock.Any(),
@@ -1147,8 +1160,8 @@ func (suite *UpdateTestSuite) TestUpdateRollbackSuccess() {
 		GetTaskRuntimesForJobByRange(gomock.Any(), suite.jobID, nil).
 		Return(nil, nil)
 
-	suite.updateStore.EXPECT().
-		AddJobUpdateEvent(
+	suite.jobUpdateEventsOps.EXPECT().
+		Create(
 			gomock.Any(),
 			gomock.Any(),
 			gomock.Any(),
@@ -1178,8 +1191,8 @@ func (suite *UpdateTestSuite) TestUpdateRollbackModifyUpdateFailure() {
 		GetTaskRuntimesForJobByRange(gomock.Any(), suite.jobID, nil).
 		Return(nil, nil)
 
-	suite.updateStore.EXPECT().
-		AddJobUpdateEvent(
+	suite.jobUpdateEventsOps.EXPECT().
+		Create(
 			gomock.Any(),
 			gomock.Any(),
 			gomock.Any(),
@@ -1263,6 +1276,7 @@ func (suite *UpdateTestSuite) TestGetInstancesToProcessForUpdateWithLabelAddAndU
 			prevJobConfig,
 			jobConfig,
 			suite.taskStore,
+			suite.taskConfigV2Ops,
 		)
 
 	suite.NoError(err)
@@ -1316,6 +1330,7 @@ func (suite *UpdateTestSuite) TestGetInstancesToProcessForUpdateWithLabelUpdated
 			prevJobConfig,
 			jobConfig,
 			suite.taskStore,
+			suite.taskConfigV2Ops,
 		)
 
 	suite.NoError(err)
@@ -1381,7 +1396,7 @@ func (suite *UpdateTestSuite) TestGetInstancesToProcessForUpdateWithAddedInstanc
 		GetTaskRuntimesForJobByRange(gomock.Any(), suite.jobID, nil).
 		Return(taskRuntimes, nil)
 
-	suite.taskStore.EXPECT().
+	suite.taskConfigV2Ops.EXPECT().
 		GetTaskConfig(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
 		Return(taskConfig, nil, nil).
 		Times(int(prevInstanceCount))
@@ -1393,6 +1408,7 @@ func (suite *UpdateTestSuite) TestGetInstancesToProcessForUpdateWithAddedInstanc
 			prevJobConfig,
 			jobConfig,
 			suite.taskStore,
+			suite.taskConfigV2Ops,
 		)
 
 	suite.NoError(err)
@@ -1451,7 +1467,7 @@ func (suite *UpdateTestSuite) TestGetInstancesToProcessForUpdateWithRemovedInsta
 		GetTaskRuntimesForJobByRange(gomock.Any(), suite.jobID, nil).
 		Return(taskRuntimes, nil)
 
-	suite.taskStore.EXPECT().
+	suite.taskConfigV2Ops.EXPECT().
 		GetTaskConfig(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
 		Return(taskConfig, nil, nil).
 		Times(int(instanceCount))
@@ -1463,6 +1479,7 @@ func (suite *UpdateTestSuite) TestGetInstancesToProcessForUpdateWithRemovedInsta
 			prevJobConfig,
 			jobConfig,
 			suite.taskStore,
+			suite.taskConfigV2Ops,
 		)
 
 	suite.NoError(err)
@@ -1516,7 +1533,7 @@ func (suite *UpdateTestSuite) TestGetInstancesToProcessForUpdateWithMssingConfig
 		GetTaskRuntimesForJobByRange(gomock.Any(), suite.jobID, nil).
 		Return(taskRuntimes, nil)
 
-	suite.taskStore.EXPECT().
+	suite.taskConfigV2Ops.EXPECT().
 		GetTaskConfig(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
 		Return(nil, nil, yarpcerrors.NotFoundErrorf("not-found")).
 		Times(int(instanceCount))
@@ -1528,6 +1545,7 @@ func (suite *UpdateTestSuite) TestGetInstancesToProcessForUpdateWithMssingConfig
 			jobConfig,
 			jobConfig,
 			suite.taskStore,
+			suite.taskConfigV2Ops,
 		)
 
 	suite.NoError(err)
@@ -1581,7 +1599,7 @@ func (suite *UpdateTestSuite) TestGetInstancesToProcessForUpdateWithUpdateInstan
 		GetTaskRuntimesForJobByRange(gomock.Any(), suite.jobID, nil).
 		Return(taskRuntimes, nil)
 
-	suite.taskStore.EXPECT().
+	suite.taskConfigV2Ops.EXPECT().
 		GetTaskConfig(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
 		Return(taskConfig, nil, nil).
 		Times(int(instanceCount))
@@ -1593,6 +1611,7 @@ func (suite *UpdateTestSuite) TestGetInstancesToProcessForUpdateWithUpdateInstan
 			jobConfig,
 			jobConfig,
 			suite.taskStore,
+			suite.taskConfigV2Ops,
 		)
 
 	suite.NoError(err)
@@ -1634,6 +1653,7 @@ func (suite *UpdateTestSuite) TestGetInstancesToProcessForUpdateRuntimeError() {
 			prevJobConfig,
 			jobConfig,
 			suite.taskStore,
+			suite.taskConfigV2Ops,
 		)
 
 	suite.Error(err)
@@ -1693,7 +1713,7 @@ func (suite *UpdateTestSuite) TestGetInstancesToProcessForUpdateConfigError() {
 		GetTaskRuntimesForJobByRange(gomock.Any(), suite.jobID, nil).
 		Return(taskRuntimes, nil)
 
-	suite.taskStore.EXPECT().
+	suite.taskConfigV2Ops.EXPECT().
 		GetTaskConfig(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
 		Return(nil, nil, fmt.Errorf("fake db error"))
 
@@ -1704,6 +1724,7 @@ func (suite *UpdateTestSuite) TestGetInstancesToProcessForUpdateConfigError() {
 			prevJobConfig,
 			jobConfig,
 			suite.taskStore,
+			suite.taskConfigV2Ops,
 		)
 
 	suite.Error(err)
@@ -1727,8 +1748,8 @@ func (suite *UpdateTestSuite) TestUpdateCreateSuccess() {
 	jobConfig := prevConfig
 	configAddOn := &models.ConfigAddOn{}
 
-	suite.updateStore.EXPECT().
-		AddJobUpdateEvent(
+	suite.jobUpdateEventsOps.EXPECT().
+		Create(
 			gomock.Any(),
 			gomock.Any(),
 			gomock.Any(),
@@ -1796,8 +1817,8 @@ func (suite *UpdateTestSuite) TestUpdateCreatePausedSuccess() {
 	jobConfig := prevConfig
 	configAddOn := &models.ConfigAddOn{}
 
-	suite.updateStore.EXPECT().
-		AddJobUpdateEvent(
+	suite.jobUpdateEventsOps.EXPECT().
+		Create(
 			gomock.Any(),
 			gomock.Any(),
 			gomock.Any(),

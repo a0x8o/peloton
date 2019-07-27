@@ -29,17 +29,14 @@ import (
 	"github.com/uber/peloton/.gen/peloton/api/v0/job"
 	"github.com/uber/peloton/.gen/peloton/api/v0/peloton"
 	"github.com/uber/peloton/.gen/peloton/api/v0/query"
-	"github.com/uber/peloton/.gen/peloton/api/v0/respool"
 	"github.com/uber/peloton/.gen/peloton/api/v0/task"
 	"github.com/uber/peloton/.gen/peloton/api/v0/update"
 	"github.com/uber/peloton/.gen/peloton/api/v0/volume"
-	"github.com/uber/peloton/.gen/peloton/api/v1alpha/job/stateless"
 	"github.com/uber/peloton/.gen/peloton/private/models"
 
 	"github.com/uber/peloton/pkg/common"
 	"github.com/uber/peloton/pkg/common/backoff"
 	"github.com/uber/peloton/pkg/common/taskconfig"
-	"github.com/uber/peloton/pkg/common/util"
 	"github.com/uber/peloton/pkg/storage"
 	ormobjects "github.com/uber/peloton/pkg/storage/objects"
 	qb "github.com/uber/peloton/pkg/storage/querybuilder"
@@ -48,16 +45,11 @@ import (
 	"github.com/gogo/protobuf/proto"
 	"github.com/golang/protobuf/ptypes"
 	"github.com/pborman/uuid"
-	"github.com/pkg/errors"
 	log "github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/suite"
 	"github.com/uber-go/tally"
 	"go.uber.org/yarpc/yarpcerrors"
-)
-
-const (
-	_resPoolOwner = "teamPeloton"
 )
 
 type CassandraStoreTestSuite struct {
@@ -117,50 +109,6 @@ func TestCassandraStore(t *testing.T) {
 	assert.True(t, testScope.Snapshot().Counters()["execute.execute+result=success,store=peloton_test"].Value() > 0)
 }
 
-// TestGetTaskIDsForJobAndState tests reading task IDs for given job and state
-func (suite *CassandraStoreTestSuite) TestGetTaskIDsForJobAndState() {
-	var taskStore storage.TaskStore
-	taskStore = store
-	var jobID = peloton.JobID{Value: uuid.New()}
-	runtimes := make(map[uint32]*task.RuntimeInfo)
-	jobConfig := buildJobConfig()
-	jobConfig.InstanceCount = 10
-	jobConfig.InstanceConfig = map[uint32]*task.TaskConfig{}
-
-	for i := 0; i < 10; i++ {
-		taskInfo := createTaskInfo(jobConfig, &jobID, 0)
-		taskInfo.Config = &task.TaskConfig{Name: fmt.Sprintf("task_%d", i)}
-		jobConfig.InstanceConfig[uint32(i)] = taskInfo.Config
-		taskInfo.Runtime.State = task.TaskState_RUNNING
-		if i%2 == 0 {
-			taskInfo.Runtime.State = task.TaskState_PENDING
-		}
-		runtimes[uint32(i)] = taskInfo.Runtime
-	}
-
-	err := suite.createJob(context.Background(), &jobID, jobConfig, &models.ConfigAddOn{}, "user1")
-	suite.Nil(err)
-
-	for i := 0; i < 10; i++ {
-		runtimes[uint32(i)].ConfigVersion = jobConfig.GetChangeLog().
-			GetVersion()
-		err = taskStore.CreateTaskRuntime(context.Background(),
-			&jobID, uint32(i), runtimes[uint32(i)], "test", jobConfig.GetType())
-		suite.NoError(err)
-	}
-
-	// get the task configs
-	ids, err := store.GetTaskIDsForJobAndState(
-		context.Background(), &jobID, task.TaskState_PENDING.String())
-	suite.NoError(err)
-	suite.Equal(5, len(ids))
-
-	ids, err = store.GetTaskIDsForJobAndState(
-		context.Background(), &jobID, task.TaskState_RUNNING.String())
-	suite.NoError(err)
-	suite.Equal(5, len(ids))
-}
-
 func (suite *CassandraStoreTestSuite) createJob(
 	ctx context.Context,
 	id *peloton.JobID,
@@ -178,6 +126,7 @@ func (suite *CassandraStoreTestSuite) createJob(
 		id,
 		jobConfig,
 		configAddOn,
+		nil,
 		jobConfig.GetChangeLog().GetVersion(),
 	); err != nil {
 		return err
@@ -222,12 +171,13 @@ func (suite *CassandraStoreTestSuite) createJob(
 func createTaskConfigs(ctx context.Context, id *peloton.JobID, jobConfig *job.JobConfig, configAddOn *models.ConfigAddOn) error {
 	version := jobConfig.GetChangeLog().GetVersion()
 	if jobConfig.GetDefaultConfig() != nil {
-		if err := store.CreateTaskConfig(
+		if err := store.taskConfigV2Ops.Create(
 			ctx,
 			id,
 			common.DefaultTaskConfigID,
 			jobConfig.GetDefaultConfig(),
 			configAddOn,
+			nil,
 			version,
 		); err != nil {
 			return err
@@ -237,55 +187,19 @@ func createTaskConfigs(ctx context.Context, id *peloton.JobID, jobConfig *job.Jo
 	for instanceID, cfg := range jobConfig.GetInstanceConfig() {
 		merged := taskconfig.Merge(jobConfig.GetDefaultConfig(), cfg)
 		// TODO set correct version
-		if err := store.CreateTaskConfig(
+		if err := store.taskConfigV2Ops.Create(
 			ctx,
 			id,
 			int64(instanceID),
 			merged,
 			configAddOn,
+			nil,
 			version,
 		); err != nil {
 			return err
 		}
 	}
 
-	return nil
-}
-
-// createTaskConfigsLegacy creates task configs in task_config table, and not
-// task_config_v2 table. This will help in testing legacy jobs which don't have
-// entries in the task_config table.
-func createTaskConfigsLegacy(
-	ctx context.Context, id *peloton.JobID, jobConfig *job.JobConfig) error {
-	version := jobConfig.GetChangeLog().GetVersion()
-
-	configBuffer, err := proto.Marshal(jobConfig.GetDefaultConfig())
-	if err != nil {
-		return err
-	}
-	queryBuilder := store.DataStore.NewQuery()
-	stmt := queryBuilder.Insert(taskConfigTable).
-		Columns("job_id", "version", "instance_id", "creation_time", "config").
-		Values(id.GetValue(), version, common.DefaultTaskConfigID,
-			time.Now().UTC(), configBuffer)
-	if err = store.applyStatement(ctx, stmt, id.GetValue()); err != nil {
-		return err
-	}
-	for instanceID, cfg := range jobConfig.GetInstanceConfig() {
-		merged := taskconfig.Merge(jobConfig.GetDefaultConfig(), cfg)
-		mergedBuffer, err := proto.Marshal(merged)
-		if err != nil {
-			return err
-		}
-		stmt := queryBuilder.Insert(taskConfigTable).
-			Columns("job_id", "version", "instance_id",
-				"creation_time", "config").
-			Values(id.GetValue(), version, int64(instanceID),
-				time.Now().UTC(), mergedBuffer)
-		if err = store.applyStatement(ctx, stmt, id.GetValue()); err != nil {
-			return err
-		}
-	}
 	return nil
 }
 
@@ -442,17 +356,6 @@ func (suite *CassandraStoreTestSuite) TestGetMaxJobConfigVersion() {
 	)
 	suite.NoError(err)
 	suite.Equal(uint64(1), version)
-}
-
-// TestGetAllJobsInJobIndex tests getting all jobs in the job_index table
-func (suite *CassandraStoreTestSuite) TestGetAllJobsInJobIndex() {
-	var jobStore storage.JobStore
-	jobStore = store
-
-	_, err := jobStore.GetAllJobsInJobIndex(
-		context.Background(),
-	)
-	suite.NoError(err)
 }
 
 func (suite *CassandraStoreTestSuite) TestQueryJobPaging() {
@@ -1457,12 +1360,13 @@ func (suite *CassandraStoreTestSuite) TestTaskVersionMigration() {
 
 	// Create legacy task with missing version field.
 	suite.NoError(
-		store.CreateTaskConfig(
+		store.taskConfigV2Ops.Create(
 			context.Background(),
 			jobID,
 			0,
 			&task.TaskConfig{},
 			configAddOn,
+			nil,
 			0,
 		),
 	)
@@ -1526,20 +1430,28 @@ func (suite *CassandraStoreTestSuite) TestGetTaskConfigs() {
 	}
 
 	// create default task config
-	store.CreateTaskConfig(context.Background(), jobID,
+	store.taskConfigV2Ops.Create(
+		context.Background(),
+		jobID,
 		common.DefaultTaskConfigID,
 		&task.TaskConfig{
 			Name: "default",
-		}, configAddOn,
+		},
+		configAddOn,
+		nil,
 		0)
 
 	// create 5 tasks with versions
 	for i := int64(0); i < 5; i++ {
-		suite.NoError(store.CreateTaskConfig(context.Background(), jobID,
+		suite.NoError(store.taskConfigV2Ops.Create(
+			context.Background(),
+			jobID,
 			i,
 			&task.TaskConfig{
 				Name: fmt.Sprintf("task-%d", i),
-			}, configAddOn,
+			},
+			configAddOn,
+			nil,
 			0))
 		instanceIDs = append(instanceIDs, uint32(i))
 	}
@@ -1596,13 +1508,6 @@ func (suite *CassandraStoreTestSuite) TestGetTaskStateSummary() {
 			jobConfig.GetType())
 		suite.Nil(err)
 	}
-
-	taskStateSummary, err := store.GetTaskStateSummaryForJob(context.Background(), &jobID)
-	suite.Nil(err)
-	suite.Equal(len(taskStateSummary), len(task.TaskState_name))
-	for _, state := range task.TaskState_name {
-		suite.Equal(taskStateSummary[state], uint32(2))
-	}
 }
 
 func (suite *CassandraStoreTestSuite) TestGetTaskByRange() {
@@ -1631,43 +1536,6 @@ func (suite *CassandraStoreTestSuite) TestGetTaskByRange() {
 	suite.validateRange(&jobID, 60, 83)
 	suite.validateRange(&jobID, 70, 97)
 	suite.validateRange(&jobID, 70, 120)
-}
-
-// TestActiveJobsForRecovery tests add/get/delete jobs to active jobs table
-func (suite *CassandraStoreTestSuite) TestActiveJobsForRecovery() {
-	var jobStore storage.JobStore
-	jobStore = store
-	ctx := context.Background()
-	jobIDs := []string{}
-	for i := 0; i < 10; i++ {
-		jobID := peloton.JobID{Value: uuid.New()}
-		err := jobStore.AddActiveJob(ctx, &jobID)
-		suite.NoError(err)
-		jobIDs = append(jobIDs, jobID.GetValue())
-	}
-
-	actualJobIDs, err := jobStore.GetActiveJobs(ctx)
-	suite.NoError(err)
-	suite.Len(actualJobIDs, 10)
-
-	for _, actualID := range actualJobIDs {
-		suite.True(util.Contains(jobIDs, actualID.GetValue()))
-	}
-
-	for _, id := range jobIDs {
-		err := jobStore.DeleteActiveJob(
-			context.Background(), &peloton.JobID{Value: id})
-		suite.NoError(err)
-	}
-
-	actualJobIDs, err = jobStore.GetActiveJobs(ctx)
-	suite.NoError(err)
-	suite.Len(actualJobIDs, 0)
-
-	// Delete job id which is not present in active_jobs table
-	err = jobStore.DeleteActiveJob(
-		context.Background(), &peloton.JobID{Value: uuid.New()})
-	suite.NoError(err)
 }
 
 func (suite *CassandraStoreTestSuite) validateRange(jobID *peloton.JobID, from, to int) {
@@ -1769,152 +1637,6 @@ func (suite *CassandraStoreTestSuite) TestGetTaskRuntimesForJobByRange() {
 		context.Background(), &jobID, r)
 	suite.NoError(err)
 	suite.Equal(0, len(runtime))
-}
-
-func (suite *CassandraStoreTestSuite) TestCreateGetResourcePoolConfig() {
-	var resourcePoolStore storage.ResourcePoolStore
-	resourcePoolStore = store
-	testCases := []struct {
-		resourcePoolID string
-		owner          string
-		config         *respool.ResourcePoolConfig
-		expectedErr    error
-		msg            string
-	}{
-		{
-			resourcePoolID: "first",
-			owner:          "team1",
-			config:         createResourcePoolConfig(),
-			expectedErr:    nil,
-			msg:            "testcase: create resource pool",
-		},
-		{
-			resourcePoolID: "second",
-			owner:          "",
-			config:         createResourcePoolConfig(),
-			expectedErr:    nil,
-			msg:            "testcase: create resource pool, no owner",
-		},
-		{
-			resourcePoolID: "",
-			owner:          "team2",
-			config:         createResourcePoolConfig(),
-			expectedErr:    errors.New("Key may not be empty"),
-			msg:            "testcase: create resource pool, no resource ID",
-		},
-		{
-			resourcePoolID: "first",
-			owner:          "team1",
-			config:         createResourcePoolConfig(),
-			expectedErr:    errors.New("code:already-exists message:first is not applied, item could exist already"),
-			msg:            "testcase: create resource pool, duplicate ID",
-		},
-	}
-
-	for _, tc := range testCases {
-		actualErr := resourcePoolStore.CreateResourcePool(context.Background(),
-			&peloton.ResourcePoolID{Value: tc.resourcePoolID},
-			tc.config, tc.owner)
-		if tc.expectedErr == nil {
-			suite.Nil(actualErr, tc.msg)
-		} else {
-			suite.EqualError(actualErr, tc.expectedErr.Error(), tc.msg)
-		}
-	}
-
-	// cleanup respools
-	for _, tc := range testCases {
-		if tc.expectedErr == nil {
-			err := resourcePoolStore.DeleteResourcePool(context.Background(),
-				&peloton.ResourcePoolID{Value: tc.resourcePoolID})
-			suite.NoError(err)
-		}
-	}
-}
-
-// TestGetAllResourcePools tests getting all resource pools from store
-func (suite *CassandraStoreTestSuite) TestGetAllResourcePools() {
-	var resourcePoolStore storage.ResourcePoolStore
-	resourcePoolStore = store
-	nResourcePools := 2
-
-	initResourcePools, err := resourcePoolStore.GetAllResourcePools(
-		context.Background())
-	suite.NoError(err)
-
-	// todo move to setup once ^^^ issue resolves
-	for i := 0; i < nResourcePools; i++ {
-		resourcePoolID := &peloton.ResourcePoolID{
-			Value: fmt.Sprintf("%s%d", _resPoolOwner, i)}
-		resourcePoolConfig := createResourcePoolConfig()
-		resourcePoolConfig.Name = resourcePoolID.Value
-		err := resourcePoolStore.CreateResourcePool(context.Background(),
-			resourcePoolID, resourcePoolConfig, _resPoolOwner)
-		suite.NoError(err)
-	}
-
-	resourcePools, err := resourcePoolStore.GetAllResourcePools(
-		context.Background())
-	suite.NoError(err)
-	suite.Len(resourcePools, len(initResourcePools)+nResourcePools)
-
-	// cleanup created resource pools
-	for i := 0; i < nResourcePools; i++ {
-		resourcePoolID := &peloton.ResourcePoolID{
-			Value: fmt.Sprintf("%s%d", _resPoolOwner, i)}
-		err := resourcePoolStore.DeleteResourcePool(
-			context.Background(), resourcePoolID)
-		suite.NoError(err)
-	}
-}
-
-// TestGetAllResourcePoolsEmptyResourcePool tests getting empty resource pool
-func (suite *CassandraStoreTestSuite) TestGetAllResourcePoolsEmptyResourcePool() {
-	var resourcePoolStore storage.ResourcePoolStore
-	resourcePoolStore = store
-	resourcePools, err := resourcePoolStore.GetAllResourcePools(context.Background())
-	suite.NoError(err)
-	suite.Len(resourcePools, 0)
-}
-
-func (suite *CassandraStoreTestSuite) TestUpdateResourcePool() {
-	var resourcePoolStore storage.ResourcePoolStore
-	resourcePoolStore = store
-	resourcePoolID := &peloton.ResourcePoolID{Value: fmt.Sprintf("%s%d",
-		"UpdateRespool", 1)}
-	resourcePoolConfig := createResourcePoolConfig()
-
-	resourcePoolConfig.Name = resourcePoolID.Value
-	err := resourcePoolStore.CreateResourcePool(context.Background(),
-		resourcePoolID, resourcePoolConfig, "Update")
-	suite.NoError(err)
-
-	resourcePoolConfig.Description = "Updated description"
-	err = resourcePoolStore.UpdateResourcePool(context.Background(),
-		resourcePoolID, resourcePoolConfig)
-	suite.NoError(err)
-
-	// GetAllResourcePools
-	resourcePools, err := resourcePoolStore.GetAllResourcePools(context.Background())
-	suite.NoError(err)
-	suite.Equal("Updated description", resourcePools[resourcePoolID.Value].Description)
-
-	// cleanup resource pool
-	err = resourcePoolStore.DeleteResourcePool(
-		context.Background(), resourcePoolID)
-	suite.NoError(err)
-}
-
-func (suite *CassandraStoreTestSuite) TestDeleteResourcePool() {
-	var resourcePoolStore storage.ResourcePoolStore
-	resourcePoolStore = store
-	resourcePoolID := &peloton.ResourcePoolID{Value: fmt.Sprintf("%s%d", "DeleteRespool", 1)}
-	resourcePoolConfig := createResourcePoolConfig()
-	resourcePoolConfig.Name = resourcePoolID.Value
-	err := resourcePoolStore.CreateResourcePool(context.Background(), resourcePoolID, resourcePoolConfig, "Delete")
-	suite.Nil(err)
-	err = resourcePoolStore.DeleteResourcePool(context.Background(), resourcePoolID)
-	suite.Nil(err)
 }
 
 func (suite *CassandraStoreTestSuite) TestPersistentVolumeInfo() {
@@ -2560,14 +2282,32 @@ func (suite *CassandraStoreTestSuite) TestModifyUpdate() {
 		}
 	}
 
-	// add INITIALIZED update state to job update events
-	suite.NoError(store.AddJobUpdateEvent(
-		context.Background(),
-		updateID,
-		models.WorkflowType_UPDATE,
-		state,
-	))
+	var jobConfig = job.JobConfig{
+		Name:          "TestJob",
+		InstanceCount: instancesTotal,
+		Type:          job.JobType_BATCH,
+		Description:   fmt.Sprintf("TestDeleteTaskConfigSuccess"),
+	}
 
+	jobConfig.ChangeLog = &peloton.ChangeLog{
+		CreatedAt: uint64(time.Now().UnixNano()),
+		UpdatedAt: uint64(time.Now().UnixNano()),
+		Version:   1,
+	}
+
+	initialJobRuntime := job.RuntimeInfo{
+		State:        job.JobState_INITIALIZED,
+		CreationTime: time.Now().Format(time.RFC3339Nano),
+		TaskStats:    make(map[string]uint32),
+		GoalState:    job.JobState_SUCCEEDED,
+		Revision: &peloton.ChangeLog{
+			CreatedAt: uint64(time.Now().UnixNano()),
+			UpdatedAt: uint64(time.Now().UnixNano()),
+			Version:   1,
+		},
+		ConfigurationVersion: jobConfig.GetChangeLog().GetVersion(),
+	}
+	err := jobRuntimeOps.Upsert(context.Background(), jobID, &initialJobRuntime)
 	// create a new update
 	suite.NoError(store.CreateUpdate(
 		context.Background(),
@@ -2585,14 +2325,6 @@ func (suite *CassandraStoreTestSuite) TestModifyUpdate() {
 			CreationTime:         time.Now().Format(time.RFC3339Nano),
 			UpdateTime:           time.Now().Format(time.RFC3339Nano),
 		},
-	))
-
-	// add ROLLING_BACKWARD update state to job update events
-	suite.NoError(store.AddJobUpdateEvent(
-		context.Background(),
-		updateID,
-		models.WorkflowType_UPDATE,
-		update.State_ROLLING_BACKWARD,
 	))
 
 	suite.NoError(store.ModifyUpdate(
@@ -2624,42 +2356,8 @@ func (suite *CassandraStoreTestSuite) TestModifyUpdate() {
 	suite.Equal(updateResult.GetJobConfigVersion(), jobVersion+1)
 	suite.Equal(updateResult.GetPrevJobConfigVersion(), jobVersion)
 
-	// Get job update events, events are in descending create timestamp order
-	jobUpdateEvents, err := store.GetJobUpdateEvents(
-		context.Background(),
-		updateID)
-	suite.NoError(err)
-	suite.Equal(2, len(jobUpdateEvents))
-	suite.Equal(stateless.WorkflowState_WORKFLOW_STATE_ROLLING_BACKWARD,
-		jobUpdateEvents[0].GetState())
-	suite.Equal(stateless.WorkflowState_WORKFLOW_STATE_INITIALIZED,
-		jobUpdateEvents[1].GetState())
-
-	// Add ROLLING_BACKWARD job update event again,
-	// which will be dedupe
-	suite.NoError(store.AddJobUpdateEvent(
-		context.Background(),
-		updateID,
-		models.WorkflowType_UPDATE,
-		update.State_ROLLING_BACKWARD,
-	))
-
-	jobUpdateEvents, err = store.GetJobUpdateEvents(
-		context.Background(),
-		updateID)
-	suite.NoError(err)
-	suite.Equal(2, len(jobUpdateEvents))
-
-	// delete update
-	suite.NoError(store.DeleteUpdate(
-		context.Background(),
-		updateID,
-		jobID,
-		jobVersion+1,
-	))
-
 	// delete the job
-	store.DeleteJob(context.Background(), jobID.GetValue())
+	suite.NoError(store.DeleteJob(context.Background(), jobID.GetValue()))
 	suite.NoError(deleteJobIndex(context.Background(), jobID))
 
 	updateResult, err = store.GetUpdate(context.Background(), updateID)
@@ -2667,7 +2365,7 @@ func (suite *CassandraStoreTestSuite) TestModifyUpdate() {
 	suite.True(yarpcerrors.IsNotFound(err))
 
 	// job update events are deleted as well with update
-	jobUpdateEvents, err = store.GetJobUpdateEvents(
+	jobUpdateEvents, err := store.jobUpdateEventsOps.GetAll(
 		context.Background(),
 		updateID)
 	suite.NoError(err)
@@ -2704,44 +2402,13 @@ func createTaskInfo(
 			Revision: &peloton.ChangeLog{
 				Version: 1,
 			},
+			ConfigVersion: 1,
 		},
 		Config:     jobConfig.GetDefaultConfig(),
 		InstanceId: uint32(i),
 		JobId:      jobID,
 	}
 	return &taskInfo
-}
-
-// Returns mock resource pool config
-func createResourcePoolConfig() *respool.ResourcePoolConfig {
-	return &respool.ResourcePoolConfig{
-		Name:        "TestResourcePool_1",
-		ChangeLog:   nil,
-		Description: "test resource pool",
-		LdapGroups:  []string{"l1", "l2"},
-		OwningTeam:  "team1",
-		Parent:      nil,
-		Policy:      1,
-		Resources:   createResourceConfigs(),
-	}
-}
-
-// Returns mock list of resource configs
-func createResourceConfigs() []*respool.ResourceConfig {
-	return []*respool.ResourceConfig{
-		{
-			Kind:        "cpu",
-			Limit:       1000.0,
-			Reservation: 100.0,
-			Share:       1.0,
-		},
-		{
-			Kind:        "gpu",
-			Limit:       4.0,
-			Reservation: 2.0,
-			Share:       1.0,
-		},
-	}
 }
 
 func (suite *CassandraStoreTestSuite) TestGetTaskRuntime() {
@@ -2755,7 +2422,14 @@ func (suite *CassandraStoreTestSuite) TestGetTaskRuntime() {
 	jobID := &peloton.JobID{Value: uuid.NewRandom().String()}
 	configAddOn := &models.ConfigAddOn{}
 	var tID = fmt.Sprintf("%s-%d-%d", jobID.GetValue(), 0, 1)
-	suite.NoError(store.CreateTaskConfig(context.Background(), jobID, 0, &task.TaskConfig{}, configAddOn, 0))
+	suite.NoError(store.taskConfigV2Ops.Create(
+		context.Background(),
+		jobID,
+		0,
+		&task.TaskConfig{},
+		configAddOn,
+		nil,
+		0))
 	suite.NoError(store.CreateTaskRuntime(
 		context.Background(),
 		jobID,
@@ -3257,7 +2931,7 @@ func (suite *CassandraStoreTestSuite) TestPodEvents() {
 
 func (suite *CassandraStoreTestSuite) TestGetPodEvent() {
 	dummyJobID := &peloton.JobID{Value: "dummy id"}
-	_, err := store.GetPodEvents(
+	_, err := store.getPodEvents(
 		context.Background(),
 		dummyJobID.GetValue(),
 		0)
@@ -3290,7 +2964,7 @@ func (suite *CassandraStoreTestSuite) TestGetPodEvent() {
 	}
 
 	store.addPodEvent(context.Background(), jobID, 0, runtime)
-	podEvents, err := store.GetPodEvents(
+	podEvents, err := store.getPodEvents(
 		context.Background(),
 		jobID.GetValue(),
 		0,
@@ -3324,14 +2998,14 @@ func (suite *CassandraStoreTestSuite) TestGetPodEvent() {
 	}
 
 	store.addPodEvent(context.Background(), jobID, 0, runtime)
-	podEvents, err = store.GetPodEvents(
+	podEvents, err = store.getPodEvents(
 		context.Background(),
 		jobID.GetValue(),
 		0)
 	suite.Equal(len(podEvents), 1)
 	suite.NoError(err)
 
-	podEvents, err = store.GetPodEvents(
+	podEvents, err = store.getPodEvents(
 		context.Background(),
 		jobID.GetValue(),
 		0,
@@ -3342,7 +3016,7 @@ func (suite *CassandraStoreTestSuite) TestGetPodEvent() {
 	err = store.DeletePodEvents(context.Background(), jobID.GetValue(), 0, 2, 3)
 	suite.NoError(err)
 
-	podEvents, err = store.GetPodEvents(
+	podEvents, err = store.getPodEvents(
 		context.Background(),
 		jobID.GetValue(),
 		0)
@@ -3565,56 +3239,68 @@ func (suite *CassandraStoreTestSuite) TestCreateTaskConfigSuccess() {
 		},
 	}
 
-	suite.NoError(store.CreateTaskConfig(
+	suite.NoError(store.taskConfigV2Ops.Create(
 		context.Background(),
 		&peloton.JobID{Value: testJob},
 		0,
 		taskConfig,
 		&models.ConfigAddOn{},
+		nil,
 		1,
 	))
 }
 
-// TestTaskConfigsForLegacyJobs tests if a legacy task config be retrieved
-// successfully using GetTaskConfig and GetTaskConfigs call
-func (suite *CassandraStoreTestSuite) TestTaskConfigsForLegacyJobs() {
-	var numTasks = 5
-	instanceConfig := make(map[uint32]*task.TaskConfig)
-	var jobID = peloton.JobID{Value: uuid.New()}
-	for i := 0; i < numTasks; i++ {
-		taskConfig := &task.TaskConfig{
-			Resource: &task.ResourceConfig{
-				CpuLimit:    0.8,
-				MemLimitMb:  800,
-				DiskLimitMb: 1500,
-				FdLimit:     1000 + uint32(i),
-			},
-		}
-		instanceConfig[uint32(i)] = taskConfig
-	}
+// TestDeleteTaskConfigSuccess test deletion on taskconfig v2 table
+func (suite *CassandraStoreTestSuite) TestDeleteTaskConfig() {
+	now := time.Now()
+	instanceCount := uint32(10)
+	jobID := peloton.JobID{Value: uuid.New()}
 	var jobConfig = job.JobConfig{
-		Name:           fmt.Sprintf("TestTaskConfigLegacy"),
-		DefaultConfig:  &task.TaskConfig{},
-		InstanceCount:  10,
-		Type:           job.JobType_BATCH,
-		InstanceConfig: instanceConfig,
+		Name:          "TestJob",
+		InstanceCount: instanceCount,
+		Type:          job.JobType_BATCH,
+		Description:   fmt.Sprintf("TestDeleteTaskConfigSuccess"),
 	}
-	// Manually create entries for the task configs in the task_config table
-	// to simulate legacy jobs which don't use task_config_v2
-	err := createTaskConfigsLegacy(context.Background(), &jobID, &jobConfig)
+
+	jobConfig.ChangeLog = &peloton.ChangeLog{
+		CreatedAt: uint64(now.UnixNano()),
+		UpdatedAt: uint64(now.UnixNano()),
+		Version:   1,
+	}
+	err := suite.createJob(context.Background(), &jobID, &jobConfig, &models.ConfigAddOn{}, "uber")
 	suite.NoError(err)
 
-	taskConfigs, _, err := store.GetTaskConfigs(
-		context.Background(), &jobID, []uint32{0, 1, 2, 3, 4}, 0)
-	suite.Equal(len(taskConfigs), 5)
-	suite.NoError(err)
-
-	for i := 0; i < numTasks; i++ {
-		taskConfig, _, err := store.GetTaskConfig(
-			context.Background(), &jobID, uint32(i), 0)
+	for i := int64(0); i < int64(instanceCount); i++ {
+		err = store.taskConfigV2Ops.Create(
+			context.Background(),
+			&jobID,
+			i,
+			&task.TaskConfig{Name: "testTask"},
+			&models.ConfigAddOn{},
+			nil,
+			1,
+		)
 		suite.NoError(err)
-		expectedCfg, ok := instanceConfig[uint32(i)]
-		suite.True(ok)
-		suite.Equal(*taskConfig, *expectedCfg)
+	}
+
+	for i := uint32(0); i < instanceCount; i++ {
+		taskConfigV2Row, _, err := store.taskConfigV2Ops.GetTaskConfig(
+			context.Background(),
+			&jobID,
+			i,
+			1)
+		suite.NoError(err)
+		suite.NotNil(taskConfigV2Row)
+	}
+
+	store.deleteTaskConfigV2OnDeleteJob(context.Background(), jobID.GetValue())
+
+	for i := uint32(0); i < instanceCount; i++ {
+		_, _, err := store.taskConfigV2Ops.GetTaskConfig(
+			context.Background(),
+			&jobID,
+			i,
+			1)
+		suite.Error(err)
 	}
 }

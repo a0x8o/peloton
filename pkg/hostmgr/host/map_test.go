@@ -195,11 +195,15 @@ func (suite *HostMapTestSuite) TestMaintenanceHostInfoMap() {
 		downHosts = append(downHosts, hostInfo.GetHostname())
 	}
 	suite.Nil(maintenanceHostInfoMap.GetDrainingHostInfos([]string{}))
-	maintenanceHostInfoMap.AddHostInfos(drainingHostInfos)
+	for _, drainingHostInfo := range drainingHostInfos {
+		maintenanceHostInfoMap.AddHostInfo(drainingHostInfo)
+	}
 	suite.NotEmpty(maintenanceHostInfoMap.GetDrainingHostInfos(drainingHosts))
 
 	suite.Nil(maintenanceHostInfoMap.GetDownHostInfos([]string{}))
-	maintenanceHostInfoMap.AddHostInfos(downHostInfos)
+	for _, downHostInfo := range downHostInfos {
+		maintenanceHostInfoMap.AddHostInfo(downHostInfo)
+	}
 	suite.NotEmpty(maintenanceHostInfoMap.GetDownHostInfos(downHosts))
 
 	drainingHostInfoMap := make(map[string]*host.HostInfo)
@@ -277,19 +281,27 @@ func (suite *HostMapTestSuite) TestMaintenanceHostInfoMap() {
 	suite.Error(err)
 
 	// Test RemoveHostInfos
-	maintenanceHostInfoMap.RemoveHostInfos(drainingHosts)
+	for _, drainingHost := range drainingHosts {
+		maintenanceHostInfoMap.RemoveHostInfo(drainingHost)
+	}
 	suite.Empty(maintenanceHostInfoMap.GetDrainingHostInfos([]string{}))
 	suite.NotEmpty(maintenanceHostInfoMap.GetDownHostInfos([]string{}))
 
-	maintenanceHostInfoMap.RemoveHostInfos(downHosts)
+	for _, downHost := range downHosts {
+		maintenanceHostInfoMap.RemoveHostInfo(downHost)
+	}
 	suite.Empty(maintenanceHostInfoMap.GetDrainingHostInfos([]string{}))
 	suite.Empty(maintenanceHostInfoMap.GetDownHostInfos([]string{}))
 
 	// Test ClearAndFillMap
-	maintenanceHostInfoMap.AddHostInfos(drainingHostInfos)
+	for _, drainingHostInfo := range drainingHostInfos {
+		maintenanceHostInfoMap.AddHostInfo(drainingHostInfo)
+	}
 	suite.NotEmpty(maintenanceHostInfoMap.GetDrainingHostInfos(drainingHosts))
 
-	maintenanceHostInfoMap.AddHostInfos(downHostInfos)
+	for _, downHostInfo := range downHostInfos {
+		maintenanceHostInfoMap.AddHostInfo(downHostInfo)
+	}
 	suite.NotEmpty(maintenanceHostInfoMap.GetDownHostInfos(downHosts))
 
 	maintenanceHostInfoMap.ClearAndFillMap(drainingHostInfos)
@@ -299,6 +311,21 @@ func (suite *HostMapTestSuite) TestMaintenanceHostInfoMap() {
 	maintenanceHostInfoMap.ClearAndFillMap(downHostInfos)
 	suite.NotEmpty(maintenanceHostInfoMap.GetDownHostInfos([]string{}))
 	suite.Empty(maintenanceHostInfoMap.GetDrainingHostInfos([]string{}))
+}
+
+// TestIsHostUp tests IsHostUp()
+func (suite *HostMapTestSuite) TestIsHostUp() {
+	loader := &Loader{
+		OperatorClient:         suite.operatorClient,
+		Scope:                  suite.testScope,
+		SlackResourceTypes:     []string{common.MesosCPU},
+		MaintenanceHostInfoMap: NewMaintenanceHostInfoMap(tally.NoopScope),
+	}
+	// Mock 1 host `id-0` as an Up registered agent
+	suite.operatorClient.EXPECT().Agents().Return(makeAgentsResponse(1), nil)
+	loader.Load(nil)
+	suite.True(IsHostUp("id-0"))
+	suite.False(IsHostUp("testfalse"))
 }
 
 func TestHostMapTestSuite(t *testing.T) {

@@ -193,19 +193,16 @@ func (p *processor) processPlacement(ctx context.Context, placement *resmgr.Plac
 
 	if len(launchableTaskInfos) > 0 {
 
-		// CreateLaunchableTasks returns a list of launchableTasks and taskInfo
-		// map of tasks that could not be launched because of transient error
-		// in getting secrets.
-		launchableTasks, skippedTaskInfos :=
-			p.taskLauncher.CreateLaunchableTasks(ctx, launchableTaskInfos)
-		p.processSkippedLaunches(ctx, skippedTaskInfos)
-
-		if err = p.taskLauncher.ProcessPlacement(ctx,
-			launchableTasks, placement); err != nil {
+		skippedTaskInfos, err := p.taskLauncher.Launch(
+			ctx,
+			launchableTaskInfos,
+			placement,
+		)
+		if err != nil {
 			p.processSkippedLaunches(ctx, launchableTaskInfos)
 			return
 		}
-
+		p.processSkippedLaunches(ctx, skippedTaskInfos)
 		// Finally, enqueue tasks into goalstate
 		p.enqueueTaskToGoalState(launchableTaskInfos)
 	}
@@ -298,10 +295,13 @@ func (p *processor) createTaskInfos(
 		}
 		retry := 0
 		for retry < maxRetryCount {
-			err = cachedJob.PatchTasks(ctx,
+			_, _, err := cachedJob.PatchTasks(
+				ctx,
 				map[uint32]jobmgrcommon.RuntimeDiff{
 					uint32(instanceID): launchableTask.RuntimeDiff,
-				})
+				},
+				false,
+			)
 			if err == nil {
 				runtime, _ := cachedTask.GetRuntime(ctx)
 				taskInfos[taskID] = &launcher.LaunchableTaskInfo{
@@ -312,24 +312,28 @@ func (p *processor) createTaskInfos(
 						JobId:      jobID,
 					},
 					ConfigAddOn: launchableTask.ConfigAddOn,
+					Spec:        launchableTask.Spec,
 				}
 				break
 			}
+
 			if common.IsTransientError(err) {
 				// TBD add a max retry to bail out after a few retries.
 				log.WithError(err).WithFields(log.Fields{
 					"job_id":      id,
 					"instance_id": instanceID,
 				}).Warn("retrying update task runtime on transient error")
-			} else {
-				log.WithError(err).WithFields(log.Fields{
+				retry++
+				continue
+			}
+
+			log.WithError(err).
+				WithFields(log.Fields{
 					"job_id":      id,
 					"instance_id": instanceID,
 				}).Error("cannot process placement due to non-transient db error")
-				delete(taskInfos, taskID)
-				break
-			}
-			retry++
+			delete(taskInfos, taskID)
+			break
 		}
 	}
 	return taskInfos, skippedTasks
@@ -401,9 +405,10 @@ func (p *processor) enqueueTasksToResMgr(ctx context.Context, tasks map[string]*
 		retry := 0
 		for retry < maxRetryCount {
 			cachedJob := p.jobFactory.AddJob(t.JobId)
-			err = cachedJob.PatchTasks(
+			_, _, err = cachedJob.PatchTasks(
 				ctx,
 				map[uint32]jobmgrcommon.RuntimeDiff{uint32(t.InstanceId): runtimeDiff},
+				false,
 			)
 			if err == nil {
 				p.goalStateDriver.EnqueueTask(t.JobId, t.InstanceId, time.Now())

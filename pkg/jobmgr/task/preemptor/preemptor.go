@@ -29,7 +29,7 @@ import (
 	"github.com/uber/peloton/pkg/jobmgr/cached"
 	jobmgrcommon "github.com/uber/peloton/pkg/jobmgr/common"
 	"github.com/uber/peloton/pkg/jobmgr/goalstate"
-	"github.com/uber/peloton/pkg/storage"
+	ormobjects "github.com/uber/peloton/pkg/storage/objects"
 
 	multierror "github.com/hashicorp/go-multierror"
 	"github.com/pkg/errors"
@@ -69,12 +69,12 @@ type Preemptor interface {
 // preemptor implements the Preemptor interface
 type preemptor struct {
 	resMgrClient    resmgrsvc.ResourceManagerServiceYARPCClient
-	taskStore       storage.TaskStore
 	jobFactory      cached.JobFactory
 	goalStateDriver goalstate.Driver
 	config          *Config
 	metrics         *Metrics
 	lifeCycle       lifecycle.LifeCycle // lifecycle manager
+	taskConfigV2Ops ormobjects.TaskConfigV2Ops
 }
 
 var _timeoutFunctionCall = 120 * time.Second
@@ -83,7 +83,7 @@ var _timeoutFunctionCall = 120 * time.Second
 func New(
 	d *yarpc.Dispatcher,
 	resMgrClientName string,
-	taskStore storage.TaskStore,
+	ormStore *ormobjects.Store,
 	jobFactory cached.JobFactory,
 	goalStateDriver goalstate.Driver,
 	config *Config,
@@ -92,12 +92,12 @@ func New(
 
 	return &preemptor{
 		resMgrClient:    resmgrsvc.NewResourceManagerServiceYARPCClient(d.ClientConfig(resMgrClientName)),
-		taskStore:       taskStore,
 		jobFactory:      jobFactory,
 		goalStateDriver: goalStateDriver,
 		config:          config,
 		metrics:         NewMetrics(parent.SubScope("jobmgr").SubScope("task")),
 		lifeCycle:       lifecycle.NewLifeCycle(),
+		taskConfigV2Ops: ormobjects.NewTaskConfigV2Ops(ormStore),
 	}
 }
 
@@ -208,8 +208,16 @@ func (p *preemptor) preemptTasks(
 			runtime,
 			preemptPolicy)
 
-		// update the task in cache and enqueue to goal state engine
-		err = cachedJob.PatchTasks(ctx, map[uint32]jobmgrcommon.RuntimeDiff{uint32(instanceID): runtimeDiff})
+		// update the task and SLAInfo in cache and enqueue to goal state engine.
+		// We do not need to handle the `instancesToBeRetried` here since the
+		// task is being enqueued into the goalstate. The goalstate will reload
+		// runtime into cache if needed. The task preemption will be retried
+		// in the next preemption cycle.
+		_, _, err = cachedJob.PatchTasks(
+			ctx,
+			map[uint32]jobmgrcommon.RuntimeDiff{uint32(instanceID): runtimeDiff},
+			false,
+		)
 		if err != nil {
 			errs = multierror.Append(errs, err)
 		} else {
@@ -276,7 +284,7 @@ func (p *preemptor) getTaskPreemptionPolicy(
 	jobID *peloton.JobID,
 	instanceID uint32,
 	configVersion uint64) (*pbtask.PreemptionPolicy, error) {
-	config, _, err := p.taskStore.GetTaskConfig(
+	config, _, err := p.taskConfigV2Ops.GetTaskConfig(
 		ctx,
 		jobID,
 		instanceID,
@@ -296,10 +304,23 @@ func getRuntimeDiffForPreempt(
 	instanceID uint32,
 	taskReason resmgr.PreemptionReason,
 	taskRuntime *pbtask.RuntimeInfo,
-	preemptPolicy *pbtask.PreemptionPolicy) jobmgrcommon.RuntimeDiff {
+	preemptPolicy *pbtask.PreemptionPolicy,
+) jobmgrcommon.RuntimeDiff {
+
+	tsReason := pbtask.TerminationStatus_TERMINATION_STATUS_REASON_INVALID
+	switch taskReason {
+	case resmgr.PreemptionReason_PREEMPTION_REASON_HOST_MAINTENANCE:
+		tsReason = pbtask.TerminationStatus_TERMINATION_STATUS_REASON_KILLED_HOST_MAINTENANCE
+	case resmgr.PreemptionReason_PREEMPTION_REASON_REVOKE_RESOURCES:
+		tsReason = pbtask.TerminationStatus_TERMINATION_STATUS_REASON_PREEMPTED_RESOURCES
+	}
+
 	runtimeDiff := jobmgrcommon.RuntimeDiff{
 		jobmgrcommon.MessageField: _msgPreemptingRunningTask,
 		jobmgrcommon.ReasonField:  taskReason.String(),
+		jobmgrcommon.TerminationStatusField: &pbtask.TerminationStatus{
+			Reason: tsReason,
+		},
 	}
 
 	if preemptPolicy != nil && preemptPolicy.GetKillOnPreempt() {
@@ -312,15 +333,7 @@ func getRuntimeDiffForPreempt(
 			// kill the task if GetKillOnPreempt is true
 			runtimeDiff[jobmgrcommon.GoalStateField] = pbtask.TaskState_KILLED
 		}
-		tsReason := pbtask.TerminationStatus_TERMINATION_STATUS_REASON_INVALID
-		switch taskReason {
-		case resmgr.PreemptionReason_PREEMPTION_REASON_HOST_MAINTENANCE:
-			tsReason = pbtask.TerminationStatus_TERMINATION_STATUS_REASON_KILLED_HOST_MAINTENANCE
-		case resmgr.PreemptionReason_PREEMPTION_REASON_REVOKE_RESOURCES:
-			tsReason = pbtask.TerminationStatus_TERMINATION_STATUS_REASON_PREEMPTED_RESOURCES
-		}
-		runtimeDiff[jobmgrcommon.TerminationStatusField] =
-			&pbtask.TerminationStatus{Reason: tsReason}
+
 		return runtimeDiff
 	}
 

@@ -584,7 +584,7 @@ func processInstancesInUpdate(
 	}
 
 	if len(runtimes) > 0 {
-		if err := cachedJob.PatchTasks(ctx, runtimes); err != nil {
+		if _, _, err := cachedJob.PatchTasks(ctx, runtimes, false); err != nil {
 			return err
 		}
 	}
@@ -639,7 +639,7 @@ func removeInstancesInUpdate(
 	}
 
 	if len(runtimes) > 0 {
-		if err := cachedJob.PatchTasks(ctx, runtimes); err != nil {
+		if _, _, err := cachedJob.PatchTasks(ctx, runtimes, false); err != nil {
 			return err
 		}
 	}
@@ -850,7 +850,7 @@ func updateWithRecentRunID(
 	instanceID uint32,
 	runtime *pbtask.RuntimeInfo,
 	goalStateDriver *driver) error {
-	podEvents, err := goalStateDriver.taskStore.GetPodEvents(
+	podEvents, err := goalStateDriver.podEventsOps.GetAll(
 		ctx,
 		jobID.GetValue(),
 		instanceID)

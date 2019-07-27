@@ -20,8 +20,10 @@ import (
 
 	"github.com/uber/peloton/.gen/peloton/api/v0/peloton"
 	"github.com/uber/peloton/.gen/peloton/api/v0/update"
+	"github.com/uber/peloton/.gen/peloton/api/v1alpha/job/stateless"
 	"github.com/uber/peloton/.gen/peloton/private/models"
 
+	"github.com/uber/peloton/pkg/common"
 	"github.com/uber/peloton/pkg/common/goalstate"
 	"github.com/uber/peloton/pkg/jobmgr/cached"
 	jobmgrcommon "github.com/uber/peloton/pkg/jobmgr/common"
@@ -103,7 +105,7 @@ func handleUnchangedInstancesInUpdate(
 	if len(runtimes) > 0 {
 		// Just update the runtime of the tasks with the
 		// new version and move on.
-		if err := cachedJob.PatchTasks(ctx, runtimes); err != nil {
+		if _, _, err := cachedJob.PatchTasks(ctx, runtimes, false); err != nil {
 			return err
 		}
 	}
@@ -136,7 +138,7 @@ func UpdateStart(ctx context.Context, entity goalstate.Entity) error {
 
 	jobID := cachedWorkflow.JobID()
 	// fetch the job configuration first
-	jobConfig, configAddOn, err := goalStateDriver.jobConfigOps.Get(
+	obj, err := goalStateDriver.jobConfigOps.GetResult(
 		ctx,
 		jobID,
 		cachedWorkflow.GetGoalState().JobVersion)
@@ -144,13 +146,21 @@ func UpdateStart(ctx context.Context, entity goalstate.Entity) error {
 		goalStateDriver.mtx.updateMetrics.UpdateStartFail.Inc(1)
 		return err
 	}
+	jobConfig := obj.JobConfig
+	configAddOn := obj.ConfigAddOn
+
+	var spec *stateless.JobSpec
+	if obj.ApiVersion == common.V1AlphaApi {
+		spec = obj.JobSpec
+	}
 
 	// lets write the new task configs first
 	if err := cachedJob.CreateTaskConfigs(
 		ctx,
 		jobID,
 		jobConfig,
-		configAddOn); err != nil {
+		configAddOn,
+		spec); err != nil {
 		goalStateDriver.mtx.updateMetrics.UpdateStartFail.Inc(1)
 		return err
 	}
@@ -179,6 +189,7 @@ func UpdateStart(ctx context.Context, entity goalstate.Entity) error {
 			prevJobConfig,
 			jobConfig,
 			goalStateDriver.taskStore,
+			goalStateDriver.taskConfigV2Ops,
 		)
 		if err != nil {
 			goalStateDriver.mtx.updateMetrics.UpdateStartFail.Inc(1)

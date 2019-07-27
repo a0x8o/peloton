@@ -30,6 +30,7 @@ import (
 	common_config "github.com/uber/peloton/pkg/common/config"
 	"github.com/uber/peloton/pkg/common/leader"
 	"github.com/uber/peloton/pkg/common/util"
+	"github.com/uber/peloton/pkg/hostmgr/watchevent"
 
 	kingpin "gopkg.in/alecthomas/kingpin.v2"
 )
@@ -536,11 +537,11 @@ var (
 	host            = app.Command("host", "manage hosts")
 	hostMaintenance = host.Command("maintenance", "host maintenance")
 
-	hostMaintenanceStart          = hostMaintenance.Command("start", "start host maintenance on a list of hosts")
-	hostMaintenanceStartHostnames = hostMaintenanceStart.Arg("hostnames", "comma separated hostnames").Required().String()
+	hostMaintenanceStart         = hostMaintenance.Command("start", "start maintenance on a host")
+	hostMaintenanceStartHostname = hostMaintenanceStart.Arg("hostname", "hostname").Required().String()
 
-	hostMaintenanceComplete          = hostMaintenance.Command("complete", "complete host maintenance on a list of hosts")
-	hostMaintenanceCompleteHostnames = hostMaintenanceComplete.Arg("hostnames", "comma separated hostnames").Required().String()
+	hostMaintenanceComplete         = hostMaintenance.Command("complete", "complete maintenance on a host")
+	hostMaintenanceCompleteHostname = hostMaintenanceComplete.Arg("hostname", "hostname").Required().String()
 
 	hostQuery       = host.Command("query", "query hosts by state(s)")
 	hostQueryStates = hostQuery.Flag("states", "host state(s) to filter").Default("").Short('s').String()
@@ -625,7 +626,8 @@ var (
 	getHostsHostnames = getHosts.Flag("hosts", "filter the hosts based on the comma separated hostnames provided").String()
 
 	// command to watch mesos events update present in the event stream
-	watchHostMgr = hostmgr.Command("watch_events", "watch mesos event update received from mesos")
+	watchEventMesosUpdate = hostmgr.Command("events-mesos-update", "watch mesos event update received from mesos")
+	watchEventHostSummary = hostmgr.Command("events-host-summary", "watch mesos event update received from mesos")
 
 	// command to disable the kill tasks request to mesos master
 	disableKillTasks = hostmgr.Command("disable-kill-tasks", "disable the kill task request to mesos master")
@@ -835,9 +837,9 @@ func main() {
 	case taskRestart.FullCommand():
 		err = client.TaskRestartAction(*taskRestartJobName, *taskRestartInstanceRanges)
 	case hostMaintenanceStart.FullCommand():
-		err = client.HostMaintenanceStartAction(*hostMaintenanceStartHostnames)
+		err = client.HostMaintenanceStartAction(*hostMaintenanceStartHostname)
 	case hostMaintenanceComplete.FullCommand():
-		err = client.HostMaintenanceCompleteAction(*hostMaintenanceCompleteHostnames)
+		err = client.HostMaintenanceCompleteAction(*hostMaintenanceCompleteHostname)
 	case hostQuery.FullCommand():
 		err = client.HostQueryAction(*hostQueryStates)
 	case jobMgrThrottledPods.FullCommand():
@@ -906,8 +908,10 @@ func main() {
 		err = client.PodRefreshAction(*podRefreshPodName)
 	case podStart.FullCommand():
 		err = client.PodStartAction(*podStartPodName)
-	case watchHostMgr.FullCommand():
-		err = client.WatchHostManagerEvents()
+	case watchEventHostSummary.FullCommand():
+		err = client.WatchHostSummaryEvent(string(watchevent.HostSummary))
+	case watchEventMesosUpdate.FullCommand():
+		err = client.WatchEventStreamEvents(string(watchevent.EventStream))
 	case statelessListJobs.FullCommand():
 		err = client.StatelessListJobsAction()
 	case statelessListPods.FullCommand():

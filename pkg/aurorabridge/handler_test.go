@@ -34,6 +34,7 @@ import (
 	"github.com/uber/peloton/.gen/peloton/private/jobmgrsvc"
 	jobmgrmocks "github.com/uber/peloton/.gen/peloton/private/jobmgrsvc/mocks"
 	"github.com/uber/peloton/.gen/thrift/aurora/api"
+	cachemocks "github.com/uber/peloton/pkg/aurorabridge/cache/mocks"
 	commonmocks "github.com/uber/peloton/pkg/aurorabridge/common/mocks"
 	aurorabridgemocks "github.com/uber/peloton/pkg/aurorabridge/mocks"
 	"github.com/uber/peloton/pkg/common/util"
@@ -68,6 +69,7 @@ type ServiceHandlerTestSuite struct {
 	podClient      *podmocks.MockPodServiceYARPCClient
 	respoolLoader  *aurorabridgemocks.MockRespoolLoader
 	random         *commonmocks.MockRandom
+	jobIdCache     *cachemocks.MockJobIDCache
 
 	config        ServiceHandlerConfig
 	thermosConfig atop.ThermosExecutorConfig
@@ -85,6 +87,7 @@ func (suite *ServiceHandlerTestSuite) SetupTest() {
 	suite.podClient = podmocks.NewMockPodServiceYARPCClient(suite.ctrl)
 	suite.respoolLoader = aurorabridgemocks.NewMockRespoolLoader(suite.ctrl)
 	suite.random = commonmocks.NewMockRandom(suite.ctrl)
+	suite.jobIdCache = cachemocks.NewMockJobIDCache(suite.ctrl)
 
 	suite.random.EXPECT().
 		RandomUUID().
@@ -110,6 +113,7 @@ func (suite *ServiceHandlerTestSuite) SetupTest() {
 		suite.podClient,
 		suite.respoolLoader,
 		suite.random,
+		suite.jobIdCache,
 	)
 	suite.NoError(err)
 	suite.handler = handler
@@ -142,7 +146,11 @@ func (suite *ServiceHandlerTestSuite) TestGetJobSummary() {
 		label.BuildPartialAuroraJobKeyLabels(role, "", ""),
 		common.BridgeJobLabel,
 	)
-	suite.expectQueryJobsWithLabels(ql, jobIDs, jobKey)
+	jobCache := suite.expectQueryJobsWithLabels(ql, jobIDs, jobKey)
+
+	// Expect cache not populated
+	suite.jobIdCache.EXPECT().GetJobIDs(role).Return(nil)
+	suite.jobIdCache.EXPECT().PopulateFromJobCache(role, jobCache)
 
 	for _, jobID := range jobIDs {
 		podName := &peloton.PodName{Value: jobID.GetValue() + "-0"}
@@ -195,7 +203,11 @@ func (suite *ServiceHandlerTestSuite) TestGetJobSummarySkipNotFoundJobs() {
 		label.BuildPartialAuroraJobKeyLabels(role, "", ""),
 		common.BridgeJobLabel,
 	)
-	suite.expectQueryJobsWithLabels(ql, jobIDs, jobKey)
+	jobCache := suite.expectQueryJobsWithLabels(ql, jobIDs, jobKey)
+
+	// Expect cache not populated
+	suite.jobIdCache.EXPECT().GetJobIDs(role).Return(nil)
+	suite.jobIdCache.EXPECT().PopulateFromJobCache(role, jobCache)
 
 	for i, jobID := range jobIDs {
 		podName := &peloton.PodName{Value: jobID.GetValue() + "-0"}
@@ -257,7 +269,11 @@ func (suite *ServiceHandlerTestSuite) TestGetJobSummaryFailure() {
 		label.BuildPartialAuroraJobKeyLabels(role, "", ""),
 		common.BridgeJobLabel,
 	)
-	suite.expectQueryJobsWithLabels(ql, jobIDs, jobKey)
+	jobCache := suite.expectQueryJobsWithLabels(ql, jobIDs, jobKey)
+
+	// Expect cache not populated
+	suite.jobIdCache.EXPECT().GetJobIDs(role).Return(nil)
+	suite.jobIdCache.EXPECT().PopulateFromJobCache(role, jobCache)
 
 	for i, jobID := range jobIDs {
 		podName := &peloton.PodName{Value: jobID.GetValue() + "-0"}
@@ -397,7 +413,11 @@ func (suite *ServiceHandlerTestSuite) TestGetJobs() {
 		label.BuildPartialAuroraJobKeyLabels(role, "", ""),
 		common.BridgeJobLabel,
 	)
-	suite.expectQueryJobsWithLabels(ql, jobIDs, jobKey)
+	jobCache := suite.expectQueryJobsWithLabels(ql, jobIDs, jobKey)
+
+	// Expect cache not populated
+	suite.jobIdCache.EXPECT().GetJobIDs(role).Return(nil)
+	suite.jobIdCache.EXPECT().PopulateFromJobCache(role, jobCache)
 
 	for _, jobID := range jobIDs {
 		podName := &peloton.PodName{Value: jobID.GetValue() + "-0"}
@@ -452,7 +472,11 @@ func (suite *ServiceHandlerTestSuite) TestGetJobsSkipNotFoundJobs() {
 		label.BuildPartialAuroraJobKeyLabels(role, "", ""),
 		common.BridgeJobLabel,
 	)
-	suite.expectQueryJobsWithLabels(ql, jobIDs, jobKey)
+	jobCache := suite.expectQueryJobsWithLabels(ql, jobIDs, jobKey)
+
+	// Expect cache not populated
+	suite.jobIdCache.EXPECT().GetJobIDs(role).Return(nil)
+	suite.jobIdCache.EXPECT().PopulateFromJobCache(role, jobCache)
 
 	for i, jobID := range jobIDs {
 		podName := &peloton.PodName{Value: jobID.GetValue() + "-0"}
@@ -516,7 +540,11 @@ func (suite *ServiceHandlerTestSuite) TestGetJobsFailure() {
 		label.BuildPartialAuroraJobKeyLabels(role, "", ""),
 		common.BridgeJobLabel,
 	)
-	suite.expectQueryJobsWithLabels(ql, jobIDs, jobKey)
+	jobCache := suite.expectQueryJobsWithLabels(ql, jobIDs, jobKey)
+
+	// Expect cache not populated
+	suite.jobIdCache.EXPECT().GetJobIDs(role).Return(nil)
+	suite.jobIdCache.EXPECT().PopulateFromJobCache(role, jobCache)
 
 	for i, jobID := range jobIDs {
 		podName := &peloton.PodName{Value: jobID.GetValue() + "-0"}
@@ -712,6 +740,8 @@ func (suite *ServiceHandlerTestSuite) TestStartJobUpdate_NewJobSuccess() {
 		CreateJob(gomock.Any(), gomock.Any()).
 		Return(&statelesssvc.CreateJobResponse{}, nil)
 
+	suite.jobIdCache.EXPECT().Invalidate(k.GetRole())
+
 	resp, err := suite.handler.StartJobUpdate(suite.ctx, req, ptr.String("some message"))
 	suite.NoError(err)
 	suite.Equal(api.ResponseCodeOk, resp.GetResponseCode())
@@ -740,6 +770,8 @@ func (suite *ServiceHandlerTestSuite) TestStartJobUpdate_NewJobConflict() {
 	suite.jobClient.EXPECT().
 		CreateJob(gomock.Any(), gomock.Any()).
 		Return(nil, yarpcerrors.AlreadyExistsErrorf(""))
+
+	suite.jobIdCache.EXPECT().Invalidate(req.GetTaskConfig().GetJob().GetRole())
 
 	resp, err := suite.handler.StartJobUpdate(suite.ctx, req, ptr.String("some message"))
 	suite.NoError(err)
@@ -1103,28 +1135,27 @@ func (suite *ServiceHandlerTestSuite) expectQueryJobsWithLabels(
 	labels []*peloton.Label,
 	jobIDs []*peloton.JobID,
 	jobKey *api.JobKey,
-) {
-	var summaries []*stateless.JobSummary
+) (jobCache []*jobmgrsvc.QueryJobCacheResponse_JobCache) {
 	for _, jobID := range jobIDs {
-		summaries = append(summaries, &stateless.JobSummary{
-			JobId:  jobID,
-			Name:   atop.NewJobName(jobKey),
-			Labels: labels,
+		jobCache = append(jobCache, &jobmgrsvc.QueryJobCacheResponse_JobCache{
+			JobId: jobID,
+			Name:  atop.NewJobName(jobKey),
 		})
 	}
 
-	suite.jobClient.EXPECT().
-		QueryJobs(gomock.Any(),
-			&statelesssvc.QueryJobsRequest{
-				Spec: &stateless.QuerySpec{
+	suite.jobmgrClient.EXPECT().
+		QueryJobCache(
+			gomock.Any(),
+			&jobmgrsvc.QueryJobCacheRequest{
+				Spec: &jobmgrsvc.QueryJobCacheRequest_CacheQuerySpec{
 					Labels: labels,
-					Pagination: &pbquery.PaginationSpec{
-						Limit:    suite.config.QueryJobsLimit,
-						MaxLimit: suite.config.QueryJobsLimit,
-					},
 				},
 			}).
-		Return(&statelesssvc.QueryJobsResponse{Records: summaries}, nil)
+		Return(&jobmgrsvc.QueryJobCacheResponse{
+			Result: jobCache,
+		}, nil)
+
+	return
 }
 
 func (suite *ServiceHandlerTestSuite) expectGetJobVersion(id *peloton.JobID, v *peloton.EntityVersion) {
@@ -1298,74 +1329,6 @@ func (suite *ServiceHandlerTestSuite) TestGetJobIDsFromTaskQuery_PartialJobKey()
 	}
 }
 
-// TestGetJobIDsFromTaskQuery_PartialJobKeyFilterUnexpected checks
-// getJobIDsFromTaskQuery returns result when input query only contains
-// partial job key parameters - role, environment, and/or job_name,
-// meanwhile jobs that does not contain expected labels are filtered out.
-func (suite *ServiceHandlerTestSuite) TestGetJobIDsFromTaskQuery_PartialJobKeyFilterUnexpected() {
-	defer goleak.VerifyNoLeaks(suite.T())
-
-	role := "role1"
-	env := "env1"
-	jobID1 := fixture.PelotonJobID()
-	jobID2 := fixture.PelotonJobID()
-	jobID3 := fixture.PelotonJobID()
-
-	labels := append(
-		label.BuildPartialAuroraJobKeyLabels(role, env, ""),
-		common.BridgeJobLabel,
-	)
-
-	var summaries []*stateless.JobSummary
-	for _, jobID := range []*peloton.JobID{jobID1, jobID2} {
-		summaries = append(summaries, &stateless.JobSummary{
-			JobId:  jobID,
-			Name:   atop.NewJobName(nil),
-			Labels: labels,
-		})
-	}
-
-	var unexpctedLabels []*peloton.Label
-	for _, l := range labels {
-		unexpctedLabels = append(unexpctedLabels, &peloton.Label{
-			Key:   l.GetKey(),
-			Value: l.GetValue() + "_unexpcted",
-		})
-	}
-	summaries = append(summaries, &stateless.JobSummary{
-		JobId:  jobID3,
-		Name:   atop.NewJobName(nil),
-		Labels: unexpctedLabels,
-	})
-
-	suite.jobClient.EXPECT().
-		QueryJobs(gomock.Any(),
-			&statelesssvc.QueryJobsRequest{
-				Spec: &stateless.QuerySpec{
-					Labels: labels,
-					Pagination: &pbquery.PaginationSpec{
-						Limit:    suite.config.QueryJobsLimit,
-						MaxLimit: suite.config.QueryJobsLimit,
-					},
-				},
-			}).
-		Return(&statelesssvc.QueryJobsResponse{Records: summaries}, nil)
-
-	query := &api.TaskQuery{
-		Role:        ptr.String(role),
-		Environment: ptr.String(env),
-	}
-
-	jobIDs, err := suite.handler.getJobIDsFromTaskQuery(suite.ctx, query)
-	suite.NoError(err)
-	suite.Equal(2, len(jobIDs))
-	for _, jobID := range jobIDs {
-		if jobID.Value != jobID1.Value && jobID.Value != jobID2.Value {
-			suite.Fail("unexpected job id: \"%s\"", jobID.Value)
-		}
-	}
-}
-
 // TestGetJobIDsFromTaskQuery_PartialJobKeyError checks getJobIDsFromTaskQuery
 // returns error when the query fails and input query only contains partial
 // job key parameters - role, environment, and/or job_name.
@@ -1380,18 +1343,15 @@ func (suite *ServiceHandlerTestSuite) TestGetJobIDsFromTaskQuery_PartialJobKeyEr
 		common.BridgeJobLabel,
 	)
 
-	suite.jobClient.EXPECT().
-		QueryJobs(gomock.Any(),
-			&statelesssvc.QueryJobsRequest{
-				Spec: &stateless.QuerySpec{
+	suite.jobmgrClient.EXPECT().
+		QueryJobCache(
+			gomock.Any(),
+			&jobmgrsvc.QueryJobCacheRequest{
+				Spec: &jobmgrsvc.QueryJobCacheRequest_CacheQuerySpec{
 					Labels: labels,
-					Pagination: &pbquery.PaginationSpec{
-						Limit:    suite.config.QueryJobsLimit,
-						MaxLimit: suite.config.QueryJobsLimit,
-					},
 				},
 			}).
-		Return(nil, errors.New("failed to get job summary"))
+		Return(nil, errors.New("failed to query job cache"))
 
 	query := &api.TaskQuery{
 		Role:    ptr.String(role),

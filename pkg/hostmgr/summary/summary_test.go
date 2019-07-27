@@ -17,16 +17,13 @@ package summary
 import (
 	"context"
 	"errors"
-	"fmt"
 	"strconv"
-	"sync"
 	"testing"
 	"time"
 
 	mesos "github.com/uber/peloton/.gen/mesos/v1"
 	"github.com/uber/peloton/.gen/peloton/api/v0/peloton"
 	"github.com/uber/peloton/.gen/peloton/api/v0/task"
-	"github.com/uber/peloton/.gen/peloton/api/v0/volume"
 	"github.com/uber/peloton/.gen/peloton/private/hostmgr/hostsvc"
 
 	"github.com/uber/peloton/pkg/common"
@@ -34,7 +31,7 @@ import (
 	constraint_mocks "github.com/uber/peloton/pkg/common/constraints/mocks"
 	"github.com/uber/peloton/pkg/common/util"
 	"github.com/uber/peloton/pkg/hostmgr/scalar"
-	store_mocks "github.com/uber/peloton/pkg/storage/mocks"
+	watchmocks "github.com/uber/peloton/pkg/hostmgr/watchevent/mocks"
 
 	"github.com/golang/mock/gomock"
 	log "github.com/sirupsen/logrus"
@@ -89,12 +86,11 @@ var (
 
 type HostOfferSummaryTestSuite struct {
 	suite.Suite
-
-	offer           *mesos.Offer
-	labels1         *mesos.Labels
-	labels2         *mesos.Labels
-	ctrl            *gomock.Controller
-	mockVolumeStore *store_mocks.MockPersistentVolumeStore
+	offer          *mesos.Offer
+	labels1        *mesos.Labels
+	labels2        *mesos.Labels
+	ctrl           *gomock.Controller
+	watchProcessor *watchmocks.MockWatchProcessor
 }
 
 func (suite *HostOfferSummaryTestSuite) SetupSuite() {
@@ -118,7 +114,7 @@ func (suite *HostOfferSummaryTestSuite) SetupSuite() {
 
 func (suite *HostOfferSummaryTestSuite) SetupTest() {
 	suite.ctrl = gomock.NewController(suite.T())
-	suite.mockVolumeStore = store_mocks.NewMockPersistentVolumeStore(suite.ctrl)
+	suite.watchProcessor = watchmocks.NewMockWatchProcessor(suite.ctrl)
 }
 
 func (suite *HostOfferSummaryTestSuite) TearDownTest() {
@@ -224,14 +220,6 @@ func (suite *HostOfferSummaryTestSuite) createReservedMesosOffer(
 		Hostname:  &_testAgent,
 		Resources: rs,
 	}
-}
-
-func (suite *HostOfferSummaryTestSuite) createReservedMesosOffers(count int, hasPersistentVolume bool) []*mesos.Offer {
-	var offers []*mesos.Offer
-	for i := 0; i < count; i++ {
-		offers = append(offers, suite.createReservedMesosOffer("offer-id-"+strconv.Itoa(i), hasPersistentVolume))
-	}
-	return offers
 }
 
 func (suite *HostOfferSummaryTestSuite) createUnreservedMesosOffer(
@@ -597,19 +585,18 @@ func (suite *HostOfferSummaryTestSuite) TestSlackResourcesConstraint() {
 			offerID:       emptyOfferID,
 		},
 	}
-
 	for ttName, tt := range testTable {
 		offers := suite.createUnreservedMesosOffers(5)
 		s := New(
-			suite.mockVolumeStore,
 			nil,
 			offers[0].GetHostname(),
 			supportedSlackResourceTypes,
 			time.Duration(30*time.Second),
+			suite.watchProcessor,
 		).(*hostSummary)
 		s.offerIDgenerator = seqIDGenerator(tt.offerID)
 		s.status = tt.initialStatus
-
+		suite.watchProcessor.EXPECT().NotifyEventChange(gomock.Any()).AnyTimes()
 		suite.Equal(tt.initialStatus, s.AddMesosOffers(context.Background(), offers))
 
 		filter := &hostsvc.HostFilter{
@@ -780,20 +767,19 @@ func (suite *HostOfferSummaryTestSuite) TestTryMatchSchedulingConstraint() {
 	for ttName, tt := range testTable {
 		ctrl := gomock.NewController(suite.T())
 		mockEvaluator := constraint_mocks.NewMockEvaluator(ctrl)
+		mockProcessor := watchmocks.NewMockWatchProcessor(ctrl)
 
 		offer0 := offer
 		if len(tt.initialOffers) > 0 {
 			offer0 = tt.initialOffers[0]
 		}
 		s := New(
-			suite.mockVolumeStore,
 			nil,
 			offer0.GetHostname(),
 			supportedSlackResourceTypes,
-			time.Duration(30*time.Second)).(*hostSummary)
+			time.Duration(30*time.Second), mockProcessor).(*hostSummary)
 		s.status = tt.initialStatus
 		s.offerIDgenerator = seqIDGenerator(tt.offerID)
-
 		suite.Equal(
 			tt.initialStatus,
 			s.AddMesosOffers(context.Background(),
@@ -836,7 +822,7 @@ func (suite *HostOfferSummaryTestSuite) TestTryMatchSchedulingConstraint() {
 					gomock.Eq(lv)).
 				Return(tt.evaluateRes, tt.evaluateErr)
 		}
-
+		mockProcessor.EXPECT().NotifyEventChange(gomock.Any())
 		match := s.TryMatch(filter, mockEvaluator)
 		suite.Equal(tt.wantResult, match.Result,
 			"test case is %s", ttName)
@@ -923,13 +909,12 @@ func (suite *HostOfferSummaryTestSuite) TestTryMatchHostOnHeld() {
 	for ttName, tt := range testTable {
 		ctrl := gomock.NewController(suite.T())
 		mockEvaluator := constraint_mocks.NewMockEvaluator(ctrl)
-
+		mockProcessor := watchmocks.NewMockWatchProcessor(ctrl)
 		s := New(
-			suite.mockVolumeStore,
 			nil,
 			offer.GetHostname(),
 			supportedSlackResourceTypes,
-			time.Duration(30*time.Second)).(*hostSummary)
+			time.Duration(30*time.Second), mockProcessor).(*hostSummary)
 		s.status = tt.initialStatus
 		s.offerIDgenerator = seqIDGenerator(tt.offerID)
 
@@ -961,7 +946,7 @@ func (suite *HostOfferSummaryTestSuite) TestTryMatchHostOnHeld() {
 					gomock.Eq(lv)).
 				Return(tt.evaluateRes, tt.evaluateErr)
 		}
-
+		mockProcessor.EXPECT().NotifyEventChange(gomock.Any())
 		match := s.TryMatch(filter, mockEvaluator)
 		suite.Equal(tt.wantResult, match.Result,
 			"test case is %s", ttName)
@@ -979,123 +964,12 @@ func (suite *HostOfferSummaryTestSuite) TestTryMatchHostOnHeld() {
 	}
 }
 
-func (suite *HostOfferSummaryTestSuite) TestAddRemoveHybridOffers() {
-	defer suite.ctrl.Finish()
-	// Add offer concurrently.
-	reservedOffers := 5
-	unreservedOffers := 5
-	nOffers := reservedOffers + unreservedOffers
-	wg := sync.WaitGroup{}
-	wg.Add(nOffers)
-
-	hybridSummary := New(suite.mockVolumeStore,
-		nil,
-		_testAgent,
-		supportedSlackResourceTypes,
-		time.Duration(30*time.Second)).(*hostSummary)
-
-	suite.False(hybridSummary.HasOffer())
-	suite.False(hybridSummary.HasAnyOffer())
-	suite.Equal(hybridSummary.readyCount.Load(), int32(0))
-
-	// Try to remove non-existent offer.
-	status, offer := hybridSummary.RemoveMesosOffer(_dummyOfferID, "Offer is expired")
-	suite.Equal(status, ReadyHost)
-	suite.Nil(offer)
-
-	var offers []*mesos.Offer
-	for i := 0; i < reservedOffers; i++ {
-		offerID := fmt.Sprintf("reserved-%d", i)
-		offers = append(offers, suite.createReservedMesosOffer(offerID, true /* hasPersistentVolume */))
-	}
-	for i := 0; i < unreservedOffers; i++ {
-		offerID := fmt.Sprintf("unreserved-%d", i)
-		offers = append(offers, suite.createUnreservedMesosOffer(offerID))
-	}
-
-	volumeInfo := &volume.PersistentVolumeInfo{}
-
-	suite.mockVolumeStore.EXPECT().
-		GetPersistentVolume(context.Background(), gomock.Any()).
-		AnyTimes().
-		Return(volumeInfo, nil)
-	suite.mockVolumeStore.EXPECT().
-		UpdatePersistentVolume(context.Background(), gomock.Any()).
-		AnyTimes().
-		Return(nil)
-
-	status = hybridSummary.AddMesosOffers(context.Background(), offers)
-
-	// Verify aggregated resources for reserved part.
-	suite.Equal(reservedOffers, len(hybridSummary.reservedOffers))
-	suite.Equal(unreservedOffers, len(hybridSummary.unreservedOffers))
-
-	// Verify resources for unreserved part.
-	suite.True(hybridSummary.HasOffer())
-	suite.True(hybridSummary.HasAnyOffer())
-	suite.Equal(hybridSummary.readyCount.Load(), int32(5))
-	unreservedAmount, revocableUnreservedAmount, status := hybridSummary.UnreservedAmount()
-	suite.Equal(5.0, unreservedAmount.CPU)
-	suite.Equal(5.0, revocableUnreservedAmount.CPU)
-	suite.Equal(5.0, unreservedAmount.Mem)
-	suite.Equal(5.0, unreservedAmount.Disk)
-	suite.Equal(5.0, unreservedAmount.GPU)
-
-	suite.Equal(ReadyHost, status)
-
-	// Remove offer concurrently.
-	wg = sync.WaitGroup{}
-	wg.Add(nOffers)
-	for _, offer := range offers {
-		go func(offer *mesos.Offer) {
-			defer wg.Done()
-
-			status, offer := hybridSummary.RemoveMesosOffer(*offer.Id.Value, "Offer is rescinded")
-			suite.Equal(ReadyHost, status)
-			suite.NotNil(offer)
-		}(offer)
-	}
-	wg.Wait()
-
-	// Verify aggregated resources.
-	suite.Empty(hybridSummary.reservedOffers)
-	suite.Empty(hybridSummary.unreservedOffers)
-	suite.Equal(hybridSummary.readyCount.Load(), int32(0))
-	suite.Equal(ReadyHost, hybridSummary.status)
-
-	hybridSummary.AddMesosOffers(context.Background(), offers)
-
-	// Verify aggregated resources for reserved part.
-	suite.Equal(reservedOffers, len(hybridSummary.reservedOffers))
-	suite.Equal(unreservedOffers, len(hybridSummary.unreservedOffers))
-
-	// Verify resources for unreserved part.
-	suite.True(hybridSummary.HasOffer())
-	suite.True(hybridSummary.HasAnyOffer())
-	suite.Equal(hybridSummary.readyCount.Load(), int32(5))
-	unreservedAmount, revocableUnreservedAmount, status = hybridSummary.UnreservedAmount()
-	suite.Equal(5.0, unreservedAmount.CPU)
-	suite.Equal(5.0, revocableUnreservedAmount.CPU)
-	suite.Equal(5.0, unreservedAmount.Mem)
-	suite.Equal(5.0, unreservedAmount.Disk)
-	suite.Equal(5.0, unreservedAmount.GPU)
-	summaryOffers := hybridSummary.GetOffers(Reserved)
-	suite.Equal(len(summaryOffers), 5)
-	summaryOffers = hybridSummary.GetOffers(Unreserved)
-	suite.Equal(len(summaryOffers), 5)
-	summaryOffers = hybridSummary.GetOffers(All)
-	suite.Equal(len(summaryOffers), 10)
-
-	suite.Equal(ReadyHost, status)
-}
-
 func (suite *HostOfferSummaryTestSuite) TestResetExpiredPlacingOfferStatus() {
 	defer suite.ctrl.Finish()
 
 	now := time.Now()
 	offers := suite.createUnreservedMesosOffers(5)
 	hostname := offers[0].GetHostname()
-
 	testTable := []struct {
 		initialStatus                HostStatus
 		statusPlacingOfferExpiration time.Time
@@ -1125,13 +999,12 @@ func (suite *HostOfferSummaryTestSuite) TestResetExpiredPlacingOfferStatus() {
 			msg:                          "HostSummary in PlacingOffer status, has timed out",
 		},
 	}
-
+	suite.watchProcessor.EXPECT().NotifyEventChange(gomock.Any()).AnyTimes()
 	for _, tt := range testTable {
-		s := New(suite.mockVolumeStore, nil, hostname, supportedSlackResourceTypes, time.Duration(30*time.Second)).(*hostSummary)
+		s := New(nil, hostname, supportedSlackResourceTypes, time.Duration(30*time.Second), suite.watchProcessor).(*hostSummary)
 		s.status = tt.initialStatus
 		s.statusPlacingOfferExpiration = tt.statusPlacingOfferExpiration
 		s.AddMesosOffers(context.Background(), offers)
-
 		reset, _, _ := s.ResetExpiredPlacingOfferStatus(now)
 		suite.Equal(tt.resetExpected, reset, tt.msg)
 		suite.Equal(s.readyCount.Load(), int32(tt.readyCount), tt.msg)
@@ -1140,7 +1013,7 @@ func (suite *HostOfferSummaryTestSuite) TestResetExpiredPlacingOfferStatus() {
 		}
 	}
 
-	s := New(suite.mockVolumeStore, nil, hostname, supportedSlackResourceTypes, time.Duration(30*time.Second)).(*hostSummary)
+	s := New(nil, hostname, supportedSlackResourceTypes, time.Duration(30*time.Second), suite.watchProcessor).(*hostSummary)
 	s.AddMesosOffers(context.Background(), offers)
 	s.statusPlacingOfferExpiration = now.Add(-10 * time.Minute)
 	invalidCacheStatus := s.CasStatus(PlacingHost, ReadyHost)
@@ -1257,12 +1130,12 @@ func (suite *HostOfferSummaryTestSuite) TestResetExpiredHeldOfferStatus() {
 	}
 
 	for _, tt := range testTable {
-		s := New(suite.mockVolumeStore, nil, "host1", supportedSlackResourceTypes, time.Duration(30*time.Second)).(*hostSummary)
+		s := New(nil, "host1", supportedSlackResourceTypes, time.Duration(30*time.Second), suite.watchProcessor).(*hostSummary)
 		s.status = tt.initialStatus
 		for _, task := range tt.tasksHeld {
 			s.heldTasks[task.taskHeld.GetValue()] = task.statusHeldHostExpiration
 		}
-
+		suite.watchProcessor.EXPECT().NotifyEventChange(gomock.Any()).AnyTimes()
 		reset, _, taskExpired := s.ResetExpiredHostHeldStatus(now)
 		suite.Equal(tt.newStatus, s.status, tt.msg)
 		suite.Equal(tt.resetExpected, reset, tt.msg)
@@ -1273,8 +1146,6 @@ func (suite *HostOfferSummaryTestSuite) TestResetExpiredHeldOfferStatus() {
 func (suite *HostOfferSummaryTestSuite) TestClaimForUnreservedOffersForLaunch() {
 	defer suite.ctrl.Finish()
 	offers := suite.createUnreservedMesosOffers(5)
-	offers = append(offers, suite.createReservedMesosOffer(
-		"reserved-offerid-1", false))
 
 	testTable := []struct {
 		name               string
@@ -1345,22 +1216,20 @@ func (suite *HostOfferSummaryTestSuite) TestClaimForUnreservedOffersForLaunch() 
 
 	for _, tt := range testTable {
 		s := New(
-			suite.mockVolumeStore,
 			nil,
 			offers[0].GetHostname(),
 			supportedSlackResourceTypes,
-			time.Duration(30*time.Second)).(*hostSummary)
+			time.Duration(30*time.Second), suite.watchProcessor).(*hostSummary)
 		s.AddMesosOffers(context.Background(), offers)
-		suite.Equal(s.readyCount.Load(), int32(len(offers)-1))
+		suite.Equal(s.readyCount.Load(), int32(len(offers)))
 		s.status = tt.initialStatus
 		s.hostOfferID = tt.offerID
 
 		for _, heldTask := range tt.heldTasks {
 			s.HoldForTask(heldTask)
 		}
-
 		suite.Len(s.GetHeldTask(), len(tt.heldTasks))
-
+		suite.watchProcessor.EXPECT().NotifyEventChange(gomock.Any()).AnyTimes()
 		_, err := s.ClaimForLaunch(offers[0].GetId().GetValue(), tt.claimTasks...)
 		if err != nil {
 			suite.Equal(err.Error(), tt.err.Error(), tt.name)
@@ -1376,32 +1245,16 @@ func (suite *HostOfferSummaryTestSuite) TestClaimForUnreservedOffersForLaunch() 
 	}
 }
 
-func (suite *HostOfferSummaryTestSuite) TestClaimForReservedOffersForLaunch() {
-	defer suite.ctrl.Finish()
-	offers := suite.createReservedMesosOffers(5, true)
-	offers = append(offers, suite.createUnreservedMesosOffer("unreserved-offerid-1"))
-
-	s := New(suite.mockVolumeStore, nil, offers[0].GetHostname(), supportedSlackResourceTypes, time.Duration(30*time.Second)).(*hostSummary)
-
-	s.AddMesosOffers(context.Background(), offers)
-	suite.Equal(int(s.readyCount.Load()), 1)
-
-	s.ClaimReservedOffersForLaunch()
-	suite.Equal(s.GetHostStatus(), ReadyHost)
-	suite.Equal(int(s.readyCount.Load()), 1)
-	summaryOffers := s.GetOffers(Reserved)
-	suite.Equal(len(summaryOffers), 0)
-}
-
 func (suite *HostOfferSummaryTestSuite) TestHoldAndReleaseTask() {
 	defer suite.ctrl.Finish()
 
 	hostname0 := "hostname-0"
-	hs0 := New(suite.mockVolumeStore, nil, hostname0, supportedSlackResourceTypes, time.Duration(30*time.Second)).(*hostSummary)
+	hs0 := New(nil, hostname0, supportedSlackResourceTypes, time.Duration(30*time.Second), suite.watchProcessor).(*hostSummary)
 
 	hostname1 := "hostname-1"
-	hs1 := New(suite.mockVolumeStore, nil, hostname1, supportedSlackResourceTypes, time.Duration(30*time.Second)).(*hostSummary)
+	hs1 := New(nil, hostname1, supportedSlackResourceTypes, time.Duration(30*time.Second), suite.watchProcessor).(*hostSummary)
 
+	suite.watchProcessor.EXPECT().NotifyEventChange(gomock.Any()).AnyTimes()
 	t1 := &peloton.TaskID{Value: "t1"}
 	t2 := &peloton.TaskID{Value: "t2"}
 	t3 := &peloton.TaskID{Value: "t3"}
@@ -1423,7 +1276,8 @@ func (suite *HostOfferSummaryTestSuite) TestHoldAndReleaseTask() {
 func (suite *HostOfferSummaryTestSuite) TestReturnPlacingHost() {
 	defer suite.ctrl.Finish()
 
-	hs := New(suite.mockVolumeStore, nil, _testAgent, supportedSlackResourceTypes, time.Duration(30*time.Second)).(*hostSummary)
+	hs := New(nil, _testAgent, supportedSlackResourceTypes, time.Duration(30*time.Second), suite.watchProcessor).(*hostSummary)
+	suite.watchProcessor.EXPECT().NotifyEventChange(gomock.Any()).AnyTimes()
 	// host in ready state, should fail the call
 	suite.Error(hs.ReturnPlacingHost())
 

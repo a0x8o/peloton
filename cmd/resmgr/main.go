@@ -22,6 +22,7 @@ import (
 	"github.com/uber/peloton/pkg/auth"
 	auth_impl "github.com/uber/peloton/pkg/auth/impl"
 	"github.com/uber/peloton/pkg/common"
+	"github.com/uber/peloton/pkg/common/api"
 	"github.com/uber/peloton/pkg/common/buildversion"
 	"github.com/uber/peloton/pkg/common/config"
 	"github.com/uber/peloton/pkg/common/health"
@@ -260,6 +261,10 @@ func main() {
 	log.WithField("config", cfg).
 		Info("Completed Resource Manager config")
 
+	if cfg.ResManager.HostManagerAPIVersion == "" {
+		cfg.ResManager.HostManagerAPIVersion = api.V0
+	}
+
 	rootScope, scopeCloser, mux := metrics.InitMetricScope(
 		&cfg.Metrics,
 		common.PelotonResourceManager,
@@ -278,6 +283,8 @@ func main() {
 	if ormErr != nil {
 		log.WithError(ormErr).Fatal("Failed to create ORM store for Cassandra")
 	}
+	respoolOps := ormobjects.NewResPoolOps(ormStore)
+	activeJobsOps := ormobjects.NewActiveJobsOps(ormStore)
 
 	// Create both HTTP and GRPC inbounds
 	inbounds := rpc.NewInbounds(
@@ -359,7 +366,7 @@ func main() {
 	// Initializing Resource Pool Tree.
 	tree := respool.NewTree(
 		rootScope,
-		store, // store implements RespoolStore
+		respoolOps,
 		store, // store implements JobStore
 		store, // store implements TaskStore
 		*cfg.ResManager.PreemptionConfig)
@@ -369,7 +376,7 @@ func main() {
 		dispatcher,
 		rootScope,
 		tree,
-		store, // store implements RespoolStore
+		ormobjects.NewResPoolOps(ormStore),
 	)
 
 	// Initializing the rmtasks in-memory tracker
@@ -390,8 +397,9 @@ func main() {
 	calculator := entitlement.NewCalculator(
 		cfg.ResManager.EntitlementCaculationPeriod,
 		rootScope,
-		hostmgrClient,
+		dispatcher,
 		tree,
+		cfg.ResManager.HostManagerAPIVersion,
 	)
 
 	// Initializing the task reconciler
@@ -432,8 +440,8 @@ func main() {
 	// Initialize recovery
 	recoveryHandler := resmgr.NewRecovery(
 		rootScope,
-		store, // store implements JobStore
 		store, // store implements TaskStore
+		activeJobsOps,
 		ormobjects.NewJobConfigOps(ormStore),
 		ormobjects.NewJobRuntimeOps(ormStore),
 		serviceHandler,

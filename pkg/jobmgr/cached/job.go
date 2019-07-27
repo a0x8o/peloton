@@ -21,11 +21,14 @@ import (
 	"sync"
 	"time"
 
+	mesos "github.com/uber/peloton/.gen/mesos/v1"
 	pbjob "github.com/uber/peloton/.gen/peloton/api/v0/job"
 	"github.com/uber/peloton/.gen/peloton/api/v0/peloton"
 	pbtask "github.com/uber/peloton/.gen/peloton/api/v0/task"
 	pbupdate "github.com/uber/peloton/.gen/peloton/api/v0/update"
+	"github.com/uber/peloton/.gen/peloton/api/v1alpha/job/stateless"
 	v1alphapeloton "github.com/uber/peloton/.gen/peloton/api/v1alpha/peloton"
+	pbpod "github.com/uber/peloton/.gen/peloton/api/v1alpha/pod"
 	"github.com/uber/peloton/.gen/peloton/private/models"
 
 	"github.com/uber/peloton/pkg/common"
@@ -44,7 +47,28 @@ import (
 	"go.uber.org/yarpc/yarpcerrors"
 )
 
-var _updateDeleteJobErr = yarpcerrors.InvalidArgumentErrorf("job is going to be deleted")
+var (
+	_defaultTimeout     = 10 * time.Second
+	_updateDeleteJobErr = yarpcerrors.InvalidArgumentErrorf("job is going to be deleted")
+)
+
+// instance availability type. It is used to determine the type of instance
+// availability in instance availability calculation for SLA Aware pod kill
+type instanceAvailability_Type int32
+
+const (
+	// Invalid instance availability
+	instanceAvailability_INVALID instanceAvailability_Type = 0
+	// instance is available - RUNNING and HEALTHY (if health check defined)
+	instanceAvailability_AVAILABLE instanceAvailability_Type = 1
+	// instance has been killed (deadline-exceeded, by user, etc) or preempted
+	instanceAvailability_KILLED instanceAvailability_Type = 2
+	// instance has been deleted
+	instanceAvailability_DELETED instanceAvailability_Type = 3
+	// instance is any state other than the ones specified above is said to be
+	// unavailable
+	instanceAvailability_UNAVAILABLE instanceAvailability_Type = 4
+)
 
 // Job in the cache.
 // TODO there a lot of methods in this interface. To determine if
@@ -61,6 +85,7 @@ type Job interface {
 		jobID *peloton.JobID,
 		jobConfig *pbjob.JobConfig,
 		configAddOn *models.ConfigAddOn,
+		spec *stateless.JobSpec,
 	) error
 
 	// CreateTaskRuntimes creates the task runtimes in cache and DB.
@@ -68,13 +93,23 @@ type Job interface {
 	// storage calls are different.
 	CreateTaskRuntimes(ctx context.Context, runtimes map[uint32]*pbtask.RuntimeInfo, owner string) error
 
-	// PatchTasks patch runtime diff to the existing task cache. runtimeDiffs
+	// PatchTasks patches runtime diff to the existing task cache. runtimeDiffs
 	// is a kv map with key as the instance_id of the task to be updated.
 	// Value of runtimeDiffs is RuntimeDiff, of which key is the field name
 	// to be update, and value is the new value of the field. PatchTasks
 	// would save the change in both cache and DB. If persisting to DB fails,
-	// cache would be invalidated as well.
-	PatchTasks(ctx context.Context, runtimeDiffs map[uint32]jobmgrcommon.RuntimeDiff) error
+	// cache would be invalidated as well. The `force` flag affects only stateless
+	// jobs. By default (with force flag unset), stateless jobs are patched in
+	// a SLA aware manner i.e. only the tasks in the runtimeDiff which do not
+	// violate the job SLA will be patched. If `force` flag is set, the diff
+	// will be patched even if it violates job SLA. PatchTasks returns 2 lists
+	// 1. list of instance_ids which were successfully patched and
+	// 2. a list of instance_ids that should be retried.
+	PatchTasks(
+		ctx context.Context,
+		runtimeDiffs map[uint32]jobmgrcommon.RuntimeDiff,
+		force bool,
+	) (instancesSucceeded []uint32, instancesToBeRetried []uint32, err error)
 
 	// ReplaceTasks replaces task runtime and config in cache.
 	// If forceReplace is false, it would check Revision version
@@ -105,6 +140,7 @@ type Job interface {
 		ctx context.Context,
 		config *pbjob.JobConfig,
 		configAddOn *models.ConfigAddOn,
+		spec *stateless.JobSpec,
 	) error
 
 	// RollingCreate is used to create the job configuration and runtime in DB.
@@ -114,6 +150,7 @@ type Job interface {
 		ctx context.Context,
 		config *pbjob.JobConfig,
 		configAddOn *models.ConfigAddOn,
+		spec *stateless.JobSpec,
 		updateConfig *pbupdate.UpdateConfig,
 		opaqueData *peloton.OpaqueData,
 	) error
@@ -124,7 +161,13 @@ type Job interface {
 	// If successful, the cache is updated as well.
 	// TODO: no config update should go through this API, divide this API into
 	// config and runtime part
-	Update(ctx context.Context, jobInfo *pbjob.JobInfo, configAddOn *models.ConfigAddOn, req UpdateRequest) error
+	Update(
+		ctx context.Context,
+		jobInfo *pbjob.JobInfo,
+		configAddOn *models.ConfigAddOn,
+		spec *stateless.JobSpec,
+		req UpdateRequest,
+	) error
 
 	// CompareAndSetRuntime replaces the existing job runtime in cache and DB with
 	// the job runtime supplied. CompareAndSetRuntime would use
@@ -143,7 +186,29 @@ type Job interface {
 	// automatically upon success. Caller should not manually modify
 	// the value of JobConfig.ChangeLog.Version.
 	// It returns the resultant jobConfig with version updated.
-	CompareAndSetConfig(ctx context.Context, config *pbjob.JobConfig, configAddOn *models.ConfigAddOn) (jobmgrcommon.JobConfig, error)
+	// JobSpec is also passed along so that it can be written as is to the DB
+	CompareAndSetConfig(
+		ctx context.Context,
+		config *pbjob.JobConfig,
+		configAddOn *models.ConfigAddOn,
+		spec *stateless.JobSpec,
+	) (jobmgrcommon.JobConfig, error)
+
+	// CompareAndSetTask replaces the existing task runtime in DB and cache.
+	// It uses RuntimeInfo.Revision.Version for concurrency control, and it would
+	// update RuntimeInfo.Revision.Version automatically upon success.
+	// Caller should not manually modify the value of RuntimeInfo.Revision.Version.
+	// The `force` flag affects only stateless jobs. By default (with force flag
+	// not set), for stateless job, if the task is becoming unavailable due to
+	// host maintenance and update, then runtime is set only if it does not
+	// violate the job SLA. If `force` flag is set, the task runtime will
+	// be set even if it violates job SLA.
+	CompareAndSetTask(
+		ctx context.Context,
+		id uint32,
+		runtime *pbtask.RuntimeInfo,
+		force bool,
+	) (*pbtask.RuntimeInfo, error)
 
 	// IsPartiallyCreated returns if job has not been fully created yet
 	IsPartiallyCreated(config jobmgrcommon.JobConfig) bool
@@ -209,6 +274,9 @@ type Job interface {
 
 	// GetWorkflowStateCount returns the state count of all workflows in the cache
 	GetWorkflowStateCount() map[pbupdate.State]int
+
+	// RepopulateInstanceAvailabilityInfo repopulates the SLA information in the job cache
+	RepopulateInstanceAvailabilityInfo(ctx context.Context) error
 }
 
 // JobSpreadCounts contains task and host counts for jobs that use
@@ -345,6 +413,18 @@ type job struct {
 	resourceUsage map[string]float64
 
 	workflows map[string]*update // map of all job workflows
+
+	// instance availability information
+	instanceAvailabilityInfo *instanceAvailabilityInfo
+}
+
+// instanceAvailabilityInfo holds the instance availability information of the job
+type instanceAvailabilityInfo struct {
+	// Instances that are preempted/explicitly killed.
+	// These are not included in instance availability calculations
+	killedInstances map[uint32]bool
+	// Instances that are unavailable
+	unavailableInstances map[uint32]bool
 }
 
 func (j *job) ID() *peloton.JobID {
@@ -385,16 +465,21 @@ func (j *job) addTaskToJobMap(id uint32) *task {
 	if !ok {
 		t = newTask(j.ID(), id, j.jobFactory, j.jobType)
 	}
+
 	j.tasks[id] = t
 	return t
 }
 
 func (j *job) AddTask(
 	ctx context.Context,
-	id uint32) (Task, error) {
+	id uint32) (instance Task, err error) {
 	if t := j.GetTask(id); t != nil {
 		return t, nil
 	}
+
+	defer func() {
+		j.updateInstanceAvailabilityInfoForInstances(ctx, []uint32{id}, err != nil)
+	}()
 
 	j.Lock()
 	defer j.Unlock()
@@ -423,7 +508,6 @@ func (j *job) AddTask(
 			}
 			return nil, err
 		}
-
 		// store the task with the job
 		j.tasks[id] = t
 	}
@@ -436,15 +520,17 @@ func (j *job) CreateTaskConfigs(
 	jobID *peloton.JobID,
 	jobConfig *pbjob.JobConfig,
 	configAddOn *models.ConfigAddOn,
+	spec *stateless.JobSpec,
 ) error {
 	if jobConfig.GetDefaultConfig() != nil {
 		// Create default task config in DB
-		if err := j.jobFactory.taskStore.CreateTaskConfig(
+		if err := j.jobFactory.taskConfigV2Ops.Create(
 			ctx,
 			jobID,
 			common.DefaultTaskConfigID,
 			jobConfig.GetDefaultConfig(),
 			configAddOn,
+			spec.GetDefaultSpec(),
 			jobConfig.GetChangeLog().GetVersion(),
 		); err != nil {
 			log.WithError(err).
@@ -458,6 +544,7 @@ func (j *job) CreateTaskConfigs(
 
 	createSingleTaskConfig := func(id uint32) error {
 		var cfg *pbtask.TaskConfig
+		var instanceSpec, podSpec *pbpod.PodSpec
 		var ok bool
 		if cfg, ok = jobConfig.GetInstanceConfig()[id]; !ok {
 			return yarpcerrors.NotFoundErrorf(
@@ -466,12 +553,28 @@ func (j *job) CreateTaskConfigs(
 		}
 		taskConfig := taskconfig.Merge(jobConfig.GetDefaultConfig(), cfg)
 
-		return j.jobFactory.taskStore.CreateTaskConfig(
+		if spec != nil {
+			// The assumption here is that if the spec is present, it has
+			// already been converted to v0 JobConfig. So the id can be
+			// used to retrieve InstanceSpec in the same way as InstanceConfig
+			if instanceSpec, ok = spec.GetInstanceSpec()[id]; !ok {
+				return yarpcerrors.NotFoundErrorf(
+					"failed to get pod spec for instance %v", id,
+				)
+			}
+			podSpec = taskconfig.MergePodSpec(
+				spec.GetDefaultSpec(),
+				instanceSpec,
+			)
+		}
+
+		return j.jobFactory.taskConfigV2Ops.Create(
 			ctx,
 			jobID,
 			int64(id),
 			taskConfig,
 			configAddOn,
+			podSpec,
 			jobConfig.GetChangeLog().GetVersion(),
 		)
 	}
@@ -507,7 +610,7 @@ func (j *job) CreateTaskRuntimes(
 		}
 
 		t := j.addTaskToJobMap(id)
-		return t.CreateTask(ctx, runtime, owner)
+		return t.createTask(ctx, runtime, owner)
 	}
 	return taskutil.RunInParallel(
 		j.ID().GetValue(),
@@ -517,39 +620,69 @@ func (j *job) CreateTaskRuntimes(
 
 func (j *job) PatchTasks(
 	ctx context.Context,
-	runtimeDiffs map[uint32]jobmgrcommon.RuntimeDiff) error {
+	runtimeDiffs map[uint32]jobmgrcommon.RuntimeDiff,
+	force bool,
+) (instancesSucceeded []uint32, instancesToBeRetried []uint32, err error) {
+	defer func() {
+		j.updateInstanceAvailabilityInfoForInstances(ctx, instancesSucceeded, err != nil)
+	}()
+
+	runtimesToPatch := runtimeDiffs
+	if j.jobType == pbjob.JobType_SERVICE && !force {
+		// Stateless jobs are patched in SLA aware manner unless force flag is set
+		runtimesToPatch, instancesToBeRetried, err = j.filterRuntimeDiffsBySLA(ctx, runtimeDiffs)
+		if err != nil {
+			return nil, nil, err
+		}
+	}
+
+	instancesSucceeded = getIdsFromDiffs(runtimesToPatch)
 
 	patchSingleTask := func(id uint32) error {
 		t, err := j.AddTask(ctx, id)
 		if err != nil {
 			return err
 		}
-		return t.PatchTask(ctx, runtimeDiffs[id])
+		return t.(*task).patchTask(ctx, runtimeDiffs[id])
 	}
 
-	return taskutil.RunInParallel(
+	err = taskutil.RunInParallel(
 		j.ID().GetValue(),
-		getIdsFromDiffs(runtimeDiffs),
+		instancesSucceeded,
 		patchSingleTask)
+
+	return instancesSucceeded, instancesToBeRetried, err
 }
 
 func (j *job) ReplaceTasks(
 	taskInfos map[uint32]*pbtask.TaskInfo,
-	forceReplace bool) error {
+	forceReplace bool) (err error) {
+
+	var instancesReplaced []uint32
+
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), _defaultTimeout)
+		defer cancel()
+
+		j.updateInstanceAvailabilityInfoForInstances(ctx, instancesReplaced, err != nil)
+	}()
 
 	replaceSingleTask := func(id uint32) error {
 		t := j.addTaskToJobMap(id)
-		return t.ReplaceTask(
+		return t.replaceTask(
 			taskInfos[id].GetRuntime(),
 			taskInfos[id].GetConfig(),
 			forceReplace,
 		)
 	}
 
-	return taskutil.RunInParallel(
+	instancesReplaced = getIdsFromTaskInfoMap(taskInfos)
+	err = taskutil.RunInParallel(
 		j.ID().GetValue(),
-		getIdsFromTaskInfoMap(taskInfos),
+		instancesReplaced,
 		replaceSingleTask)
+
+	return err
 }
 
 func (j *job) GetTask(id uint32) Task {
@@ -568,7 +701,7 @@ func (j *job) RemoveTask(id uint32) {
 	defer j.Unlock()
 
 	if t, ok := j.tasks[id]; ok {
-		t.DeleteTask()
+		t.deleteTask()
 	}
 
 	delete(j.tasks, id)
@@ -588,6 +721,7 @@ func (j *job) Create(
 	ctx context.Context,
 	config *pbjob.JobConfig,
 	configAddOn *models.ConfigAddOn,
+	spec *stateless.JobSpec,
 ) error {
 	var runtimeCopy *pbjob.RuntimeInfo
 	var jobType pbjob.JobType
@@ -607,7 +741,7 @@ func (j *job) Create(
 
 	// Add jobID to active jobs table before creating job runtime. This should
 	// happen every time a job is first created.
-	if err := j.jobFactory.jobStore.AddActiveJob(
+	if err := j.jobFactory.activeJobsOps.Create(
 		ctx, j.ID()); err != nil {
 		j.invalidateCache()
 		return err
@@ -634,7 +768,7 @@ func (j *job) Create(
 	}
 
 	// create job config
-	if err := j.createJobConfig(ctx, config, configAddOn); err != nil {
+	if err := j.createJobConfig(ctx, config, configAddOn, spec); err != nil {
 		j.invalidateCache()
 		return err
 	}
@@ -668,6 +802,7 @@ func (j *job) RollingCreate(
 	ctx context.Context,
 	config *pbjob.JobConfig,
 	configAddOn *models.ConfigAddOn,
+	spec *stateless.JobSpec,
 	updateConfig *pbupdate.UpdateConfig,
 	opaqueData *peloton.OpaqueData,
 ) error {
@@ -693,7 +828,7 @@ func (j *job) RollingCreate(
 
 	// Add jobID to active jobs table before creating job runtime. This should
 	// happen every time a job is first created.
-	if err := j.jobFactory.jobStore.AddActiveJob(
+	if err := j.jobFactory.activeJobsOps.Create(
 		ctx, j.ID()); err != nil {
 		j.invalidateCache()
 		return err
@@ -758,7 +893,7 @@ func (j *job) RollingCreate(
 
 	// create the dummy config in db, it is possible that the dummy config already
 	// exists in db when doing error retry. So ignore already exist error here
-	if err := j.createJobConfig(ctx, dummyConfig, configAddOn); err != nil &&
+	if err := j.createJobConfig(ctx, dummyConfig, configAddOn, nil); err != nil &&
 		!yarpcerrors.IsAlreadyExists(errors.Cause(err)) {
 		j.invalidateCache()
 		return err
@@ -769,7 +904,7 @@ func (j *job) RollingCreate(
 	// as created successfully, and should be able to recover from
 	// rest of the error. Calling RollingCreate after this call succeeds again,
 	// would result in AlreadyExist error
-	if err := j.createJobConfig(ctx, config, configAddOn); err != nil {
+	if err := j.createJobConfig(ctx, config, configAddOn, spec); err != nil {
 		j.invalidateCache()
 		return err
 	}
@@ -817,12 +952,14 @@ func (j *job) createJobConfig(
 	ctx context.Context,
 	config *pbjob.JobConfig,
 	configAddOn *models.ConfigAddOn,
+	spec *stateless.JobSpec,
 ) error {
 	if err := j.jobFactory.jobConfigOps.Create(
 		ctx,
 		j.ID(),
 		config,
 		configAddOn,
+		spec,
 		config.ChangeLog.Version,
 	); err != nil {
 		return err
@@ -932,11 +1069,77 @@ func (j *job) CompareAndSetRuntime(ctx context.Context, jobRuntime *pbjob.Runtim
 	return runtimeCopy, nil
 }
 
-func (j *job) CompareAndSetConfig(ctx context.Context, config *pbjob.JobConfig, configAddOn *models.ConfigAddOn) (jobmgrcommon.JobConfig, error) {
+func (j *job) CompareAndSetConfig(
+	ctx context.Context,
+	config *pbjob.JobConfig,
+	configAddOn *models.ConfigAddOn,
+	spec *stateless.JobSpec,
+) (jobmgrcommon.JobConfig, error) {
 	j.Lock()
 	defer j.Unlock()
 
-	return j.compareAndSetConfig(ctx, config, configAddOn)
+	return j.compareAndSetConfig(ctx, config, configAddOn, spec)
+}
+
+// CompareAndSetTask replaces the existing task runtime in DB and cache.
+// It uses RuntimeInfo.Revision.Version for concurrency control, and it would
+// update RuntimeInfo.Revision.Version automatically upon success.
+// Caller should not manually modify the value of RuntimeInfo.Revision.Version.
+// The `force` flag affects only stateless jobs. By default (with force flag
+// not set), for stateless job, if the task is becoming unavailable due to
+// host maintenance and update, then runtime is set only if it does not
+// violate the job SLA. If `force` flag is set, the task runtime will
+// be set even if it violates job SLA.
+func (j *job) CompareAndSetTask(
+	ctx context.Context,
+	id uint32,
+	runtime *pbtask.RuntimeInfo,
+	force bool,
+) (runtimeCopy *pbtask.RuntimeInfo, err error) {
+	defer func() {
+		j.updateInstanceAvailabilityInfoForInstances(ctx, []uint32{id}, err != nil)
+	}()
+
+	t, err := j.AddTask(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+
+	if j.jobType == pbjob.JobType_SERVICE && !force {
+		j.Lock()
+		defer j.Unlock()
+
+		instanceAvailabilityInfo, err := j.getInstanceAvailabilityInfo(ctx)
+		if err != nil {
+			return nil, err
+		}
+
+		if err = j.populateCurrentJobConfig(ctx); err != nil {
+			return nil, errors.Wrap(err, "failed to populate job config")
+		}
+
+		if runtime.GetTerminationStatus() != nil {
+			switch runtime.GetTerminationStatus().GetReason() {
+			// If restart/kill is due to host-maintenance,
+			// skip doing so if SLA is violated
+			case pbtask.TerminationStatus_TERMINATION_STATUS_REASON_KILLED_HOST_MAINTENANCE:
+				// if SLA is defined (and MaximumUnavailableInstances
+				// is non zero), check for SLA violation
+				if j.config.GetSLA().GetMaximumUnavailableInstances() != 0 {
+					if !instanceAvailabilityInfo.unavailableInstances[id] &&
+						uint32(len(instanceAvailabilityInfo.unavailableInstances)) >=
+							j.config.GetSLA().GetMaximumUnavailableInstances() {
+						// return the existing runtime so that the caller can look at the
+						// revision and determine the new runtime did not get set
+						return t.GetRuntime(ctx)
+					}
+				}
+			}
+		}
+	}
+
+	runtimeCopy, err = t.(*task).compareAndSetTask(ctx, runtime, j.jobType)
+	return runtimeCopy, err
 }
 
 // CurrentState of the job.
@@ -961,7 +1164,12 @@ func (j *job) GoalState() JobStateVector {
 	}
 }
 
-func (j *job) compareAndSetConfig(ctx context.Context, config *pbjob.JobConfig, configAddOn *models.ConfigAddOn) (jobmgrcommon.JobConfig, error) {
+func (j *job) compareAndSetConfig(
+	ctx context.Context,
+	config *pbjob.JobConfig,
+	configAddOn *models.ConfigAddOn,
+	spec *stateless.JobSpec,
+) (jobmgrcommon.JobConfig, error) {
 	// first make sure current config is in cache
 	if err := j.populateCurrentJobConfig(ctx); err != nil {
 		return nil, err
@@ -973,12 +1181,24 @@ func (j *job) compareAndSetConfig(ctx context.Context, config *pbjob.JobConfig, 
 		return nil, err
 	}
 
+	// updatedConfig now contains updated version number and timestamp.
+	// If the job spec is provided, the spec should reflect the same version
+	// and time.
+	if spec != nil {
+		spec.Revision = &v1alphapeloton.Revision{
+			Version:   updatedConfig.GetChangeLog().GetVersion(),
+			CreatedAt: updatedConfig.GetChangeLog().GetCreatedAt(),
+			UpdatedAt: updatedConfig.GetChangeLog().GetUpdatedAt(),
+		}
+	}
+
 	// write the config into DB
 	if err := j.jobFactory.jobConfigOps.Create(
 		ctx,
 		j.ID(),
 		updatedConfig,
 		configAddOn,
+		spec,
 		updatedConfig.GetChangeLog().GetVersion(),
 	); err != nil {
 		j.invalidateCache()
@@ -1003,7 +1223,12 @@ func (j *job) compareAndSetConfig(ctx context.Context, config *pbjob.JobConfig, 
 // The runtime being passed should only set the fields which the caller intends to change,
 // the remaining fields should be left unfilled.
 // The config would be updated to the config passed in (except changeLog)
-func (j *job) Update(ctx context.Context, jobInfo *pbjob.JobInfo, configAddOn *models.ConfigAddOn, req UpdateRequest) error {
+func (j *job) Update(
+	ctx context.Context,
+	jobInfo *pbjob.JobInfo,
+	configAddOn *models.ConfigAddOn,
+	spec *stateless.JobSpec,
+	req UpdateRequest) error {
 	var runtimeCopy *pbjob.RuntimeInfo
 	var jobType pbjob.JobType
 	// notify listeners after dropping the lock
@@ -1074,6 +1299,7 @@ func (j *job) Update(ctx context.Context, jobInfo *pbjob.JobInfo, configAddOn *m
 				j.ID(),
 				updatedConfig,
 				configAddOn,
+				spec,
 				updatedConfig.GetChangeLog().GetVersion(),
 			); err != nil {
 				j.invalidateCache()
@@ -1105,6 +1331,197 @@ func (j *job) Update(ctx context.Context, jobInfo *pbjob.JobInfo, configAddOn *m
 	}
 	jobType = j.jobType
 	return nil
+}
+
+// updateInstanceAvailabilityInfoForInstances updates the
+// instanceAvailabilityInfo for the instances
+func (j *job) updateInstanceAvailabilityInfoForInstances(
+	ctx context.Context,
+	instances []uint32,
+	invalidateInstanceAvailabilityInfo bool,
+) {
+	if j.jobType != pbjob.JobType_SERVICE {
+		return
+	}
+
+	j.Lock()
+	defer j.Unlock()
+
+	if invalidateInstanceAvailabilityInfo {
+		j.invalidateInstanceAvailabilityInfo()
+		return
+	}
+
+	for _, id := range instances {
+		t := j.tasks[id]
+		if t == nil {
+			j.invalidateInstanceAvailabilityInfo()
+			return
+		}
+
+		runtime, err := t.GetRuntime(ctx)
+		if err != nil || runtime == nil {
+			j.invalidateInstanceAvailabilityInfo()
+			return
+		}
+
+		currentState := &TaskStateVector{
+			State:         runtime.GetState(),
+			ConfigVersion: runtime.GetConfigVersion(),
+			MesosTaskID:   runtime.GetMesosTaskId(),
+		}
+
+		goalState := &TaskStateVector{
+			State:         runtime.GetGoalState(),
+			ConfigVersion: runtime.GetDesiredConfigVersion(),
+			MesosTaskID:   runtime.GetDesiredMesosTaskId(),
+		}
+
+		j.updateInstanceAvailabilityInfo(
+			ctx,
+			id,
+			currentState,
+			goalState,
+			runtime.GetHealthy(),
+			t.TerminationStatus(),
+		)
+	}
+}
+
+// filterRuntimeDiffsBySLA runs through the given runtimeDiffs and returns the following
+// 1. runtimeDiffs which do not violate job SLA
+// 2. list of instances whose state is unknown to cache. These should be
+//    retried after reloading their runtimes into cache
+func (j *job) filterRuntimeDiffsBySLA(
+	ctx context.Context,
+	runtimeDiffs map[uint32]jobmgrcommon.RuntimeDiff,
+) (map[uint32]jobmgrcommon.RuntimeDiff, []uint32, error) {
+	j.Lock()
+	defer j.Unlock()
+
+	instanceAvailabilityInfo, err := j.getInstanceAvailabilityInfo(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	if err = j.populateCurrentJobConfig(ctx); err != nil {
+		return nil, nil, errors.Wrap(err, "failed to populate job config")
+	}
+
+	log.WithFields(log.Fields{
+		"killed_instances":      instanceAvailabilityInfo.killedInstances,
+		"unavailable_instances": instanceAvailabilityInfo.unavailableInstances,
+		"runtime_diffs":         runtimeDiffs,
+	}).Debug("instance availability before patch")
+
+	runtimesToPatch := make(map[uint32]jobmgrcommon.RuntimeDiff)
+	var instancesToBeRetried []uint32
+	for i, runtimeDiff := range runtimeDiffs {
+		t := j.tasks[i]
+		taskCurrentState := t.CurrentState()
+		taskGoalState := t.GoalState()
+		if goalState, ok := runtimeDiff[jobmgrcommon.GoalStateField]; ok &&
+			goalState.(pbtask.TaskState) == pbtask.TaskState_DELETED {
+
+			delete(instanceAvailabilityInfo.killedInstances, i)
+			delete(instanceAvailabilityInfo.unavailableInstances, i)
+
+			runtimesToPatch[i] = runtimeDiff
+			continue
+		}
+
+		if goalState, ok := runtimeDiff[jobmgrcommon.GoalStateField]; ok &&
+			goalState.(pbtask.TaskState) == pbtask.TaskState_KILLED {
+
+			delete(instanceAvailabilityInfo.unavailableInstances, i)
+			instanceAvailabilityInfo.killedInstances[i] = true
+
+			runtimesToPatch[i] = runtimeDiff
+			continue
+		}
+
+		if termStatus := runtimeDiff[jobmgrcommon.TerminationStatusField]; termStatus != nil {
+			reason := termStatus.(*pbtask.TerminationStatus).GetReason()
+
+			switch reason {
+			// If restart/kill is due to host-maintenance,
+			// skip doing so if SLA is violated
+			case pbtask.TerminationStatus_TERMINATION_STATUS_REASON_KILLED_HOST_MAINTENANCE:
+				if j.config.GetSLA().GetMaximumUnavailableInstances() != 0 {
+					// if SLA is defined (and MaximumUnavailableInstances
+					// is non zero), check for SLA violation
+					if !instanceAvailabilityInfo.unavailableInstances[i] &&
+						uint32(len(instanceAvailabilityInfo.unavailableInstances)) >=
+							j.config.GetSLA().GetMaximumUnavailableInstances() {
+						continue
+					}
+				}
+
+				delete(instanceAvailabilityInfo.killedInstances, i)
+				instanceAvailabilityInfo.unavailableInstances[i] = true
+
+			default:
+				delete(instanceAvailabilityInfo.unavailableInstances, i)
+				instanceAvailabilityInfo.killedInstances[i] = true
+			}
+
+			runtimesToPatch[i] = runtimeDiff
+			continue
+		}
+
+		if taskCurrentState.State == pbtask.TaskState_UNKNOWN ||
+			taskGoalState.State == pbtask.TaskState_UNKNOWN {
+			instancesToBeRetried = append(instancesToBeRetried, i)
+			continue
+		}
+
+		if desiredMesosTaskID := runtimeDiff[jobmgrcommon.DesiredMesosTaskIDField]; desiredMesosTaskID != nil &&
+			desiredMesosTaskID.(*mesos.TaskID).GetValue() != taskGoalState.MesosTaskID.GetValue() {
+
+			// If the desired mesos-task-id is being modified and
+			// the termination status is not set, mark the instance KILLED.
+			// Ideally we shouldn't hit this path since we always set the
+			// termination status when changing the desired mesos task
+			delete(instanceAvailabilityInfo.unavailableInstances, i)
+			instanceAvailabilityInfo.killedInstances[i] = true
+
+		} else if desiredConfigVersion, ok := runtimeDiff[jobmgrcommon.DesiredConfigVersionField]; ok &&
+			desiredConfigVersion.(uint64) != taskGoalState.ConfigVersion {
+			// if the desired config version is being changed, we need to mark
+			// instance as KILLED. The only exception is when both config
+			// version and desired config version are being set to the same
+			// value (for unchanged instances in update) since it doesn't
+			// affect instance availability
+			if configVersion, ok := runtimeDiff[jobmgrcommon.ConfigVersionField]; !ok ||
+				configVersion.(uint64) != desiredConfigVersion.(uint64) {
+				delete(instanceAvailabilityInfo.unavailableInstances, i)
+				instanceAvailabilityInfo.killedInstances[i] = true
+			}
+
+		} else {
+			goalState, ok := runtimeDiff[jobmgrcommon.GoalStateField]
+			if ok && goalState.(pbtask.TaskState) == pbtask.TaskState_RUNNING ||
+				taskGoalState.State == pbtask.TaskState_RUNNING {
+				// if the task goal state is being set to RUNNING or if the task
+				// is already RUNNING, mark it unavailable. If the task is
+				// incorrectly marked unavailable (say when updating HealthState),
+				// it'll be updated once the task has been patched (when
+				// instanceAvailabilityInfo is updated)
+				delete(instanceAvailabilityInfo.killedInstances, i)
+				instanceAvailabilityInfo.unavailableInstances[i] = true
+			}
+		}
+
+		runtimesToPatch[i] = runtimeDiff
+	}
+
+	log.WithFields(log.Fields{
+		"killed_instances":          instanceAvailabilityInfo.killedInstances,
+		"unavailable_instances":     instanceAvailabilityInfo.unavailableInstances,
+		"max_unavailable_instances": j.config.GetSLA().GetMaximumUnavailableInstances(),
+	}).Debug("instance availability after change")
+
+	return runtimesToPatch, instancesToBeRetried, nil
 }
 
 // getUpdatedJobConfigCache validates the config input and
@@ -1493,6 +1910,166 @@ func (j *job) GetCachedConfig() jobmgrcommon.JobConfig {
 	return j.config
 }
 
+// RepopulateInstanceAvailabilityInfo repopulates the instance availability information in the job cache
+func (j *job) RepopulateInstanceAvailabilityInfo(ctx context.Context) error {
+	if j.jobType != pbjob.JobType_SERVICE {
+		return nil
+	}
+
+	j.Lock()
+	defer j.Unlock()
+
+	return j.populateInstanceAvailabilityInfo(ctx)
+}
+
+// getInstanceAvailabilityInfo returns the instance availability info of the job.
+// If the instance availability info is not present in cache, it is populated
+// and returned. The caller should have the job lock before calling this function.
+func (j *job) getInstanceAvailabilityInfo(ctx context.Context) (*instanceAvailabilityInfo, error) {
+	if j.instanceAvailabilityInfo == nil {
+		if err := j.populateInstanceAvailabilityInfo(ctx); err != nil {
+			j.invalidateInstanceAvailabilityInfo()
+			return nil, err
+		}
+	}
+	return j.instanceAvailabilityInfo, nil
+}
+
+// populateInstanceAvailabilityInfo populates the instance availability info of
+// the job. The caller should have the job lock before calling this function.
+func (j *job) populateInstanceAvailabilityInfo(ctx context.Context) error {
+	info := &instanceAvailabilityInfo{
+		killedInstances:      make(map[uint32]bool),
+		unavailableInstances: make(map[uint32]bool),
+	}
+
+	for i, t := range j.tasks {
+		taskRuntime, err := t.GetRuntime(ctx)
+		if err != nil {
+			return err
+		}
+
+		currentStateVector := &TaskStateVector{
+			State:         taskRuntime.GetState(),
+			ConfigVersion: taskRuntime.GetConfigVersion(),
+			MesosTaskID:   taskRuntime.GetMesosTaskId(),
+		}
+
+		goalStateVector := &TaskStateVector{
+			State:         taskRuntime.GetGoalState(),
+			ConfigVersion: taskRuntime.GetDesiredConfigVersion(),
+			MesosTaskID:   taskRuntime.GetDesiredMesosTaskId(),
+		}
+
+		availability := getInstanceAvailability(
+			currentStateVector,
+			goalStateVector,
+			taskRuntime.GetHealthy(),
+			taskRuntime.GetTerminationStatus(),
+		)
+
+		switch availability {
+		case instanceAvailability_UNAVAILABLE:
+			info.unavailableInstances[i] = true
+		case instanceAvailability_KILLED:
+			info.killedInstances[i] = true
+		}
+	}
+
+	j.instanceAvailabilityInfo = info
+	return nil
+}
+
+// updateInstanceAvailabilityInfo updates the instance availability information
+// of the job. The caller must acquire the job lock before calling this function.
+func (j *job) updateInstanceAvailabilityInfo(
+	ctx context.Context,
+	id uint32,
+	currentState *TaskStateVector,
+	goalState *TaskStateVector,
+	healthState pbtask.HealthState,
+	terminationStatus *pbtask.TerminationStatus,
+) {
+	if j.jobType != pbjob.JobType_SERVICE {
+		return
+	}
+
+	instanceAvailabilityInfo, err := j.getInstanceAvailabilityInfo(ctx)
+	if err != nil {
+		j.invalidateInstanceAvailabilityInfo()
+		return
+	}
+
+	availability := getInstanceAvailability(
+		currentState,
+		goalState,
+		healthState,
+		terminationStatus,
+	)
+
+	switch availability {
+	case instanceAvailability_UNAVAILABLE:
+		delete(instanceAvailabilityInfo.killedInstances, id)
+		instanceAvailabilityInfo.unavailableInstances[id] = true
+	case instanceAvailability_KILLED:
+		delete(instanceAvailabilityInfo.unavailableInstances, id)
+		instanceAvailabilityInfo.killedInstances[id] = true
+	case instanceAvailability_AVAILABLE, instanceAvailability_DELETED:
+		delete(instanceAvailabilityInfo.unavailableInstances, id)
+		delete(instanceAvailabilityInfo.killedInstances, id)
+	}
+}
+
+// invalidateInstanceAvailabilityInfo clears the job instance availability information
+func (j *job) invalidateInstanceAvailabilityInfo() {
+	j.instanceAvailabilityInfo = nil
+}
+
+func getInstanceAvailability(
+	currentState *TaskStateVector,
+	goalState *TaskStateVector,
+	healthState pbtask.HealthState,
+	terminationStatus *pbtask.TerminationStatus,
+) instanceAvailability_Type {
+	if goalState.State == pbtask.TaskState_DELETED {
+		return instanceAvailability_DELETED
+	}
+
+	if goalState.State == pbtask.TaskState_KILLED {
+		return instanceAvailability_KILLED
+	}
+
+	// If termination status is set then the instance has been terminated. See
+	// the termination reason to determine whether to mark it UNAVAILABLE or KILLED.
+	if terminationStatus != nil {
+		switch terminationStatus.GetReason() {
+		case pbtask.TerminationStatus_TERMINATION_STATUS_REASON_KILLED_HOST_MAINTENANCE:
+			return instanceAvailability_UNAVAILABLE
+		default:
+			return instanceAvailability_KILLED
+		}
+	}
+
+	// If the current mesos-task-id/config-version do not match with desired
+	// mesos-task-id/config-version and the termination status is not set,
+	// mark the instance KILLED. This is because we always set termination status
+	// with the appropriate reason whenever it is SLA aware killed (host-maintenanace/update)
+	if currentState.MesosTaskID.GetValue() != goalState.MesosTaskID.GetValue() ||
+		currentState.ConfigVersion != goalState.ConfigVersion {
+		return instanceAvailability_KILLED
+	}
+
+	if currentState.State == pbtask.TaskState_RUNNING &&
+		goalState.State == pbtask.TaskState_RUNNING {
+		switch healthState {
+		case pbtask.HealthState_HEALTHY, pbtask.HealthState_DISABLED:
+			return instanceAvailability_AVAILABLE
+		}
+	}
+
+	return instanceAvailability_UNAVAILABLE
+}
+
 // Option to create a workflow
 type Option interface {
 	apply(*workflowOpts)
@@ -1502,25 +2079,28 @@ type workflowOpts struct {
 	jobConfig       *pbjob.JobConfig
 	prevJobConfig   *pbjob.JobConfig
 	configAddOn     *models.ConfigAddOn
+	jobSpec         *stateless.JobSpec
 	instanceAdded   []uint32
 	instanceUpdated []uint32
 	instanceRemoved []uint32
 	opaqueData      *peloton.OpaqueData
 }
 
-// WithConfig defines the original
-// config and target config for the workflow.
-// Workflow could use the configs to calculate
-// the instances it would need to work on.
+// WithConfig defines the original config and target config for the workflow.
+// Workflow could use the configs to calculate the instances it would need to
+// work on as well as verify if the update is a noop. It also includes the
+// target job spec which would be stored to the DB as part of workflow creation.
 func WithConfig(
 	jobConfig *pbjob.JobConfig,
 	prevJobConfig *pbjob.JobConfig,
 	configAddOn *models.ConfigAddOn,
+	jobSpec *stateless.JobSpec,
 ) Option {
 	return &configOpt{
 		jobConfig:     jobConfig,
 		prevJobConfig: prevJobConfig,
 		configAddOn:   configAddOn,
+		jobSpec:       jobSpec,
 	}
 }
 
@@ -1552,12 +2132,14 @@ type configOpt struct {
 	jobConfig     *pbjob.JobConfig
 	prevJobConfig *pbjob.JobConfig
 	configAddOn   *models.ConfigAddOn
+	jobSpec       *stateless.JobSpec
 }
 
 func (o *configOpt) apply(opts *workflowOpts) {
 	opts.jobConfig = o.jobConfig
 	opts.prevJobConfig = o.prevJobConfig
 	opts.configAddOn = o.configAddOn
+	opts.jobSpec = o.jobSpec
 }
 
 type instanceToProcessOpt struct {
@@ -1656,7 +2238,12 @@ func (j *job) CreateWorkflow(
 			nil
 	}
 
-	newConfig, err := j.compareAndSetConfig(ctx, opts.jobConfig, opts.configAddOn)
+	newConfig, err := j.compareAndSetConfig(
+		ctx,
+		opts.jobConfig,
+		opts.configAddOn,
+		opts.jobSpec,
+	)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -1968,7 +2555,7 @@ func (j *job) RollbackWorkflow(ctx context.Context) error {
 	}
 
 	// get the old job config before the workflow is run
-	prevJobConfig, configAddOn, err := j.jobFactory.jobConfigOps.Get(
+	prevObj, err := j.jobFactory.jobConfigOps.GetResult(
 		ctx,
 		j.ID(),
 		currentWorkflow.GetState().JobVersion,
@@ -1980,7 +2567,12 @@ func (j *job) RollbackWorkflow(ctx context.Context) error {
 
 	// copy the old job config and get the config which
 	// the workflow can "rollback" to
-	configCopy, err := j.copyJobAndTaskConfig(ctx, prevJobConfig, configAddOn)
+	configCopy, err := j.copyJobAndTaskConfig(
+		ctx,
+		prevObj.JobConfig,
+		prevObj.ConfigAddOn,
+		prevObj.JobSpec,
+	)
 	if err != nil {
 		return errors.Wrap(err,
 			"failed to copy job and task config for workflow rolling back")
@@ -2100,6 +2692,7 @@ func (j *job) copyJobAndTaskConfig(
 	ctx context.Context,
 	jobConfig *pbjob.JobConfig,
 	configAddOn *models.ConfigAddOn,
+	spec *stateless.JobSpec,
 ) (*pbjob.JobConfig, error) {
 	// set config changeLog version to that of current config for
 	// concurrency control
@@ -2111,7 +2704,12 @@ func (j *job) copyJobAndTaskConfig(
 	}
 
 	// copy job config
-	configCopy, err := j.compareAndSetConfig(ctx, jobConfig, configAddOn)
+	configCopy, err := j.compareAndSetConfig(
+		ctx,
+		jobConfig,
+		configAddOn,
+		spec,
+	)
 	if err != nil {
 		return nil, errors.Wrap(err,
 			"failed to set job config for workflow rolling back")
@@ -2123,7 +2721,13 @@ func (j *job) copyJobAndTaskConfig(
 		Version: configCopy.GetChangeLog().GetVersion(),
 	}
 	// copy task configs
-	if err = j.CreateTaskConfigs(ctx, j.id, jobConfig, configAddOn); err != nil {
+	if err = j.CreateTaskConfigs(
+		ctx,
+		j.id,
+		jobConfig,
+		configAddOn,
+		spec,
+	); err != nil {
 		return nil, errors.Wrap(err,
 			"failed to create task configs for workflow rolling back")
 	}
@@ -2490,7 +3094,7 @@ func (j *job) Delete(ctx context.Context) error {
 	}
 
 	// delete from active_jobs
-	return j.jobFactory.jobStore.DeleteActiveJob(ctx, j.ID())
+	return j.jobFactory.activeJobsOps.Delete(ctx, j.ID())
 }
 
 func createEmptyResourceUsageMap() map[string]float64 {

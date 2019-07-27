@@ -159,6 +159,25 @@ func buildResultRow(e *base.Definition, columns []string) []interface{} {
 		case gocqlUUIDType.Kind():
 			var value *gocql.UUID
 			results[i] = &value
+		case reflect.Ptr:
+			// Special case for custom optional string type:
+			// string type used in Cassandra
+			// converted to/from custom type in ORM layer
+			if typ == reflect.TypeOf(&base.OptionalString{}) {
+				var value *string
+				results[i] = &value
+				break
+			}
+			// Special case for custom optional int type:
+			// int64 type used in Cassandra
+			// converted to/from custom type in ORM layer
+			if typ == reflect.TypeOf(&base.OptionalUInt64{}) {
+				var value *int64
+				results[i] = &value
+				break
+			}
+			// for unrecognized pointer types, fall back to default logging
+			fallthrough
 		default:
 			// This should only happen if we start using a new cassandra type
 			// without adding to the translation layer
@@ -328,9 +347,11 @@ func (c *cassandraConnector) Get(
 	ctx context.Context,
 	e *base.Definition,
 	keyCols []base.Column,
+	colNamesToRead ...string,
 ) ([]base.Column, error) {
-
-	colNamesToRead := e.GetColumnsToRead()
+	if len(colNamesToRead) == 0 {
+		colNamesToRead = e.GetColumnsToRead()
+	}
 
 	q, err := c.buildSelectQuery(ctx, e, keyCols, colNamesToRead)
 	if err != nil {

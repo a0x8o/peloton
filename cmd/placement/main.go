@@ -21,6 +21,7 @@ import (
 	"github.com/uber/peloton/pkg/auth"
 	auth_impl "github.com/uber/peloton/pkg/auth/impl"
 	"github.com/uber/peloton/pkg/common"
+	"github.com/uber/peloton/pkg/common/api"
 	"github.com/uber/peloton/pkg/common/async"
 	"github.com/uber/peloton/pkg/common/buildversion"
 	common_config "github.com/uber/peloton/pkg/common/config"
@@ -36,6 +37,8 @@ import (
 	"github.com/uber/peloton/pkg/placement/hosts"
 	tally_metrics "github.com/uber/peloton/pkg/placement/metrics"
 	"github.com/uber/peloton/pkg/placement/offers"
+	offers_v0 "github.com/uber/peloton/pkg/placement/offers/v0"
+	offers_v1 "github.com/uber/peloton/pkg/placement/offers/v1"
 	"github.com/uber/peloton/pkg/placement/plugins"
 	"github.com/uber/peloton/pkg/placement/plugins/batch"
 	mimir_strategy "github.com/uber/peloton/pkg/placement/plugins/mimir"
@@ -43,6 +46,7 @@ import (
 	"github.com/uber/peloton/pkg/placement/tasks"
 
 	"github.com/uber/peloton/.gen/peloton/private/hostmgr/hostsvc"
+	hostsvc_v1 "github.com/uber/peloton/.gen/peloton/private/hostmgr/v1alpha/svc"
 	"github.com/uber/peloton/.gen/peloton/private/resmgr"
 	"github.com/uber/peloton/.gen/peloton/private/resmgrsvc"
 
@@ -251,6 +255,10 @@ func main() {
 		cfg.Auth.Path = *authConfigFile
 	}
 
+	if cfg.Placement.HostManagerAPIVersion == "" {
+		cfg.Placement.HostManagerAPIVersion = api.V0
+	}
+
 	log.WithField("placement_task_type", cfg.Placement.TaskType).
 		WithField("strategy", cfg.Placement.Strategy).
 		Info("Placement engine type")
@@ -371,11 +379,23 @@ func main() {
 		dispatcher.ClientConfig(common.PelotonResourceManager))
 	hostManager := hostsvc.NewInternalHostServiceYARPCClient(
 		dispatcher.ClientConfig(common.PelotonHostManager))
-	offerService := offers.NewService(
-		hostManager,
-		resourceManager,
-		tallyMetrics,
-	)
+
+	var offerService offers.Service
+	if cfg.Placement.HostManagerAPIVersion.IsV1() {
+		hostManagerV1 := hostsvc_v1.NewHostManagerServiceYARPCClient(
+			dispatcher.ClientConfig(common.PelotonHostManager))
+		offerService = offers_v1.NewService(
+			hostManagerV1,
+			resourceManager,
+			tallyMetrics,
+		)
+	} else {
+		offerService = offers_v0.NewService(
+			hostManager,
+			resourceManager,
+			tallyMetrics,
+		)
+	}
 	taskService := tasks.NewService(
 		resourceManager,
 		&cfg.Placement,

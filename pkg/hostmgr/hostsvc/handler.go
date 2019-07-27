@@ -32,7 +32,9 @@ import (
 
 	log "github.com/sirupsen/logrus"
 	"github.com/uber-go/tally"
+	"go.uber.org/multierr"
 	"go.uber.org/yarpc"
+	"go.uber.org/yarpc/yarpcerrors"
 )
 
 // serviceHandler implements peloton.api.host.svc.HostService
@@ -93,7 +95,7 @@ func (m *serviceHandler) QueryHosts(
 			upHosts, err := buildHostInfoForRegisteredAgents()
 			if err != nil {
 				m.metrics.QueryHostsFail.Inc(1)
-				return nil, err
+				return nil, yarpcerrors.InternalErrorf(err.Error())
 			}
 			// Remove draining and down hosts from the result.
 			// This is needed because AgentMap is updated every 15s
@@ -135,19 +137,55 @@ func (m *serviceHandler) StartMaintenance(
 	ctx context.Context,
 	request *host_svc.StartMaintenanceRequest,
 ) (*host_svc.StartMaintenanceResponse, error) {
-	m.metrics.StartMaintenanceAPI.Inc(1)
+	// StartMaintenanceRequest using deprecated field `hostnames`
+	var errs error
+	if len(request.GetHostnames()) != 0 {
+		for _, hostname := range request.GetHostnames() {
+			if err := m.startMaintenance(ctx, hostname); err != nil {
+				// Not error out on 1rst error, continue and aggregate errors
+				errs = multierr.Append(errs, err)
+			}
+		}
+		if errs != nil {
+			return nil, yarpcerrors.InternalErrorf(errs.Error())
+		}
+		return &host_svc.StartMaintenanceResponse{}, nil
+	}
+	// StartMaintenanceRequest using prefered field `hostname`
+	if err := m.startMaintenance(ctx, request.GetHostname()); err != nil {
+		if yarpcerrors.IsYARPCError(err) {
+			// Allow YARPC NotFound error to be returned as such
+			return nil, err
+		}
+		return nil, yarpcerrors.InternalErrorf(err.Error())
+	}
+	return &host_svc.StartMaintenanceResponse{
+		Hostname: request.GetHostname(),
+	}, nil
+}
 
-	machineIds, err := buildMachineIDsForHosts(request.GetHostnames())
+func (m *serviceHandler) startMaintenance(
+	ctx context.Context,
+	hostname string,
+) error {
+	m.metrics.StartMaintenanceAPI.Inc(1)
+	// Validate requested host is registered in UP state
+	if !host.IsHostUp(hostname) {
+		m.metrics.StartMaintenanceFail.Inc(1)
+		return yarpcerrors.NotFoundErrorf("Host is not registered as an UP agent")
+	}
+
+	machineID, err := buildMachineIDForHost(hostname)
 	if err != nil {
 		m.metrics.StartMaintenanceFail.Inc(1)
-		return nil, err
+		return err
 	}
 
 	// Get current maintenance schedule
 	response, err := m.operatorMasterClient.GetMaintenanceSchedule()
 	if err != nil {
 		m.metrics.StartMaintenanceFail.Inc(1)
-		return nil, err
+		return err
 	}
 	schedule := response.GetSchedule()
 	// Set current time as the `start` of maintenance window
@@ -158,9 +196,9 @@ func (m *serviceHandler) StartMaintenance(
 	// omitting the duration means that the unavailability will last forever. Since
 	// we do not know the duration, we are omitting it.
 
-	// Construct maintenance window
+	// Construct updated maintenance window including new host
 	maintenanceWindow := &mesos_maintenance.Window{
-		MachineIds: machineIds,
+		MachineIds: []*mesos.MachineID{machineID},
 		Unavailability: &mesos.Unavailability{
 			Start: &mesos.TimeInfo{
 				Nanoseconds: &nanos,
@@ -169,33 +207,28 @@ func (m *serviceHandler) StartMaintenance(
 	}
 	schedule.Windows = append(schedule.Windows, maintenanceWindow)
 
-	err = m.operatorMasterClient.UpdateMaintenanceSchedule(schedule)
-	if err != nil {
+	// Post updated maintenance schedule
+	if err = m.operatorMasterClient.UpdateMaintenanceSchedule(schedule); err != nil {
 		m.metrics.StartMaintenanceFail.Inc(1)
-		return nil, err
+		return err
 	}
 	log.WithField("maintenance_schedule", schedule).
 		Info("Maintenance Schedule posted to Mesos Master")
 
-	var hostInfos []*hpb.HostInfo
-	for _, machine := range machineIds {
-		hostInfos = append(hostInfos,
-			&hpb.HostInfo{
-				Hostname: machine.GetHostname(),
-				Ip:       machine.GetIp(),
-				State:    hpb.HostState_HOST_STATE_DRAINING,
-			})
+	hostInfo := &hpb.HostInfo{
+		Hostname: machineID.GetHostname(),
+		Ip:       machineID.GetIp(),
+		State:    hpb.HostState_HOST_STATE_DRAINING,
 	}
-	m.maintenanceHostInfoMap.AddHostInfos(hostInfos)
-	// Enqueue hostnames into maintenance queue to initiate
-	// the rescheduling of tasks running on these hosts
-	err = m.maintenanceQueue.Enqueue(request.GetHostnames())
-	if err != nil {
-		return nil, err
+	m.maintenanceHostInfoMap.AddHostInfo(hostInfo)
+	// Enqueue hostname into maintenance queue to initiate
+	// the rescheduling of tasks running on this host
+	if err = m.maintenanceQueue.Enqueue(hostInfo.Hostname); err != nil {
+		return err
 	}
 
 	m.metrics.StartMaintenanceSuccess.Inc(1)
-	return &host_svc.StartMaintenanceResponse{}, nil
+	return nil
 }
 
 // CompleteMaintenance completes maintenance on the specified hosts. It brings
@@ -206,38 +239,63 @@ func (m *serviceHandler) CompleteMaintenance(
 	ctx context.Context,
 	request *host_svc.CompleteMaintenanceRequest,
 ) (*host_svc.CompleteMaintenanceResponse, error) {
-	m.metrics.CompleteMaintenanceAPI.Inc(1)
+	// CompleteMaintenanceRequest using deprecated field `hostnames`
+	var errs error
+	if len(request.GetHostnames()) != 0 {
+		for _, hostname := range request.GetHostnames() {
+			if err := m.completeMaintenance(ctx, hostname); err != nil {
+				// Not error out on 1rst error, continue and aggregate errors
+				errs = multierr.Append(errs, err)
+			}
+		}
+		if errs != nil {
+			return nil, yarpcerrors.InternalErrorf(errs.Error())
+		}
+		return &host_svc.CompleteMaintenanceResponse{}, nil
+	}
+	// CompleteMaintenanceRequest using prefered field `hostname`
+	if err := m.completeMaintenance(ctx, request.GetHostname()); err != nil {
+		if yarpcerrors.IsYARPCError(err) {
+			// Allow YARPC NotFound error to be returned as such
+			return nil, err
+		}
+		return nil, yarpcerrors.InternalErrorf(err.Error())
+	}
+	return &host_svc.CompleteMaintenanceResponse{
+		Hostname: request.GetHostname(),
+	}, nil
+}
 
+func (m *serviceHandler) completeMaintenance(
+	ctx context.Context,
+	hostname string,
+) error {
+	m.metrics.CompleteMaintenanceAPI.Inc(1)
+	// Get all DOWN hosts and validate requested host is in DOWN state
 	downHostInfoMap := make(map[string]*hpb.HostInfo)
 	for _, hostInfo := range m.maintenanceHostInfoMap.GetDownHostInfos([]string{}) {
 		downHostInfoMap[hostInfo.GetHostname()] = hostInfo
 	}
-
-	var machineIds []*mesos.MachineID
-	hostnames := request.GetHostnames()
-	for _, hostname := range hostnames {
-		hostInfo, ok := downHostInfoMap[hostname]
-		if !ok {
-			m.metrics.CompleteMaintenanceFail.Inc(1)
-			return nil, fmt.Errorf("invalid request. Host %s is not DOWN", hostname)
-		}
-		machineID := &mesos.MachineID{
-			Hostname: &hostInfo.Hostname,
-			Ip:       &hostInfo.Ip,
-		}
-		machineIds = append(machineIds, machineID)
-	}
-
-	err := m.operatorMasterClient.StopMaintenance(machineIds)
-	if err != nil {
+	hostInfo, ok := downHostInfoMap[hostname]
+	if !ok {
 		m.metrics.CompleteMaintenanceFail.Inc(1)
-		return nil, err
+		return yarpcerrors.NotFoundErrorf("Host is not DOWN")
 	}
 
-	m.maintenanceHostInfoMap.RemoveHostInfos(hostnames)
+	// Stop Maintenance for the host on Mesos Master
+	machineID := &mesos.MachineID{
+		Hostname: &hostInfo.Hostname,
+		Ip:       &hostInfo.Ip,
+	}
+	if err := m.operatorMasterClient.StopMaintenance([]*mesos.MachineID{machineID}); err != nil {
+		m.metrics.CompleteMaintenanceFail.Inc(1)
+		return err
+	}
+
+	m.maintenanceHostInfoMap.RemoveHostInfo(hostInfo.Hostname)
 
 	m.metrics.CompleteMaintenanceSuccess.Inc(1)
-	return &host_svc.CompleteMaintenanceResponse{}, nil
+	return nil
 }
 
 // Build host info for registered agents
@@ -264,30 +322,23 @@ func buildHostInfoForRegisteredAgents() (map[string]*hpb.HostInfo, error) {
 	return upHosts, nil
 }
 
-// Build machine ID for specified hosts
-func buildMachineIDsForHosts(
-	hostnames []string,
-) ([]*mesos.MachineID, error) {
-	var machineIds []*mesos.MachineID
+// Build machine ID for a specified host
+func buildMachineIDForHost(hostname string) (*mesos.MachineID, error) {
 	agentMap := host.GetAgentMap()
 	if agentMap == nil || len(agentMap.RegisteredAgents) == 0 {
 		return nil, fmt.Errorf("no registered agents")
 	}
-	for i := 0; i < len(hostnames); i++ {
-		hostname := hostnames[i]
-		if _, ok := agentMap.RegisteredAgents[hostname]; !ok {
-			return nil, fmt.Errorf("unknown host %s", hostname)
-		}
-		pid := agentMap.RegisteredAgents[hostname].GetPid()
-		ip, _, err := util.ExtractIPAndPortFromMesosAgentPID(pid)
-		if err != nil {
-			return nil, err
-		}
-		machineID := &mesos.MachineID{
-			Hostname: &hostname,
-			Ip:       &ip,
-		}
-		machineIds = append(machineIds, machineID)
+	if _, ok := agentMap.RegisteredAgents[hostname]; !ok {
+		return nil, fmt.Errorf("unknown host %s", hostname)
 	}
-	return machineIds, nil
+	pid := agentMap.RegisteredAgents[hostname].GetPid()
+	ip, _, err := util.ExtractIPAndPortFromMesosAgentPID(pid)
+	if err != nil {
+		return nil, err
+	}
+	machineID := &mesos.MachineID{
+		Hostname: &hostname,
+		Ip:       &ip,
+	}
+	return machineID, nil
 }

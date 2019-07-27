@@ -4,6 +4,7 @@ import time
 
 from tests.integration.stateless_job import StatelessJob
 from tests.integration.common import IntegrationTestConfig
+from tests.integration.job import get_active_jobs
 from tests.integration.stateless_job import (
     INVALID_ENTITY_VERSION_ERR_MESSAGE,
     list_jobs,
@@ -13,6 +14,7 @@ from tests.integration.stateless_job_test.util import (
     assert_pod_id_equal,
 )
 
+from peloton_client.pbgen.peloton.api.v0.task import task_pb2
 from peloton_client.pbgen.peloton.api.v1alpha.pod import pod_pb2
 
 pytestmark = [
@@ -76,7 +78,10 @@ def test__stop_start_all_tasks_stateless_kills_tasks_and_job(stateless_job):
 def test__exit_task_automatically_restart():
     job = StatelessJob(
         job_file="test_stateless_job_exit_without_err_spec.yaml",
-        config=IntegrationTestConfig(max_retry_attempts=100),
+        config=IntegrationTestConfig(
+            max_retry_attempts=100,
+            pool_file='test_stateless_respool.yaml',
+        ),
     )
     job.create()
     job.wait_for_state(goal_state="RUNNING")
@@ -98,7 +103,10 @@ def test__exit_task_automatically_restart():
 def test__failed_task_automatically_restart():
     job = StatelessJob(
         job_file="test_stateless_job_exit_with_err_spec.yaml",
-        config=IntegrationTestConfig(max_retry_attempts=100),
+        config=IntegrationTestConfig(
+            max_retry_attempts=100,
+            pool_file='test_stateless_respool.yaml',
+        ),
     )
     job.create()
     job.wait_for_state(goal_state="RUNNING")
@@ -120,7 +128,10 @@ def test__failed_task_automatically_restart():
 def test__health_check_detects_unhealthy_tasks():
     job = StatelessJob(
         job_file="test_stateless_job_failed_health_check_spec.yaml",
-        config=IntegrationTestConfig(max_retry_attempts=100),
+        config=IntegrationTestConfig(
+            max_retry_attempts=100,
+            pool_file='test_stateless_respool.yaml',
+        ),
     )
     job.job_spec.instance_count = 1
     job.create()
@@ -137,7 +148,10 @@ def test__health_check_detects_unhealthy_tasks():
 def test__health_check_detects_healthy_tasks():
     job = StatelessJob(
         job_file="test_stateless_job_successful_health_check_spec.yaml",
-        config=IntegrationTestConfig(max_retry_attempts=100),
+        config=IntegrationTestConfig(
+            max_retry_attempts=100,
+            pool_file='test_stateless_respool.yaml',
+        ),
     )
     job.job_spec.instance_count = 1
     job.create()
@@ -154,7 +168,10 @@ def test__health_check_detects_healthy_tasks():
 def test__failed_task_throttled_by_exponential_backoff():
     job = StatelessJob(
         job_file="test_stateless_job_exit_with_err_spec.yaml",
-        config=IntegrationTestConfig(max_retry_attempts=100),
+        config=IntegrationTestConfig(
+            max_retry_attempts=100,
+            pool_file='test_stateless_respool.yaml',
+        ),
     )
     job.create()
     job.wait_for_state(goal_state="RUNNING")
@@ -223,6 +240,7 @@ def test__delete_killed_job():
     job = StatelessJob()
     job.create()
     job.wait_for_state(goal_state="RUNNING")
+    job_id = job.get_job_id()
 
     job.stop()
     job.wait_for_state(goal_state="KILLED")
@@ -236,6 +254,10 @@ def test__delete_killed_job():
         assert e.code() == grpc.StatusCode.NOT_FOUND
         return
     raise Exception("job not found error not received")
+
+    # try to find the job from active_jobs
+    ids = get_active_jobs()
+    assert job_id not in ids
 
 
 # test__delete_running_job_with_force_flag tests force deleting a running job
@@ -362,6 +384,7 @@ def test__stop_restart_jobmgr(stateless_job, jobmgr):
     stateless_job.wait_for_state(goal_state="KILLED")
 
 
+@pytest.mark.skip(reason="flaky test")
 # test restarting running job, with batch size,
 def test__restart_running_job_with_batch_size(stateless_job, in_place):
     stateless_job.create()
@@ -490,3 +513,154 @@ def test__restart_bad_version(stateless_job, in_place):
         assert e.code() == grpc.StatusCode.ABORTED
         return
     raise Exception("configuration version mismatch error not received")
+
+
+def test__stop_start_tasks_when_mesos_master_down_kills_tasks_when_started(
+        stateless_job, mesos_master
+):
+    """
+    1. Create stateless job.
+    2. Wait for job state RUNNING.
+    3. Stop a subset of job instances when mesos master is down.
+    4. Start mesos master and wait for the instances to be stopped.
+    5. Start the same subset of instances when mesos master is down.
+    6. Start mesos master and wait for the instances to transit to RUNNING.
+    7. Stop the job when mesos master is down.
+    8. Start mesos master and wait for the job to terminate
+    """
+    stateless_job.create()
+    stateless_job.wait_for_state(goal_state="RUNNING")
+
+    range = task_pb2.InstanceRange(to=1)
+    setattr(range, "from", 0)
+
+    def wait_for_instance_to_stop():
+        return stateless_job.get_task(0).state_str == "KILLED"
+
+    mesos_master.stop()
+    stateless_job.stop(ranges=[range])
+    mesos_master.start()
+    stateless_job.wait_for_condition(wait_for_instance_to_stop)
+
+    def wait_for_instance_to_run():
+        return stateless_job.get_task(0).state_str == "RUNNING"
+
+    mesos_master.stop()
+    stateless_job.start(ranges=[range])
+    mesos_master.start()
+    stateless_job.wait_for_condition(wait_for_instance_to_run)
+
+    mesos_master.stop()
+    stateless_job.stop()
+    mesos_master.start()
+    stateless_job.wait_for_terminated()
+
+
+def test__stop_start_tasks_when_mesos_master_down_and_jobmgr_restarts(
+        stateless_job, mesos_master, jobmgr
+):
+    """
+    1. Create stateless job.
+    2. Wait for job state RUNNING.
+    3. Stop a subset of job instances when mesos master is down.
+    4. Restart job manager.
+    5. Start mesos master and wait for the instances to be stopped.
+    6. Start the same subset of instances when mesos master is down.
+    7. Restart job manager.
+    8. Start mesos master and wait for the instances to transit to RUNNING.
+    9. Stop the job when mesos master is down.
+    10. Restart job manager.
+    11. Start mesos master and wait for the job to terminate
+    """
+    stateless_job.create()
+    stateless_job.wait_for_state(goal_state="RUNNING")
+
+    range = task_pb2.InstanceRange(to=1)
+    setattr(range, "from", 0)
+
+    def wait_for_instance_to_stop():
+        return stateless_job.get_task(0).state_str == "KILLED"
+
+    mesos_master.stop()
+    stateless_job.stop(ranges=[range])
+    jobmgr.restart()
+    mesos_master.start()
+    stateless_job.wait_for_condition(wait_for_instance_to_stop)
+
+    def wait_for_instance_to_run():
+        return stateless_job.get_task(0).state_str == "RUNNING"
+
+    mesos_master.stop()
+    stateless_job.start(ranges=[range])
+    jobmgr.restart()
+    mesos_master.start()
+    stateless_job.wait_for_condition(wait_for_instance_to_run)
+
+    mesos_master.stop()
+    stateless_job.stop()
+    jobmgr.restart()
+    mesos_master.start()
+    stateless_job.wait_for_terminated()
+
+
+def test__kill_mesos_agent_makes_task_resume(stateless_job, mesos_agent):
+    stateless_job.create()
+    stateless_job.wait_for_state(goal_state="RUNNING")
+
+    mesos_agent.restart()
+
+    stateless_job.wait_for_state(goal_state="RUNNING")
+
+
+def test__stop_start_partial_tests_with_single_range(stateless_job):
+    stateless_job.create()
+    stateless_job.wait_for_state(goal_state="RUNNING")
+
+    range = task_pb2.InstanceRange(to=1)
+    setattr(range, "from", 0)
+
+    def wait_for_instance_to_stop():
+        return stateless_job.get_task(0).state_str == "KILLED"
+
+    stateless_job.stop(ranges=[range])
+    stateless_job.wait_for_condition(wait_for_instance_to_stop)
+
+    def wait_for_instance_to_run():
+        return stateless_job.get_task(0).state_str == "RUNNING"
+
+    stateless_job.start(ranges=[range])
+    stateless_job.wait_for_condition(wait_for_instance_to_run)
+
+    stateless_job.stop()
+    stateless_job.wait_for_state(goal_state="KILLED")
+
+
+def test__stop_start_partial_tests_with_multiple_ranges(stateless_job):
+    stateless_job.create()
+    stateless_job.wait_for_state(goal_state="RUNNING")
+
+    range1 = task_pb2.InstanceRange(to=1)
+    setattr(range1, "from", 0)
+    range2 = task_pb2.InstanceRange(to=2)
+    setattr(range2, "from", 1)
+
+    def wait_for_instance_to_stop():
+        return (
+            stateless_job.get_task(0).state_str == "KILLED"
+            and stateless_job.get_task(1).state_str == "KILLED"
+        )
+
+    stateless_job.stop(ranges=[range1, range2])
+    stateless_job.wait_for_condition(wait_for_instance_to_stop)
+
+    def wait_for_instance_to_run():
+        return (
+            stateless_job.get_task(0).state_str == "RUNNING"
+            and stateless_job.get_task(1).state_str == "RUNNING"
+        )
+
+    stateless_job.start(ranges=[range1, range2])
+    stateless_job.wait_for_condition(wait_for_instance_to_run)
+
+    stateless_job.stop()
+    stateless_job.wait_for_state(goal_state="KILLED")

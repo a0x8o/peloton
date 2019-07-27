@@ -26,7 +26,6 @@ import (
 	"github.com/uber/peloton/pkg/common/goalstate"
 	"github.com/uber/peloton/pkg/jobmgr/cached"
 	jobmgrcommon "github.com/uber/peloton/pkg/jobmgr/common"
-	jobmgrtask "github.com/uber/peloton/pkg/jobmgr/task"
 
 	log "github.com/sirupsen/logrus"
 )
@@ -144,8 +143,14 @@ func stopInitializedTask(ctx context.Context, taskEnt *taskEntity) error {
 		runtimeDiff[jobmgrcommon.FailureCountField] = uint32(0)
 	}
 
-	err = cachedJob.PatchTasks(ctx,
-		map[uint32]jobmgrcommon.RuntimeDiff{taskEnt.instanceID: runtimeDiff})
+	// we do not need to handle `instancesToBeRetried` here since the task
+	// is being requeued to the goalstate. Goalstate will reload the task
+	// runtime when the task is evaluated the next time
+	_, _, err = cachedJob.PatchTasks(
+		ctx,
+		map[uint32]jobmgrcommon.RuntimeDiff{taskEnt.instanceID: runtimeDiff},
+		false,
+	)
 	if err == nil {
 		goalStateDriver.EnqueueTask(taskEnt.jobID, taskEnt.instanceID, time.Now())
 		EnqueueJobWithDefaultDelay(taskEnt.jobID, goalStateDriver, cachedJob)
@@ -170,10 +175,9 @@ func stopMesosTask(ctx context.Context, taskEnt *taskEntity, runtime *task.Runti
 	}
 
 	// Send kill signal to mesos first time
-	err := jobmgrtask.KillTask(
+	err := goalStateDriver.lm.Kill(
 		ctx,
-		goalStateDriver.hostmgrClient,
-		runtime.GetMesosTaskId(),
+		runtime.GetMesosTaskId().GetValue(),
 		runtime.GetDesiredHost(),
 		goalStateDriver.taskKillRateLimiter,
 	)
@@ -187,8 +191,14 @@ func stopMesosTask(ctx context.Context, taskEnt *taskEntity, runtime *task.Runti
 		jobmgrcommon.ReasonField:  "",
 	}
 
-	err = cachedJob.PatchTasks(ctx,
-		map[uint32]jobmgrcommon.RuntimeDiff{taskEnt.instanceID: runtimeDiff})
+	// we do not need to handle `instancesToBeRetried` here since the task
+	// is being requeued to the goalstate. Goalstate will reload the task
+	// runtime when the task is evaluated the next time
+	_, _, err = cachedJob.PatchTasks(
+		ctx,
+		map[uint32]jobmgrcommon.RuntimeDiff{taskEnt.instanceID: runtimeDiff},
+		false,
+	)
 
 	if err == nil {
 		// timeout for task kill

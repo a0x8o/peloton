@@ -30,17 +30,13 @@ import (
 	"github.com/uber/peloton/pkg/hostmgr/mesos/yarpc/encoding/mpb"
 	"github.com/uber/peloton/pkg/hostmgr/offer/offerpool"
 	"github.com/uber/peloton/pkg/hostmgr/prune"
-	"github.com/uber/peloton/pkg/hostmgr/reservation/cleaner"
-	"github.com/uber/peloton/pkg/storage"
+	"github.com/uber/peloton/pkg/hostmgr/watchevent"
 )
 
 const (
-	_heldHostPrunerName          = "heldHostPruner"
-	_placingHostPrunerName       = "placingHostPruner"
-	_binPackingRefresherName     = "binPackingRefresher"
-	_resourceCleanerName         = "resourceCleaner"
-	_resourceCleanerPeriod       = 15 * time.Minute
-	_resourceCleanerInitialDelay = 15 * time.Minute
+	_heldHostPrunerName      = "heldHostPruner"
+	_placingHostPrunerName   = "placingHostPruner"
+	_binPackingRefresherName = "binPackingRefresher"
 
 	_poolMetricsRefresh       = "poolMetricsRefresh"
 	_poolMetricsRefreshPeriod = 10 * time.Second
@@ -79,7 +75,6 @@ func InitEventHandler(
 	offerHoldTime time.Duration,
 	offerPruningPeriod time.Duration,
 	schedulerClient mpb.SchedulerClient,
-	volumeStore storage.PersistentVolumeStore,
 	backgroundMgr background.Manager,
 	placingHostPruningPeriodSec time.Duration,
 	heldHostPruningPeriodSec time.Duration,
@@ -87,7 +82,8 @@ func InitEventHandler(
 	slackResourceTypes []string,
 	ranker binpacking.Ranker,
 	binPackingRefreshIntervalSec time.Duration,
-	hostPlacingOfferStatusTimeout time.Duration) {
+	hostPlacingOfferStatusTimeout time.Duration,
+	processor watchevent.WatchProcessor) {
 
 	if handler != nil {
 		log.Warning("Offer event handler has already been initialized")
@@ -99,11 +95,11 @@ func InitEventHandler(
 		schedulerClient,
 		metrics,
 		hostmgr_mesos.GetSchedulerDriver(),
-		volumeStore,
 		scarceResourceTypes,
 		slackResourceTypes,
 		ranker,
 		hostPlacingOfferStatusTimeout,
+		processor,
 	)
 
 	placingHostPruner := prune.NewPlacingHostPruner(
@@ -141,21 +137,7 @@ func InitEventHandler(
 		},
 	)
 
-	resourceCleaner := cleaner.NewCleaner(
-		pool,
-		parent.SubScope(_resourceCleanerName),
-		volumeStore,
-		schedulerClient,
-		hostmgr_mesos.GetSchedulerDriver(),
-	)
 	backgroundMgr.RegisterWorks(
-		background.Work{
-			Name:         _resourceCleanerName,
-			Func:         resourceCleaner.Run,
-			Period:       _resourceCleanerPeriod,
-			InitialDelay: _resourceCleanerInitialDelay,
-		},
-
 		background.Work{
 			Name: _poolMetricsRefresh,
 			Func: func(_ *atomic.Bool) {

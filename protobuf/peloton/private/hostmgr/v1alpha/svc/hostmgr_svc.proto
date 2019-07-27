@@ -28,6 +28,26 @@ message AcquireHostsResponse {
   map<string, uint32> filter_result_counts = 2;
 }
 
+// TerminateLeasesRequest contains the host leases that need to be terminated
+// so that host manager can release the locks on those hosts.
+message TerminateLeasesRequest {
+  // A LeasePair is a structure holding a hostname and its lease id.
+  message LeasePair {
+    // The lease id of the lease pair.
+    hostmgr.LeaseID lease_id = 1;
+
+    // The hostname of the lease pair.
+    string hostname = 2;
+  }
+
+  // The lease pairs of the acquired hosts who's leases need to be terminated.
+  // Each lease pair contains the lease id and the hostname for the lease.
+  repeated LeasePair leases = 1;
+}
+
+// TerminateLeasesResponse is a placeholder response structure.
+message TerminateLeasesResponse {}
+
 // LaunchPodsRequest contains the lease_id of acquired host and list of pods to
 // be launched on that host.
 message LaunchPodsRequest {
@@ -80,6 +100,41 @@ message GetEventsResponse {
 	repeated peloton.private.eventstream.v1alpha.event.Event events = 1;
 }
 
+// Error for source host pool not found when changing host pool.
+message SourcePoolNotFoundFailure {
+  string message = 1;
+}
+
+// Error for destination host pool not found when changing host pool.
+message DestinationPoolNotFoundFailure {
+  string message = 1;
+}
+
+// Request to change host pool of given host from source pool to destination pool.
+message ChangeHostPoolRequest {
+  // Source host pool id of given host.
+  string sourcePool = 1;
+
+  // Destination host pool id of given host.
+  string destinationPool = 2;
+
+  // Hostname of Host to change host pool.
+  string hostname = 3;
+}
+
+// Response containing result of changing host pool of given host.
+message ChangeHostPoolResponse {
+  message Error {
+    // Error for source pool not found failure.
+    SourcePoolNotFoundFailure sourcePoolNotFoundFailure = 1;
+
+    // Error for destination pool not found failure.
+    DestinationPoolNotFoundFailure destinationPoolNotFoundFailure = 2;
+  }
+
+  Error error = 1;
+}
+
 // HostManagerService interface to be used by JobManager, PlacementEngine and
 // ResourceManager for scheduling and managing pods and hosts in the cluster.
 service HostManagerService
@@ -87,6 +142,10 @@ service HostManagerService
   // AcquireHosts acquires a set of hosts from the host manager. Each host will
   // only be used by one client at a given time.
   rpc AcquireHosts(AcquireHostsRequest) returns (AcquireHostsResponse);
+
+  // TerminateLeases terminates the leases for a set of hosts, effectively releasing
+  // the lock that host manager had on those hosts.
+  rpc TerminateLeases(TerminateLeasesRequest) returns (TerminateLeasesResponse);
 
   // LaunchPods launches pods on the cluster.
   rpc LaunchPods(LaunchPodsRequest) returns (LaunchPodsResponse);
@@ -101,4 +160,10 @@ service HostManagerService
   // GetEvents returns all the outstanding podevents in the event stream.
 	// For debug purpose only.
   rpc GetEvents(GetEventsRequest) returns(GetEventsResponse);
+
+  // ChangeHostPool moves given host from source host pool to destination host pool.
+  // It returns SourcePoolNotFoundFailure error if source pool not found.
+  // It returns DestinationPoolNotFoundFailure error if destination pool not found.
+  // It returns YARPC error accordingly for other types of failures.
+  rpc ChangeHostPool(ChangeHostPoolRequest) returns (ChangeHostPoolResponse);
 }

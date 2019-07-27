@@ -32,6 +32,7 @@ import (
 	hosts_mock "github.com/uber/peloton/pkg/placement/hosts/mocks"
 	"github.com/uber/peloton/pkg/placement/metrics"
 	"github.com/uber/peloton/pkg/placement/models"
+	"github.com/uber/peloton/pkg/placement/models/v0"
 	tasks_mock "github.com/uber/peloton/pkg/placement/tasks/mocks"
 	"github.com/uber/peloton/pkg/placement/testutil"
 
@@ -82,7 +83,7 @@ func (suite *ReserverTestSuite) TestReserverStop() {
 // TestReservation tries to test the reservation is working as expected
 func (suite *ReserverTestSuite) TestReservation() {
 	task := createResMgrTask()
-	hosts := []*models.Host{
+	hosts := []*models_v0.Host{
 		{
 			Host: creareHostInfo(),
 		},
@@ -151,7 +152,7 @@ func (suite *ReserverTestSuite) TestReservationErrorinAcquire() {
 // from the HostService and verify that.
 func (suite *ReserverTestSuite) TestReservationErrorInReservation() {
 	task := createResMgrTask()
-	hosts := []*models.Host{
+	hosts := []*models_v0.Host{
 		{
 			Host: creareHostInfo(),
 		},
@@ -174,22 +175,18 @@ func (suite *ReserverTestSuite) TestReservationErrorInReservation() {
 // but won't get placed
 func (suite *ReserverTestSuite) TestProcessHostReservation() {
 	createTasks := 25
-	createHosts := 10
 
 	deadline := time.Now().Add(time.Second)
 
-	var assignments []*models.Assignment
+	var assignments []models.Task
 	for i := 0; i < createTasks; i++ {
 		assignment := testutil.SetupAssignment(deadline, 1)
 		assignment.GetTask().GetTask().Resource.CpuLimit = 5
+		if i == 10 {
+			assignment.Task.Task.JobId = &peloton.JobID{Value: "hostreservation_10"}
+			assignment.Task.Task.ReadyForHostReservation = true
+		}
 		assignments = append(assignments, assignment)
-	}
-	assignments[10].Task.Task.JobId = &peloton.JobID{Value: "hostreservation_10"}
-	assignments[10].Task.Task.ReadyForHostReservation = true
-
-	var hosts []*models.HostOffers
-	for i := 0; i < createHosts; i++ {
-		hosts = append(hosts, testutil.SetupHostOffers())
 	}
 
 	// Test host can be reserved
@@ -198,10 +195,12 @@ func (suite *ReserverTestSuite) TestProcessHostReservation() {
 
 	suite.Equal(1, suite.reserver.GetReservationQueue().Length())
 	item, _ := suite.reserver.GetReservationQueue().Dequeue(1 * time.Second)
+	suite.NotNil(item)
 	reservation, _ := item.(*hostsvc.Reservation)
+	suite.NotNil(reservation)
 	task := reservation.Task
 	suite.Equal(true, task.ReadyForHostReservation)
-	suite.Equal("hostreservation_10", task.JobId.Value)
+	suite.Equal("hostreservation_10", task.GetJobId().GetValue())
 
 	// test Enqueue error during host reservation
 	reserver, reserverQueue, _ := suite.getReserver()
@@ -359,7 +358,7 @@ func (suite *ReserverTestSuite) getReserver() (*reserver, *queue_mocks.MockQueue
 		taskService:               suite.taskService,
 		reservationQueue:          reserverQueue,
 		completedReservationQueue: completedQueue,
-		reservations:              make(map[string][]*models.Host),
+		reservations:              make(map[string][]*models_v0.Host),
 		tasks:                     make(map[string]*resmgr.Task),
 	}, reserverQueue, completedQueue
 }
@@ -384,7 +383,7 @@ func (suite *ReserverTestSuite) getCompletedReservation() *hostsvc.CompletedRese
 // TestTaskLen tests the TaskLen function which gets the
 // length of the tasks in HostModel
 func (suite *ReserverTestSuite) TestTaskLen() {
-	host := &models.Host{
+	host := &models_v0.Host{
 		Host: creareHostInfo(),
 		Tasks: []*resmgr.Task{
 			createResMgrTask(),

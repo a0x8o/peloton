@@ -41,7 +41,6 @@ import (
 )
 
 const (
-	testJobName  = "uber"
 	testJob      = "941ff353-ba82-49fe-8f80-fb5bc649b04d"
 	testUpdateID = "141ff353-ba82-49fe-8f80-fb5bc649b042"
 )
@@ -140,11 +139,7 @@ func (suite *MockDatastoreTestSuite) TestDataStoreFailureGetJobSummary() {
 
 // TestDataStoreFailureGetJob tests datastore failures in getting job
 func (suite *MockDatastoreTestSuite) TestDataStoreFailureGetJob() {
-	_, err := suite.store.GetJobsByStates(
-		context.Background(), []job.JobState{job.JobState_RUNNING})
-	suite.Error(err)
-
-	_, err = suite.store.GetMaxJobConfigVersion(
+	_, err := suite.store.GetMaxJobConfigVersion(
 		context.Background(), suite.testJobID.GetValue())
 	suite.Error(err)
 }
@@ -168,30 +163,14 @@ func (suite *MockDatastoreTestSuite) TestDataStoreFailureGetTasks() {
 		context.Background(), suite.testJobID.GetValue(), 0)
 	suite.Error(err)
 
-	_, err = suite.store.GetTaskIDsForJobAndState(
-		context.Background(), suite.testJobID, task.TaskState_PENDING.String())
-	suite.Error(err)
-
-	_, err = suite.store.getTaskStateCount(
-		context.Background(), suite.testJobID, task.TaskState_PENDING.String())
-	suite.Error(err)
-
 	_, err = suite.store.getTask(context.Background(), testJob, 0)
 	suite.Error(err)
 }
 
 // TestDataStoreFailureGetTaskConfig tests datastore failures in getting task cfg
 func (suite *MockDatastoreTestSuite) TestDataStoreFailureGetTaskConfig() {
-	_, _, err := suite.store.GetTaskConfig(
-		context.Background(), suite.testJobID, 0, 0)
-	suite.Error(err)
-
-	_, _, err = suite.store.GetTaskConfigs(
+	_, _, err := suite.store.GetTaskConfigs(
 		context.Background(), suite.testJobID, []uint32{0}, 0)
-	suite.Error(err)
-
-	_, err = suite.store.GetTaskStateSummaryForJob(
-		context.Background(), suite.testJobID)
 	suite.Error(err)
 }
 
@@ -282,31 +261,6 @@ func (suite *MockDatastoreTestSuite) TestDataStoreFailureDeleteJobCfgVersion() {
 	suite.Error(err)
 }
 
-// TestDataStoreFailureActiveJobs tests datastore failures add/get/delete jobID
-// from active jobs
-func (suite *MockDatastoreTestSuite) TestDataStoreFailureActiveJobs() {
-	err := suite.store.AddActiveJob(context.Background(), suite.testJobID)
-	suite.Error(err)
-
-	_, err = suite.store.GetActiveJobs(context.Background())
-	suite.Error(err)
-
-	err = suite.store.DeleteActiveJob(context.Background(), suite.testJobID)
-	suite.Error(err)
-}
-
-// TestCreateTaskConfigFailures tests failure scenarios for create task configs
-func (suite *MockDatastoreTestSuite) TestCreateTaskConfigFailures() {
-
-	jobID := &peloton.JobID{
-		Value: testJob,
-	}
-
-	err := suite.store.CreateTaskConfig(context.Background(), jobID,
-		0, &task.TaskConfig{Name: "dummy-task"}, nil, 0)
-	suite.Error(err)
-}
-
 // TestWorkflowEventsFailures tests failure scenarios for workflow events
 func (suite *MockDatastoreTestSuite) TestWorkflowEventsFailures() {
 	updateID := &peloton.UpdateID{
@@ -328,45 +282,16 @@ func (suite *MockDatastoreTestSuite) TestWorkflowEventsFailures() {
 	suite.Error(err)
 }
 
-// TestJobUpdateEventsFailures tests failure scenarios for job update events
-func (suite *MockDatastoreTestSuite) TestJobUpdateEventsFailures() {
-	updateID := &peloton.UpdateID{
-		Value: testUpdateID,
-	}
-
-	err := suite.store.AddJobUpdateEvent(
-		context.Background(),
-		updateID,
-		models.WorkflowType_UPDATE,
-		update.State_ROLLING_FORWARD)
-	suite.Error(err)
-
-	err = suite.store.deleteJobUpdateEvents(context.Background(), updateID)
-	suite.Error(err)
-
-	_, err = suite.store.GetJobUpdateEvents(context.Background(), updateID)
-	suite.Error(err)
-}
-
 // TestDataStoreFailureGetTaskConfigs tests datastore failures in get task
 // config from legacy/v2 tables
 func (suite *MockDatastoreTestSuite) TestDataStoreFailureGetTaskConfigs() {
 	ctx := context.Background()
 	var result datastore.ResultSet
 
-	// Setup mocks for this context
-	// Simulate success for the first query and failure for the second query
 	suite.mockedDataStore.EXPECT().Execute(ctx, gomock.Any()).
 		Return(result, nil)
 	suite.mockedDataStore.EXPECT().Execute(ctx, gomock.Any()).
 		Return(result, errors.New("my-error"))
-	_, _, err := suite.store.GetTaskConfig(ctx, suite.testJobID, uint32(0), 0)
-	suite.Error(err)
-
-	suite.mockedDataStore.EXPECT().Execute(ctx, gomock.Any()).
-		Return(result, nil)
-	suite.mockedDataStore.EXPECT().Execute(ctx, gomock.Any()).
-		Return(result, errors.New("my-error"))
-	_, _, err = suite.store.GetTaskConfigs(ctx, suite.testJobID, []uint32{0}, 0)
+	_, _, err := suite.store.GetTaskConfigs(ctx, suite.testJobID, []uint32{0}, 0)
 	suite.Error(err)
 }

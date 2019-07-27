@@ -20,7 +20,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/uber/peloton/.gen/mesos/v1"
+	mesos "github.com/uber/peloton/.gen/mesos/v1"
 	"github.com/uber/peloton/.gen/peloton/api/v0/peloton"
 	pb_respool "github.com/uber/peloton/.gen/peloton/api/v0/respool"
 	resp "github.com/uber/peloton/.gen/peloton/api/v0/respool"
@@ -35,6 +35,7 @@ import (
 	"github.com/uber/peloton/pkg/resmgr/respool/mocks"
 	"github.com/uber/peloton/pkg/resmgr/scalar"
 	store_mocks "github.com/uber/peloton/pkg/storage/mocks"
+	objectmocks "github.com/uber/peloton/pkg/storage/objects/mocks"
 
 	"github.com/golang/mock/gomock"
 	"github.com/pkg/errors"
@@ -55,13 +56,13 @@ type RMTaskTestSuite struct {
 
 func (s *RMTaskTestSuite) SetupSuite() {
 	s.ctrl = gomock.NewController(s.T())
-	mockResPoolStore := store_mocks.NewMockResourcePoolStore(s.ctrl)
-	mockResPoolStore.EXPECT().GetAllResourcePools(context.Background()).
+	mockResPoolOps := objectmocks.NewMockResPoolOps(s.ctrl)
+	mockResPoolOps.EXPECT().GetAll(context.Background()).
 		Return(s.getResPools(), nil).AnyTimes()
 	mockJobStore := store_mocks.NewMockJobStore(s.ctrl)
 	mockTaskStore := store_mocks.NewMockTaskStore(s.ctrl)
 
-	s.resTree = respool.NewTree(tally.NoopScope, mockResPoolStore, mockJobStore,
+	s.resTree = respool.NewTree(tally.NoopScope, mockResPoolOps, mockJobStore,
 		mockTaskStore, rc.PreemptionConfig{
 			Enabled: false,
 		})
@@ -162,7 +163,7 @@ func (s *RMTaskTestSuite) createTask(instance int) *resmgr.Task {
 			GpuLimit:    0,
 			MemLimitMb:  100,
 		},
-		TaskId: &mesos_v1.TaskID{
+		TaskId: &mesos.TaskID{
 			Value: &mesosID,
 		},
 	}
@@ -184,7 +185,7 @@ func (s *RMTaskTestSuite) createTask0(cycleCount, attemptCount float64) *resmgr.
 			GpuLimit:    0,
 			MemLimitMb:  100,
 		},
-		TaskId: &mesos_v1.TaskID{
+		TaskId: &mesos.TaskID{
 			Value: &mesosTaskID,
 		},
 		Preemptible:             true,
@@ -268,6 +269,7 @@ func (s *RMTaskTestSuite) TestCreateRMTasks() {
 		&Config{
 			LaunchingTimeout:      2 * time.Second,
 			PlacingTimeout:        2 * time.Second,
+			PreemptingTimeout:     2 * time.Second,
 			PlacementRetryCycle:   3,
 			PlacementRetryBackoff: 1 * time.Second,
 			PolicyName:            ExponentialBackOffPolicy,
@@ -286,6 +288,7 @@ func (s *RMTaskTestSuite) TestCreateRMTasks() {
 		&Config{
 			LaunchingTimeout:      2 * time.Second,
 			PlacingTimeout:        2 * time.Second,
+			PreemptingTimeout:     2 * time.Second,
 			PlacementRetryCycle:   3,
 			PlacementRetryBackoff: 1 * time.Second,
 			PolicyName:            ExponentialBackOffPolicy,
@@ -577,7 +580,6 @@ func (s *RMTaskTestSuite) TestReservingTimeout() {
 }
 
 func (s *RMTaskTestSuite) TestLaunchingTimeout() {
-
 	node, err := s.resTree.Get(&peloton.ResourcePoolID{Value: "respool3"})
 	s.NoError(err)
 	node.SetNonSlackEntitlement(s.getEntitlement())
@@ -610,7 +612,47 @@ func (s *RMTaskTestSuite) TestLaunchingTimeout() {
 	// Testing the launching timeout hence sleep
 	time.Sleep(3 * time.Second)
 	s.EqualValues(rmtask.GetCurrentState().State, task.TaskState_READY)
+}
 
+func (s *RMTaskTestSuite) TestPreemptingTimeout() {
+	node, err := s.resTree.Get(&peloton.ResourcePoolID{Value: "respool3"})
+	s.NoError(err)
+	node.SetNonSlackEntitlement(s.getEntitlement())
+
+	s.tracker.AddTask(
+		s.pendingGang0().Tasks[0],
+		nil,
+		node,
+		&Config{
+			LaunchingTimeout:      2 * time.Second,
+			PlacingTimeout:        2 * time.Second,
+			PreemptingTimeout:     2 * time.Second,
+			PlacementRetryCycle:   3,
+			PlacementRetryBackoff: 1 * time.Second,
+			PolicyName:            ExponentialBackOffPolicy,
+		})
+	s.NoError(err)
+	rmtask := s.tracker.GetTask(s.pendingGang0().Tasks[0].Id)
+	err = rmtask.TransitTo(task.TaskState_PENDING.String(), statemachine.WithInfo("mesos_task_id",
+		*s.pendingGang0().Tasks[0].TaskId.Value))
+	s.NoError(err)
+
+	err = rmtask.TransitTo(task.TaskState_READY.String())
+	s.NoError(err)
+	err = rmtask.TransitTo(task.TaskState_PLACING.String())
+	s.NoError(err)
+	err = rmtask.TransitTo(task.TaskState_PLACED.String())
+	s.NoError(err)
+	err = rmtask.TransitTo(task.TaskState_LAUNCHING.String())
+	s.NoError(err)
+	err = rmtask.TransitTo(task.TaskState_RUNNING.String())
+	s.NoError(err)
+	err = rmtask.TransitTo(task.TaskState_PREEMPTING.String())
+	s.NoError(err)
+	// Testing the preempting timeout hence sleep
+	// TODO remove sleep
+	time.Sleep(3 * time.Second)
+	s.EqualValues(rmtask.GetCurrentState().State, task.TaskState_RUNNING)
 }
 
 func (s *RMTaskTestSuite) TestRunTimeStats() {

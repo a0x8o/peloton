@@ -17,6 +17,7 @@ package jobmgr
 import (
 	"time"
 
+	"github.com/uber/peloton/pkg/common/api"
 	"github.com/uber/peloton/pkg/jobmgr/goalstate"
 	"github.com/uber/peloton/pkg/jobmgr/jobsvc"
 	"github.com/uber/peloton/pkg/jobmgr/task/deadline"
@@ -67,4 +68,8 @@ type Config struct {
 	// check instances counts between MV and configuration,
 	// if the counts mismatch, we will re-calculate job state from cache
 	JobRuntimeCalculationViaCache bool `yaml:"job_runtime_calculation_via_cache"`
+
+	// HostManagerAPIVersion is the API version that the Resource Manager
+	// should use to talk to Host Manager.
+	HostManagerAPIVersion api.Version `yaml:"hostmgr_api_version"`
 }

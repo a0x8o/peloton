@@ -24,6 +24,7 @@ import (
 	"github.com/uber/peloton/.gen/peloton/api/v0/peloton"
 	"github.com/uber/peloton/.gen/peloton/api/v0/task"
 	"github.com/uber/peloton/.gen/peloton/api/v0/update"
+	"github.com/uber/peloton/.gen/peloton/api/v1alpha/job/stateless"
 	"github.com/uber/peloton/.gen/peloton/private/models"
 
 	"github.com/uber/peloton/pkg/jobmgr/cached"
@@ -57,6 +58,7 @@ type jobActionsTestSuite struct {
 	cachedTask            *cachedmocks.MockTask
 	jobStore              *storemocks.MockJobStore
 	updateStore           *storemocks.MockUpdateStore
+	activeJobsOps         *ormmocks.MockActiveJobsOps
 	jobIndexOps           *ormmocks.MockJobIndexOps
 	jobRuntimeOps         *ormmocks.MockJobRuntimeOps
 }
@@ -70,6 +72,7 @@ func (suite *jobActionsTestSuite) SetupTest() {
 	suite.jobStore = storemocks.NewMockJobStore(suite.ctrl)
 	suite.updateStore = storemocks.NewMockUpdateStore(suite.ctrl)
 	suite.updateGoalStateEngine = goalstatemocks.NewMockEngine(suite.ctrl)
+	suite.activeJobsOps = ormmocks.NewMockActiveJobsOps(suite.ctrl)
 	suite.jobIndexOps = ormmocks.NewMockJobIndexOps(suite.ctrl)
 	suite.jobRuntimeOps = ormmocks.NewMockJobRuntimeOps(suite.ctrl)
 
@@ -80,6 +83,7 @@ func (suite *jobActionsTestSuite) SetupTest() {
 		jobEngine:     suite.jobGoalStateEngine,
 		taskEngine:    suite.taskGoalStateEngine,
 		jobFactory:    suite.jobFactory,
+		activeJobsOps: suite.activeJobsOps,
 		jobIndexOps:   suite.jobIndexOps,
 		jobRuntimeOps: suite.jobRuntimeOps,
 		mtx:           NewMetrics(tally.NoopScope),
@@ -200,6 +204,7 @@ func (suite *jobActionsTestSuite) TestJobRecoverBachJobSuccess() {
 			gomock.Any(),
 			&job.JobInfo{Runtime: &job.RuntimeInfo{State: job.JobState_INITIALIZED}},
 			nil,
+			nil,
 			cached.UpdateCacheAndDB).
 		Return(nil)
 
@@ -227,6 +232,7 @@ func (suite *jobActionsTestSuite) TestJobRecoverServiceJobSuccess() {
 		Update(
 			gomock.Any(),
 			&job.JobInfo{Runtime: &job.RuntimeInfo{State: job.JobState_PENDING}},
+			nil,
 			nil,
 			cached.UpdateCacheAndDB).
 		Return(nil)
@@ -276,8 +282,8 @@ func (suite *jobActionsTestSuite) TestJobRecoverActionFailToRecover() {
 		Delete(gomock.Any(), suite.jobID).
 		Return(nil)
 
-	suite.jobStore.EXPECT().
-		DeleteActiveJob(gomock.Any(), suite.jobID).
+	suite.activeJobsOps.EXPECT().
+		Delete(gomock.Any(), suite.jobID).
 		Return(nil)
 
 	suite.jobFactory.EXPECT().
@@ -353,7 +359,7 @@ func (suite *jobActionsTestSuite) TestDeleteJobFromActiveJobs() {
 
 		// cachedJob.EXPECT().GetJobType().Return(test.typ)
 		if test.shouldDelete {
-			suite.jobStore.EXPECT().DeleteActiveJob(gomock.Any(), suite.jobID).Return(nil)
+			suite.activeJobsOps.EXPECT().Delete(gomock.Any(), suite.jobID).Return(nil)
 		}
 		err := DeleteJobFromActiveJobs(context.Background(), suite.jobEnt)
 		suite.NoError(err)
@@ -402,7 +408,7 @@ func (suite *jobActionsTestSuite) TestDeleteJobFromActiveJobsFailures() {
 		Return(&job.JobConfig{
 			Type: job.JobType_BATCH,
 		}, nil)
-	suite.jobStore.EXPECT().DeleteActiveJob(gomock.Any(), suite.jobID).
+	suite.activeJobsOps.EXPECT().Delete(gomock.Any(), suite.jobID).
 		Return(fmt.Errorf("DB error"))
 	err = DeleteJobFromActiveJobs(context.Background(), suite.jobEnt)
 	suite.Error(err)
@@ -420,7 +426,9 @@ func (suite *jobActionsTestSuite) TestStartJobSuccess() {
 	suite.cachedJob.EXPECT().ID().Return(suite.jobID).AnyTimes()
 	suite.jobFactory.EXPECT().GetJob(suite.jobID).Return(suite.cachedJob)
 	suite.cachedJob.EXPECT().GetAllTasks().Return(taskMap)
-	suite.cachedJob.EXPECT().PatchTasks(gomock.Any(), gomock.Any()).Return(nil)
+	suite.cachedJob.EXPECT().
+		PatchTasks(gomock.Any(), gomock.Any(), false).
+		Return(nil, nil, nil)
 	suite.taskGoalStateEngine.EXPECT().Enqueue(gomock.Any(), gomock.Any())
 	suite.cachedJob.EXPECT().GetRuntime(gomock.Any()).Return(jobRuntime, nil)
 	suite.cachedJob.EXPECT().
@@ -450,8 +458,8 @@ func (suite *jobActionsTestSuite) TestStartJobPatchTasksFailure() {
 	suite.jobFactory.EXPECT().GetJob(suite.jobID).Return(cachedJob)
 	cachedJob.EXPECT().GetAllTasks().Return(taskMap)
 	cachedJob.EXPECT().
-		PatchTasks(gomock.Any(), gomock.Any()).
-		Return(yarpcerrors.InternalErrorf("test error"))
+		PatchTasks(gomock.Any(), gomock.Any(), false).
+		Return(nil, nil, yarpcerrors.InternalErrorf("test error"))
 
 	suite.Error(JobStart(context.Background(), suite.jobEnt))
 }
@@ -467,7 +475,8 @@ func (suite *jobActionsTestSuite) TestStartJobGetRuntimeFailure() {
 	cachedJob.EXPECT().ID().Return(suite.jobID).AnyTimes()
 	suite.jobFactory.EXPECT().GetJob(suite.jobID).Return(cachedJob)
 	cachedJob.EXPECT().GetAllTasks().Return(taskMap)
-	cachedJob.EXPECT().PatchTasks(gomock.Any(), gomock.Any()).Return(nil)
+	cachedJob.EXPECT().PatchTasks(gomock.Any(), gomock.Any(), false).
+		Return(nil, nil, nil)
 	suite.taskGoalStateEngine.EXPECT().Enqueue(gomock.Any(), gomock.Any())
 	cachedJob.EXPECT().
 		GetRuntime(gomock.Any()).
@@ -491,7 +500,8 @@ func (suite *jobActionsTestSuite) TestStartJobRuntimeUpdateFailure() {
 	cachedJob.EXPECT().ID().Return(suite.jobID).AnyTimes()
 	suite.jobFactory.EXPECT().GetJob(suite.jobID).Return(cachedJob)
 	cachedJob.EXPECT().GetAllTasks().Return(taskMap)
-	cachedJob.EXPECT().PatchTasks(gomock.Any(), gomock.Any()).Return(nil)
+	cachedJob.EXPECT().PatchTasks(gomock.Any(), gomock.Any(), false).
+		Return(nil, nil, nil)
 	suite.taskGoalStateEngine.EXPECT().Enqueue(gomock.Any(), gomock.Any())
 	cachedJob.EXPECT().
 		GetRuntime(gomock.Any()).
@@ -594,6 +604,7 @@ func (suite *jobActionsTestSuite) TestJobReloadRuntimeSuccess() {
 					Runtime: jobRuntime,
 				},
 				nil,
+				nil,
 				cached.UpdateCacheOnly,
 			).Return(nil),
 
@@ -620,6 +631,7 @@ func (suite *jobActionsTestSuite) TestJobReloadGetJobRuntimeFailure() {
 			Update(
 				gomock.Any(),
 				&job.JobInfo{},
+				nil,
 				nil,
 				cached.UpdateCacheOnly,
 			).Return(nil),
@@ -654,6 +666,7 @@ func (suite *jobActionsTestSuite) TestJobReloadRuntimeUpdateFailure() {
 				&job.JobInfo{
 					Runtime: jobRuntime,
 				}, nil,
+				nil,
 				cached.UpdateCacheOnly,
 			).Return(yarpcerrors.InternalErrorf("test error")),
 	)
@@ -690,6 +703,7 @@ func (suite *jobActionsTestSuite) TestJobReloadRuntimeJobNotFound() {
 			Update(
 				gomock.Any(),
 				&job.JobInfo{Runtime: &job.RuntimeInfo{State: job.JobState_PENDING}},
+				nil,
 				nil,
 				cached.UpdateCacheAndDB).
 			Return(nil),
@@ -926,10 +940,16 @@ func (suite *jobActionsTestSuite) TestJobKillAndDeleteTerminatedJobWithRunningTa
 		Return(jobRuntime, nil)
 
 	suite.cachedJob.EXPECT().
-		Update(gomock.Any(), gomock.Any(), gomock.Any(), cached.UpdateCacheAndDB).
+		Update(
+			gomock.Any(),
+			gomock.Any(),
+			gomock.Any(),
+			gomock.Any(),
+			cached.UpdateCacheAndDB).
 		Do(func(_ context.Context,
 			jobInfo *job.JobInfo,
 			_ *models.ConfigAddOn,
+			_ *stateless.JobSpec,
 			_ cached.UpdateRequest) {
 			suite.Equal(jobInfo.Runtime.State, job.JobState_KILLED)
 		}).
@@ -943,8 +963,8 @@ func (suite *jobActionsTestSuite) TestJobKillAndDeleteTerminatedJobWithRunningTa
 	}
 
 	suite.cachedJob.EXPECT().
-		PatchTasks(gomock.Any(), gomock.Any()).
-		Return(nil)
+		PatchTasks(gomock.Any(), gomock.Any(), false).
+		Return(nil, nil, nil)
 
 	suite.cachedJob.EXPECT().
 		GetJobType().
@@ -1013,8 +1033,8 @@ func (suite *jobActionsTestSuite) TestJobKillAndUntrackTerminatedJobWithNonTermi
 	}
 
 	suite.cachedJob.EXPECT().
-		PatchTasks(gomock.Any(), gomock.Any()).
-		Return(nil)
+		PatchTasks(gomock.Any(), gomock.Any(), false).
+		Return(nil, nil, nil)
 
 	suite.cachedJob.EXPECT().
 		GetConfig(gomock.Any()).

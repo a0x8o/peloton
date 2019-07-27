@@ -33,6 +33,8 @@ import (
 	"go.uber.org/yarpc/yarpcerrors"
 )
 
+var _errTasksNotInCache = yarpcerrors.InternalErrorf("some tasks not in cache")
+
 // JobUntrack deletes the job and tasks from the goal state engine and the cache.
 func JobUntrack(ctx context.Context, entity goalstate.Entity) error {
 	jobEnt := entity.(*jobEntity)
@@ -144,7 +146,7 @@ func JobRecover(ctx context.Context, entity goalstate.Entity) error {
 
 		// delete from active job in the end, after this step,
 		// we would not have any reference to the job.
-		if err := goalStateDriver.jobStore.DeleteActiveJob(
+		if err := goalStateDriver.activeJobsOps.Delete(
 			ctx,
 			cachedJob.ID(),
 		); err != nil {
@@ -172,6 +174,7 @@ func JobRecover(ctx context.Context, entity goalstate.Entity) error {
 	if err := cachedJob.Update(
 		ctx,
 		&job.JobInfo{Runtime: &job.RuntimeInfo{State: jobState}},
+		nil,
 		nil,
 		cached.UpdateCacheAndDB); err != nil {
 		return err
@@ -205,7 +208,7 @@ func DeleteJobFromActiveJobs(
 	// delete a terminal batch job from the active jobs table
 	if cfg.GetType() == job.JobType_BATCH &&
 		util.IsPelotonJobStateTerminal(runtime.GetState()) {
-		if err := goalStateDriver.jobStore.DeleteActiveJob(
+		if err := goalStateDriver.activeJobsOps.Delete(
 			ctx, jobEnt.id); err != nil {
 			return err
 		}
@@ -233,7 +236,10 @@ func JobStart(
 		}
 	}
 
-	err := cachedJob.PatchTasks(ctx, runtimeDiff)
+	// We do not need to handle 'instancesToBeRetried' here since all tasks
+	// in runtimeDiff are being requeued to the goalstate. The action will be
+	// retried by the goalstate when the tasks are evaluated next time.
+	_, _, err := cachedJob.PatchTasks(ctx, runtimeDiff, false)
 	if err != nil {
 		return err
 	}
@@ -324,6 +330,7 @@ func JobReloadRuntime(
 		&job.JobInfo{
 			Runtime: jobRuntime,
 		}, nil,
+		nil,
 		cached.UpdateCacheOnly,
 	)
 	if err != nil {
@@ -425,7 +432,7 @@ func JobKillAndUntrack(ctx context.Context, entity goalstate.Entity) error {
 		return nil
 	}
 
-	runtimeDiffNonTerminatedTasks, err :=
+	runtimeDiffNonTerminatedTasks, _, err :=
 		stopTasks(ctx, cachedJob, goalStateDriver)
 	if err != nil {
 		return err

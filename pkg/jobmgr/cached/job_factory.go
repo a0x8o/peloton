@@ -58,18 +58,21 @@ type jobFactory struct {
 	sync.RWMutex //  Mutex to acquire before accessing any variables in the job factory object
 
 	// map of active jobs (job identifier -> cache job object) in the system
-	jobs           map[string]*job
-	running        bool                          // whether job factory is running
-	jobStore       storage.JobStore              // storage job store object
-	taskStore      storage.TaskStore             // storage task store object
-	updateStore    storage.UpdateStore           // storage update store object
-	volumeStore    storage.PersistentVolumeStore // storage volume store object
-	jobIndexOps    ormobjects.JobIndexOps        // DB ops for job_index table
-	jobConfigOps   ormobjects.JobConfigOps       // DB ops for job_config table
-	jobRuntimeOps  ormobjects.JobRuntimeOps      // DB ops for job_runtime table
-	jobNameToIDOps ormobjects.JobNameToIDOps     // DB ops for job_name_to_id table
-	mtx            *Metrics                      // cache metrics
-	taskMetrics    *TaskMetrics                  // task metrics
+	jobs               map[string]*job
+	running            bool                          // whether job factory is running
+	jobStore           storage.JobStore              // storage job store object
+	taskStore          storage.TaskStore             // storage task store object
+	updateStore        storage.UpdateStore           // storage update store object
+	volumeStore        storage.PersistentVolumeStore // storage volume store object
+	activeJobsOps      ormobjects.ActiveJobsOps      // DB ops for active_jobs table
+	jobIndexOps        ormobjects.JobIndexOps        // DB ops for job_index table
+	jobConfigOps       ormobjects.JobConfigOps       // DB ops for job_config table
+	jobRuntimeOps      ormobjects.JobRuntimeOps      // DB ops for job_runtime table
+	jobNameToIDOps     ormobjects.JobNameToIDOps     // DB ops for job_name_to_id table
+	jobUpdateEventsOps ormobjects.JobUpdateEventsOps // DB ops for job_update_events table
+	taskConfigV2Ops    ormobjects.TaskConfigV2Ops    // DB ops for task_config_v2 table
+	mtx                *Metrics                      // cache metrics
+	taskMetrics        *TaskMetrics                  // task metrics
 	// Job/task listeners. This list is immutable after object is created.
 	// So it can read without a lock.
 	listeners []JobTaskListener
@@ -85,20 +88,24 @@ func InitJobFactory(
 	volumeStore storage.PersistentVolumeStore,
 	ormStore *ormobjects.Store,
 	parentScope tally.Scope,
-	listeners []JobTaskListener) JobFactory {
+	listeners []JobTaskListener,
+) JobFactory {
 	return &jobFactory{
-		jobs:           map[string]*job{},
-		jobStore:       jobStore,
-		taskStore:      taskStore,
-		updateStore:    updateStore,
-		volumeStore:    volumeStore,
-		jobIndexOps:    ormobjects.NewJobIndexOps(ormStore),
-		jobConfigOps:   ormobjects.NewJobConfigOps(ormStore),
-		jobRuntimeOps:  ormobjects.NewJobRuntimeOps(ormStore),
-		jobNameToIDOps: ormobjects.NewJobNameToIDOps(ormStore),
-		mtx:            NewMetrics(parentScope.SubScope("cache")),
-		taskMetrics:    NewTaskMetrics(parentScope.SubScope("task")),
-		listeners:      listeners,
+		jobs:               map[string]*job{},
+		jobStore:           jobStore,
+		taskStore:          taskStore,
+		updateStore:        updateStore,
+		volumeStore:        volumeStore,
+		activeJobsOps:      ormobjects.NewActiveJobsOps(ormStore),
+		jobIndexOps:        ormobjects.NewJobIndexOps(ormStore),
+		jobConfigOps:       ormobjects.NewJobConfigOps(ormStore),
+		jobRuntimeOps:      ormobjects.NewJobRuntimeOps(ormStore),
+		jobNameToIDOps:     ormobjects.NewJobNameToIDOps(ormStore),
+		jobUpdateEventsOps: ormobjects.NewJobUpdateEventsOps(ormStore),
+		taskConfigV2Ops:    ormobjects.NewTaskConfigV2Ops(ormStore),
+		mtx:                NewMetrics(parentScope.SubScope("cache")),
+		taskMetrics:        NewTaskMetrics(parentScope.SubScope("task")),
+		listeners:          listeners,
 	}
 }
 
@@ -228,14 +235,15 @@ func (f *jobFactory) publishMetrics() map[pbtask.TaskState]map[pbtask.TaskState]
 	// Iterate through jobs, tasks and count
 	jobs := f.GetAllJobs()
 	var (
-		totalThrottledTasks  int
-		spreadQuotientSum    float64
-		spreadQuotientCount  int64
-		slaViolatedJobIDs    []string
-		unavailableInstances uint32
-		unknownInstances     uint32
+		totalThrottledTasks int
+		spreadQuotientSum   float64
+		spreadQuotientCount int64
+		slaViolatedJobIDs   []string
 	)
 	for _, j := range jobs {
+		unavailableInstances := uint32(0)
+		unknownInstances := uint32(0)
+
 		taskStateCount, throttledTasks, spread := j.GetTaskStateCount()
 		for stateSummary, count := range taskStateCount {
 			currentState := stateSummary.CurrentState
@@ -324,7 +332,8 @@ func (f *jobFactory) publishMetrics() map[pbtask.TaskState]map[pbtask.TaskState]
 func (f *jobFactory) notifyJobRuntimeChanged(
 	jobID *peloton.JobID,
 	jobType pbjob.JobType,
-	runtime *pbjob.RuntimeInfo) {
+	runtime *pbjob.RuntimeInfo,
+) {
 
 	if runtime != nil {
 		for _, l := range f.listeners {
@@ -339,7 +348,8 @@ func (f *jobFactory) notifyTaskRuntimeChanged(
 	instanceID uint32,
 	jobType pbjob.JobType,
 	runtime *pbtask.RuntimeInfo,
-	labels []*peloton.Label) {
+	labels []*peloton.Label,
+) {
 
 	if runtime != nil {
 		for _, l := range f.listeners {

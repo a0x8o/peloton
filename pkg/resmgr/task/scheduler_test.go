@@ -43,6 +43,7 @@ import (
 	respool_mocks "github.com/uber/peloton/pkg/resmgr/respool/mocks"
 	"github.com/uber/peloton/pkg/resmgr/scalar"
 	store_mocks "github.com/uber/peloton/pkg/storage/mocks"
+	objectmocks "github.com/uber/peloton/pkg/storage/objects/mocks"
 )
 
 var _testTasks = []*resmgr.Task{
@@ -87,18 +88,14 @@ type SchedulerTestSuite struct {
 
 func (suite *SchedulerTestSuite) SetupSuite() {
 	suite.mockCtrl = gomock.NewController(suite.T())
-	mockResPoolStore := store_mocks.NewMockResourcePoolStore(suite.mockCtrl)
+	mockResPoolOps := objectmocks.NewMockResPoolOps(suite.mockCtrl)
 	gomock.InOrder(
-		mockResPoolStore.EXPECT().
-			GetAllResourcePools(context.Background()).Return(suite.getResPools(), nil).AnyTimes(),
+		mockResPoolOps.EXPECT().
+			GetAll(context.Background()).Return(suite.getResPools(), nil).AnyTimes(),
 	)
 	mockJobStore := store_mocks.NewMockJobStore(suite.mockCtrl)
 	mockTaskStore := store_mocks.NewMockTaskStore(suite.mockCtrl)
-	gomock.InOrder(
-		mockJobStore.EXPECT().GetJobsByStates(context.Background(),
-			gomock.Any()).Return(nil, nil).AnyTimes(),
-	)
-	suite.resTree = respool.NewTree(tally.NoopScope, mockResPoolStore, mockJobStore,
+	suite.resTree = respool.NewTree(tally.NoopScope, mockResPoolOps, mockJobStore,
 		mockTaskStore, res_common.PreemptionConfig{Enabled: false})
 
 	suite.readyQueue = queue.NewMultiLevelList("ready-queue", maxReadyQueueSize)

@@ -45,9 +45,6 @@ type JobMetrics struct {
 	JobGetRuntime     tally.Counter
 	JobGetRuntimeFail tally.Counter
 
-	JobGetByStates     tally.Counter
-	JobGetByStatesFail tally.Counter
-
 	JobGetAll     tally.Counter
 	JobGetAllFail tally.Counter
 
@@ -68,19 +65,6 @@ type JobMetrics struct {
 
 	JobGetNameToID     tally.Counter
 	JobGetNameToIDFail tally.Counter
-
-	// Timers
-	JobGetByStatesDuration     tally.Timer
-	JobGetByStatesFailDuration tally.Timer
-
-	// Recovery
-	ActiveJobsAddSuccess    tally.Counter
-	ActiveJobsAddFail       tally.Counter
-	ActiveJobsDeleteSuccess tally.Counter
-	ActiveJobsDeleteFail    tally.Counter
-	GetActiveJobsSuccess    tally.Counter
-	GetActiveJobsFail       tally.Counter
-	GetActiveJobsDuration   tally.Timer
 }
 
 // OrmJobMetrics tracks counters for job related tables accessed through ORM layer
@@ -90,6 +74,8 @@ type OrmJobMetrics struct {
 	JobIndexCreateFail tally.Counter
 	JobIndexGet        tally.Counter
 	JobIndexGetFail    tally.Counter
+	JobIndexGetAll     tally.Counter
+	JobIndexGetAllFail tally.Counter
 	JobIndexUpdate     tally.Counter
 	JobIndexUpdateFail tally.Counter
 	JobIndexDelete     tally.Counter
@@ -109,6 +95,15 @@ type OrmJobMetrics struct {
 	JobConfigDelete     tally.Counter
 	JobConfigDeleteFail tally.Counter
 
+	// active_jobs.
+	ActiveJobsCreate         tally.Counter
+	ActiveJobsCreateFail     tally.Counter
+	ActiveJobsGetAll         tally.Counter
+	ActiveJobsGetAllFail     tally.Counter
+	ActiveJobsGetAllDuration tally.Timer
+	ActiveJobsDelete         tally.Counter
+	ActiveJobsDeleteFail     tally.Counter
+
 	// secret_info
 	SecretInfoCreate     tally.Counter
 	SecretInfoCreateFail tally.Counter
@@ -120,23 +115,31 @@ type OrmJobMetrics struct {
 	SecretInfoDeleteFail tally.Counter
 }
 
+// OrmRespoolMetrics tracks counters for resource pools related tables accessed through ORM layer.
+type OrmRespoolMetrics struct {
+	RespoolCreate     tally.Counter
+	RespoolCreateFail tally.Counter
+	RespoolGet        tally.Counter
+	RespoolGetFail    tally.Counter
+	RespoolGetAll     tally.Counter
+	RespoolGetAllFail tally.Counter
+	RespoolUpdate     tally.Counter
+	RespoolUpdateFail tally.Counter
+	RespoolDelete     tally.Counter
+	RespoolDeleteFail tally.Counter
+}
+
 // TaskMetrics is a struct for tracking all the task related counters in the storage layer
 type TaskMetrics struct {
 	TaskCreate     tally.Counter
 	TaskCreateFail tally.Counter
 
-	TaskCreateConfig     tally.Counter
-	TaskCreateConfigFail tally.Counter
-
 	TaskGet      tally.Counter
 	TaskGetFail  tally.Counter
 	TaskNotFound tally.Counter
 
-	TaskGetConfig tally.Counter
-	// This metric is to indicate how many task gets are performed using
-	// legacy task_config table
-	TaskGetConfigLegacy tally.Counter
-	TaskGetConfigFail   tally.Counter
+	TaskGetConfig     tally.Counter
+	TaskGetConfigFail tally.Counter
 
 	TaskGetConfigs     tally.Counter
 	TaskGetConfigsFail tally.Counter
@@ -294,21 +297,62 @@ type OrmTaskMetrics struct {
 	PodEventsAddFail tally.Counter
 	PodEventsGet     tally.Counter
 	PodEventsGetFail tally.Counter
+
+	TaskConfigV2Create     tally.Counter
+	TaskConfigV2CreateFail tally.Counter
+
+	TaskConfigV2Get     tally.Counter
+	TaskConfigV2GetFail tally.Counter
+
+	PodSpecGet     tally.Counter
+	PodSpecGetFail tally.Counter
+}
+
+// OrmHostInfoMetrics tracks counters for host info related table
+type OrmHostInfoMetrics struct {
+	HostInfoAdd     tally.Counter
+	HostInfoAddFail tally.Counter
+
+	HostInfoGet     tally.Counter
+	HostInfoGetFail tally.Counter
+
+	HostInfoGetAll     tally.Counter
+	HostInfoGetAllFail tally.Counter
+
+	HostInfoUpdate     tally.Counter
+	HostInfoUpdateFail tally.Counter
+
+	HostInfoDelete     tally.Counter
+	HostInfoDeleteFail tally.Counter
+}
+
+// OrmJobUpdateEventsMetrics tracks counter of
+// job update events related tables
+type OrmJobUpdateEventsMetrics struct {
+	JobUpdateEventsCreate     tally.Counter
+	JobUpdateEventsCreateFail tally.Counter
+	JobUpdateEventsGet        tally.Counter
+	JobUpdateEventsGetFail    tally.Counter
+	JobUpdateEventsDelete     tally.Counter
+	JobUpdateEventsDeleteFail tally.Counter
 }
 
 // Metrics is a struct for tracking all the general purpose counters that have relevance to the storage
 // layer, i.e. how many jobs and tasks were created/deleted in the storage layer
 type Metrics struct {
-	JobMetrics            *JobMetrics
-	TaskMetrics           *TaskMetrics
-	UpdateMetrics         *UpdateMetrics
-	ResourcePoolMetrics   *ResourcePoolMetrics
-	FrameworkStoreMetrics *FrameworkStoreMetrics
-	VolumeMetrics         *VolumeMetrics
-	ErrorMetrics          *ErrorMetrics
-	WorkflowMetrics       *WorkflowMetrics
-	OrmJobMetrics         *OrmJobMetrics
-	OrmTaskMetrics        *OrmTaskMetrics
+	JobMetrics                *JobMetrics
+	TaskMetrics               *TaskMetrics
+	UpdateMetrics             *UpdateMetrics
+	ResourcePoolMetrics       *ResourcePoolMetrics
+	FrameworkStoreMetrics     *FrameworkStoreMetrics
+	VolumeMetrics             *VolumeMetrics
+	ErrorMetrics              *ErrorMetrics
+	WorkflowMetrics           *WorkflowMetrics
+	OrmJobMetrics             *OrmJobMetrics
+	OrmRespoolMetrics         *OrmRespoolMetrics
+	OrmTaskMetrics            *OrmTaskMetrics
+	OrmHostInfoMetrics        *OrmHostInfoMetrics
+	OrmJobUpdateEventsMetrics *OrmJobUpdateEventsMetrics
 }
 
 // NewMetrics returns a new Metrics struct, with all metrics initialized and rooted at the given tally.Scope
@@ -347,6 +391,10 @@ func NewMetrics(scope tally.Scope) *Metrics {
 	volumeSuccessScope := volumeScope.Tagged(map[string]string{"result": "success"})
 	volumeFailScope := volumeScope.Tagged(map[string]string{"result": "fail"})
 
+	hostInfoScope := scope.SubScope("host_info")
+	hostInfoSuccessScope := hostInfoScope.Tagged(map[string]string{"result": "success"})
+	hostInfoFailScope := hostInfoScope.Tagged(map[string]string{"result": "fail"})
+
 	storageErrorScope := scope.SubScope("storage_error")
 
 	jobMetrics := &JobMetrics{
@@ -371,8 +419,6 @@ func NewMetrics(scope tally.Scope) *Metrics {
 
 		JobGetRuntime:         jobSuccessScope.Counter("get_runtime"),
 		JobGetRuntimeFail:     jobFailScope.Counter("get_runtime"),
-		JobGetByStates:        jobSuccessScope.Counter("get_job_by_state"),
-		JobGetByStatesFail:    jobFailScope.Counter("get_job_by_state"),
 		JobGetAll:             jobSuccessScope.Counter("get_job_all"),
 		JobGetAllFail:         jobFailScope.Counter("get_job_all"),
 		JobGetByRespoolID:     jobSuccessScope.Counter("get_job_by_respool_id"),
@@ -390,31 +436,17 @@ func NewMetrics(scope tally.Scope) *Metrics {
 
 		JobUpdateInfo:     jobSuccessScope.Counter("update_info"),
 		JobUpdateInfoFail: jobFailScope.Counter("update_info"),
-
-		JobGetByStatesDuration:     jobSuccessScope.Timer("get_job_by_state_duration"),
-		JobGetByStatesFailDuration: jobFailScope.Timer("get_job_by_state_duration"),
-
-		ActiveJobsAddSuccess:    jobSuccessScope.Counter("add_active_job"),
-		ActiveJobsAddFail:       jobFailScope.Counter("add_active_job"),
-		ActiveJobsDeleteSuccess: jobSuccessScope.Counter("delete_active_job"),
-		ActiveJobsDeleteFail:    jobFailScope.Counter("delete_active_job"),
-		GetActiveJobsSuccess:    jobSuccessScope.Counter("get_active_job"),
-		GetActiveJobsFail:       jobFailScope.Counter("get_active_job"),
-		GetActiveJobsDuration:   jobSuccessScope.Timer("get_active_jobs_duration"),
 	}
 
 	taskMetrics := &TaskMetrics{
-		TaskCreate:           taskSuccessScope.Counter("create"),
-		TaskCreateFail:       taskFailScope.Counter("create"),
-		TaskCreateConfig:     taskSuccessScope.Counter("create_config"),
-		TaskCreateConfigFail: taskFailScope.Counter("create_config"),
-		TaskGet:              taskSuccessScope.Counter("get"),
-		TaskGetFail:          taskFailScope.Counter("get"),
-		TaskGetConfig:        taskSuccessScope.Counter("get_config"),
-		TaskGetConfigLegacy:  taskSuccessScope.Counter("get_config_legacy"),
-		TaskGetConfigFail:    taskFailScope.Counter("get_config"),
-		TaskGetConfigs:       taskSuccessScope.Counter("get_configs"),
-		TaskGetConfigsFail:   taskFailScope.Counter("get_configs"),
+		TaskCreate:         taskSuccessScope.Counter("create"),
+		TaskCreateFail:     taskFailScope.Counter("create"),
+		TaskGet:            taskSuccessScope.Counter("get"),
+		TaskGetFail:        taskFailScope.Counter("get"),
+		TaskGetConfig:      taskSuccessScope.Counter("get_config"),
+		TaskGetConfigFail:  taskFailScope.Counter("get_config"),
+		TaskGetConfigs:     taskSuccessScope.Counter("get_configs"),
+		TaskGetConfigsFail: taskFailScope.Counter("get_configs"),
 
 		TaskLogState:        taskSuccessScope.Counter("log_state"),
 		TaskLogStateFail:    taskFailScope.Counter("log_state"),
@@ -546,6 +578,12 @@ func NewMetrics(scope tally.Scope) *Metrics {
 
 	ormScope := scope.SubScope("orm")
 
+	activeJobsScope := ormScope.SubScope("active_jobs")
+	activeJobsSuccessScope := activeJobsScope.Tagged(
+		map[string]string{"result": "success"})
+	activeJobsFailScope := activeJobsScope.Tagged(
+		map[string]string{"result": "fail"})
+
 	jobIndexScope := ormScope.SubScope("job_index")
 	jobIndexSuccessScope := jobIndexScope.Tagged(
 		map[string]string{"result": "success"})
@@ -570,10 +608,34 @@ func NewMetrics(scope tally.Scope) *Metrics {
 	podEventsFailScope := podEventsScope.Tagged(
 		map[string]string{"result": "fail"})
 
+	taskConfigV2Scope := ormScope.SubScope("task_config_v2")
+	taskConfigV2SuccessScope := taskConfigV2Scope.Tagged(
+		map[string]string{"result": "success"})
+	taskConfigV2FailScope := taskConfigV2Scope.Tagged(
+		map[string]string{"result": "fail"})
+
+	podSpecScope := ormScope.SubScope("task_config_v2")
+	podSpecSuccessScope := podSpecScope.Tagged(
+		map[string]string{"result": "success"})
+	podSpecFailScope := podSpecScope.Tagged(
+		map[string]string{"result": "fail"})
+
+	respoolScope := ormScope.SubScope("respool")
+	respoolSuccessScope := respoolScope.Tagged(
+		map[string]string{"result": "success"})
+	respoolFailedScope := respoolScope.Tagged(
+		map[string]string{"result": "fail"})
+
 	secretInfoScope := ormScope.SubScope("secret_info")
 	secretInfoSuccessScope := secretInfoScope.Tagged(
 		map[string]string{"result": "success"})
 	secretInfoFailScope := secretInfoScope.Tagged(
+		map[string]string{"result": "fail"})
+
+	jobUpdateEventsScope := ormScope.SubScope("job_update_events")
+	jobUpdateEventsSuccessScope := jobUpdateEventsScope.Tagged(
+		map[string]string{"result": "success"})
+	jobUpdateEventsFailScope := jobUpdateEventsScope.Tagged(
 		map[string]string{"result": "fail"})
 
 	ormJobMetrics := &OrmJobMetrics{
@@ -581,6 +643,8 @@ func NewMetrics(scope tally.Scope) *Metrics {
 		JobIndexCreateFail: jobIndexFailScope.Counter("create"),
 		JobIndexGet:        jobIndexSuccessScope.Counter("get"),
 		JobIndexGetFail:    jobIndexFailScope.Counter("get"),
+		JobIndexGetAll:     jobIndexSuccessScope.Counter("geAll"),
+		JobIndexGetAllFail: jobIndexFailScope.Counter("getAll"),
 		JobIndexUpdate:     jobIndexSuccessScope.Counter("update"),
 		JobIndexUpdateFail: jobIndexFailScope.Counter("update"),
 		JobIndexDelete:     jobIndexSuccessScope.Counter("delete"),
@@ -598,6 +662,14 @@ func NewMetrics(scope tally.Scope) *Metrics {
 		JobConfigDelete:     jobConfigSuccessScope.Counter("delete"),
 		JobConfigDeleteFail: jobConfigFailScope.Counter("delete"),
 
+		ActiveJobsCreate:         activeJobsSuccessScope.Counter("create"),
+		ActiveJobsCreateFail:     activeJobsFailScope.Counter("create"),
+		ActiveJobsGetAll:         activeJobsSuccessScope.Counter("getAll"),
+		ActiveJobsGetAllFail:     activeJobsFailScope.Counter("getAll"),
+		ActiveJobsGetAllDuration: activeJobsSuccessScope.Timer("get_active_jobs_duration"),
+		ActiveJobsDelete:         activeJobsSuccessScope.Counter("delete"),
+		ActiveJobsDeleteFail:     activeJobsFailScope.Counter("delete"),
+
 		SecretInfoCreate:     secretInfoSuccessScope.Counter("create"),
 		SecretInfoCreateFail: secretInfoFailScope.Counter("create"),
 		SecretInfoGet:        secretInfoSuccessScope.Counter("get"),
@@ -608,24 +680,71 @@ func NewMetrics(scope tally.Scope) *Metrics {
 		SecretInfoDeleteFail: secretInfoFailScope.Counter("delete"),
 	}
 
+	ormRespoolMetrics := &OrmRespoolMetrics{
+		RespoolCreate:     respoolSuccessScope.Counter("create"),
+		RespoolCreateFail: respoolFailedScope.Counter("create"),
+		RespoolGet:        respoolSuccessScope.Counter("get"),
+		RespoolGetFail:    respoolFailedScope.Counter("get"),
+		RespoolGetAll:     respoolSuccessScope.Counter("getAll"),
+		RespoolGetAllFail: respoolFailedScope.Counter("getAll"),
+		RespoolUpdate:     respoolSuccessScope.Counter("update"),
+		RespoolUpdateFail: respoolFailedScope.Counter("update"),
+		RespoolDelete:     respoolSuccessScope.Counter("delete"),
+		RespoolDeleteFail: respoolFailedScope.Counter("delete"),
+	}
+
 	ormTaskMetrics := &OrmTaskMetrics{
 		PodEventsAdd:     podEventsSuccessScope.Counter("add"),
 		PodEventsAddFail: podEventsFailScope.Counter("add"),
 		PodEventsGet:     podEventsSuccessScope.Counter("get"),
 		PodEventsGetFail: podEventsFailScope.Counter("get"),
+
+		TaskConfigV2Create:     taskConfigV2SuccessScope.Counter("create"),
+		TaskConfigV2CreateFail: taskConfigV2FailScope.Counter("create"),
+
+		TaskConfigV2Get:     taskConfigV2SuccessScope.Counter("get"),
+		TaskConfigV2GetFail: taskConfigV2FailScope.Counter("get"),
+
+		PodSpecGet:     podSpecSuccessScope.Counter("get"),
+		PodSpecGetFail: podSpecFailScope.Counter("get"),
+	}
+
+	ormHostInfoMetrics := &OrmHostInfoMetrics{
+		HostInfoAdd:        hostInfoSuccessScope.Counter("add"),
+		HostInfoAddFail:    hostInfoFailScope.Counter("add"),
+		HostInfoGet:        hostInfoSuccessScope.Counter("get"),
+		HostInfoGetFail:    hostInfoFailScope.Counter("get"),
+		HostInfoGetAll:     hostInfoSuccessScope.Counter("get_all"),
+		HostInfoGetAllFail: hostInfoFailScope.Counter("get_all"),
+		HostInfoUpdate:     hostInfoSuccessScope.Counter("update"),
+		HostInfoUpdateFail: hostInfoFailScope.Counter("update"),
+		HostInfoDelete:     hostInfoSuccessScope.Counter("delete"),
+		HostInfoDeleteFail: hostInfoFailScope.Counter("delete"),
+	}
+
+	ormJobUpdateEventsMetrics := &OrmJobUpdateEventsMetrics{
+		JobUpdateEventsCreate:     jobUpdateEventsSuccessScope.Counter("create"),
+		JobUpdateEventsCreateFail: jobUpdateEventsFailScope.Counter("create"),
+		JobUpdateEventsGet:        jobUpdateEventsSuccessScope.Counter("get"),
+		JobUpdateEventsGetFail:    jobUpdateEventsFailScope.Counter("get"),
+		JobUpdateEventsDelete:     jobUpdateEventsSuccessScope.Counter("delete"),
+		JobUpdateEventsDeleteFail: jobUpdateEventsFailScope.Counter("delete"),
 	}
 
 	metrics := &Metrics{
-		JobMetrics:            jobMetrics,
-		TaskMetrics:           taskMetrics,
-		UpdateMetrics:         updateMetrics,
-		ResourcePoolMetrics:   resourcePoolMetrics,
-		FrameworkStoreMetrics: frameworkStoreMetrics,
-		VolumeMetrics:         volumeMetrics,
-		ErrorMetrics:          errorMetrics,
-		WorkflowMetrics:       workflowMetrics,
-		OrmJobMetrics:         ormJobMetrics,
-		OrmTaskMetrics:        ormTaskMetrics,
+		JobMetrics:                jobMetrics,
+		TaskMetrics:               taskMetrics,
+		UpdateMetrics:             updateMetrics,
+		ResourcePoolMetrics:       resourcePoolMetrics,
+		FrameworkStoreMetrics:     frameworkStoreMetrics,
+		VolumeMetrics:             volumeMetrics,
+		ErrorMetrics:              errorMetrics,
+		WorkflowMetrics:           workflowMetrics,
+		OrmJobMetrics:             ormJobMetrics,
+		OrmRespoolMetrics:         ormRespoolMetrics,
+		OrmTaskMetrics:            ormTaskMetrics,
+		OrmJobUpdateEventsMetrics: ormJobUpdateEventsMetrics,
+		OrmHostInfoMetrics:        ormHostInfoMetrics,
 	}
 
 	return metrics

@@ -20,19 +20,18 @@ import (
 	"testing"
 	"time"
 
-	"github.com/uber/peloton/.gen/mesos/v1"
+	mesos_v1 "github.com/uber/peloton/.gen/mesos/v1"
 	pb_job "github.com/uber/peloton/.gen/peloton/api/v0/job"
 	"github.com/uber/peloton/.gen/peloton/api/v0/peloton"
 	pb_task "github.com/uber/peloton/.gen/peloton/api/v0/task"
-	"github.com/uber/peloton/.gen/peloton/private/hostmgr/hostsvc"
-	hostmocks "github.com/uber/peloton/.gen/peloton/private/hostmgr/hostsvc/mocks"
 	"github.com/uber/peloton/.gen/peloton/private/models"
 	"github.com/uber/peloton/.gen/peloton/private/resmgrsvc"
 	res_mocks "github.com/uber/peloton/.gen/peloton/private/resmgrsvc/mocks"
-
 	goalstatemocks "github.com/uber/peloton/pkg/common/goalstate/mocks"
 	cachedmocks "github.com/uber/peloton/pkg/jobmgr/cached/mocks"
+	lmmocks "github.com/uber/peloton/pkg/jobmgr/task/lifecyclemgr/mocks"
 	store_mocks "github.com/uber/peloton/pkg/storage/mocks"
+	objectmocks "github.com/uber/peloton/pkg/storage/objects/mocks"
 
 	jobmgrcommon "github.com/uber/peloton/pkg/jobmgr/common"
 
@@ -52,7 +51,8 @@ type TestTaskLaunchRetrySuite struct {
 	jobFactory          *cachedmocks.MockJobFactory
 	cachedJob           *cachedmocks.MockJob
 	cachedTask          *cachedmocks.MockTask
-	mockHostMgr         *hostmocks.MockInternalHostServiceYARPCClient
+	taskConfigV2Ops     *objectmocks.MockTaskConfigV2Ops
+	lm                  *lmmocks.MockManager
 	jobConfig           *cachedmocks.MockJobConfigCache
 	goalStateDriver     *driver
 	resmgrClient        *res_mocks.MockResourceManagerServiceYARPCClient
@@ -73,18 +73,20 @@ func (suite *TestTaskLaunchRetrySuite) SetupTest() {
 	suite.cachedTask = cachedmocks.NewMockTask(suite.mockCtrl)
 	suite.resmgrClient = res_mocks.NewMockResourceManagerServiceYARPCClient(suite.mockCtrl)
 	suite.jobConfig = cachedmocks.NewMockJobConfigCache(suite.mockCtrl)
-	suite.mockHostMgr = hostmocks.NewMockInternalHostServiceYARPCClient(suite.mockCtrl)
+	suite.lm = lmmocks.NewMockManager(suite.mockCtrl)
+	suite.taskConfigV2Ops = objectmocks.NewMockTaskConfigV2Ops(suite.mockCtrl)
 
 	suite.goalStateDriver = &driver{
-		jobEngine:     suite.jobGoalStateEngine,
-		taskEngine:    suite.taskGoalStateEngine,
-		jobStore:      suite.jobStore,
-		taskStore:     suite.taskStore,
-		jobFactory:    suite.jobFactory,
-		hostmgrClient: suite.mockHostMgr,
-		resmgrClient:  suite.resmgrClient,
-		mtx:           NewMetrics(tally.NoopScope),
-		cfg:           &Config{},
+		jobEngine:       suite.jobGoalStateEngine,
+		taskEngine:      suite.taskGoalStateEngine,
+		jobStore:        suite.jobStore,
+		taskStore:       suite.taskStore,
+		taskConfigV2Ops: suite.taskConfigV2Ops,
+		jobFactory:      suite.jobFactory,
+		lm:              suite.lm,
+		resmgrClient:    suite.resmgrClient,
+		mtx:             NewMetrics(tally.NoopScope),
+		cfg:             &Config{},
 	}
 	suite.goalStateDriver.cfg.normalize()
 	suite.jobID = &peloton.JobID{Value: uuid.NewRandom().String()}
@@ -131,14 +133,16 @@ func (suite *TestTaskLaunchRetrySuite) TestTaskLaunchTimeout() {
 
 		suite.jobConfig.EXPECT().GetType().Return(pb_job.JobType_BATCH)
 
-		suite.cachedJob.EXPECT().PatchTasks(gomock.Any(), gomock.Any()).Do(
-			func(_ context.Context, runtimeDiffs map[uint32]jobmgrcommon.RuntimeDiff) {
+		suite.cachedJob.EXPECT().PatchTasks(gomock.Any(), gomock.Any(), false).Do(
+			func(_ context.Context,
+				runtimeDiffs map[uint32]jobmgrcommon.RuntimeDiff,
+				_ bool) {
 				for _, runtimeDiff := range runtimeDiffs {
 					suite.Equal(oldMesosTaskID, runtimeDiff[jobmgrcommon.PrevMesosTaskIDField])
 					suite.NotEqual(oldMesosTaskID, runtimeDiff[jobmgrcommon.MesosTaskIDField])
 					suite.Equal(pb_task.TaskState_INITIALIZED, runtimeDiff[jobmgrcommon.StateField])
 				}
-			}).Return(nil)
+			}).Return(nil, nil, nil)
 
 		suite.cachedJob.EXPECT().
 			GetJobType().Return(pb_job.JobType_BATCH)
@@ -153,17 +157,20 @@ func (suite *TestTaskLaunchRetrySuite) TestTaskLaunchTimeout() {
 
 		if i == 0 {
 			// test happy case
-			suite.taskStore.EXPECT().GetTaskConfig(
+			suite.taskConfigV2Ops.EXPECT().GetTaskConfig(
 				gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(config, &models.ConfigAddOn{}, nil).AnyTimes()
-			suite.mockHostMgr.EXPECT().KillTasks(gomock.Any(), &hostsvc.KillTasksRequest{
-				TaskIds: []*mesos_v1.TaskID{oldMesosTaskID},
-			}).AnyTimes()
+			suite.lm.EXPECT().Kill(
+				gomock.Any(),
+				oldMesosTaskID.GetValue(),
+				"",
+				nil,
+			).Return(nil).AnyTimes()
 		} else {
 			// test skip task kill
-			suite.taskStore.EXPECT().
+			suite.taskConfigV2Ops.EXPECT().
 				GetTaskConfig(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
 				Return(nil, nil, errors.New(""))
-			suite.mockHostMgr.EXPECT()
+			suite.lm.EXPECT()
 		}
 		suite.NoError(TaskLaunchRetry(context.Background(), suite.getTaskEntity(suite.jobID, suite.instanceID)))
 	}
@@ -245,7 +252,7 @@ func (suite *TestTaskLaunchRetrySuite) TestTaskStartTimeoutForBatchJob() {
 	suite.cachedJob.EXPECT().
 		GetTask(suite.instanceID).Return(suite.cachedTask)
 
-	suite.taskStore.EXPECT().GetTaskConfig(
+	suite.taskConfigV2Ops.EXPECT().GetTaskConfig(
 		gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(config, &models.ConfigAddOn{}, nil).Times(2)
 
 	suite.jobFactory.EXPECT().
@@ -268,14 +275,16 @@ func (suite *TestTaskLaunchRetrySuite) TestTaskStartTimeoutForBatchJob() {
 
 	suite.jobConfig.EXPECT().GetType().Return(pb_job.JobType_BATCH)
 
-	suite.cachedJob.EXPECT().PatchTasks(gomock.Any(), gomock.Any()).Do(
-		func(_ context.Context, runtimeDiffs map[uint32]jobmgrcommon.RuntimeDiff) {
+	suite.cachedJob.EXPECT().PatchTasks(gomock.Any(), gomock.Any(), false).Do(
+		func(_ context.Context,
+			runtimeDiffs map[uint32]jobmgrcommon.RuntimeDiff,
+			_ bool) {
 			for _, runtimeDiff := range runtimeDiffs {
 				suite.Equal(oldMesosTaskID, runtimeDiff[jobmgrcommon.PrevMesosTaskIDField])
 				suite.NotEqual(oldMesosTaskID, runtimeDiff[jobmgrcommon.MesosTaskIDField])
 				suite.Equal(pb_task.TaskState_INITIALIZED, runtimeDiff[jobmgrcommon.StateField])
 			}
-		}).Return(nil)
+		}).Return(nil, nil, nil)
 
 	suite.cachedJob.EXPECT().
 		GetJobType().Return(pb_job.JobType_BATCH)
@@ -288,9 +297,12 @@ func (suite *TestTaskLaunchRetrySuite) TestTaskStartTimeoutForBatchJob() {
 		Enqueue(gomock.Any(), gomock.Any()).
 		Return()
 
-	suite.mockHostMgr.EXPECT().KillTasks(gomock.Any(), &hostsvc.KillTasksRequest{
-		TaskIds: []*mesos_v1.TaskID{oldMesosTaskID},
-	})
+	suite.lm.EXPECT().Kill(
+		gomock.Any(),
+		oldMesosTaskID.GetValue(),
+		"",
+		nil,
+	).Return(nil).AnyTimes()
 
 	suite.NoError(TaskLaunchRetry(
 		context.Background(),
@@ -318,7 +330,7 @@ func (suite *TestTaskLaunchRetrySuite) TestTaskStartTimeoutForServiceJob() {
 	suite.cachedJob.EXPECT().
 		GetTask(suite.instanceID).Return(suite.cachedTask)
 
-	suite.taskStore.EXPECT().GetTaskConfig(
+	suite.taskConfigV2Ops.EXPECT().GetTaskConfig(
 		gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(config, &models.ConfigAddOn{}, nil).Times(2)
 
 	suite.jobFactory.EXPECT().

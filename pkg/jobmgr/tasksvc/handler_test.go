@@ -82,6 +82,7 @@ type TaskHandlerTestSuite struct {
 	mockedTaskStore          *storemocks.MockTaskStore
 	mockedUpdateStore        *storemocks.MockUpdateStore
 	mockedFrameworkInfoStore *storemocks.MockFrameworkInfoStore
+	mockedPodEventsOps       *objectmocks.MockPodEventsOps
 	mockedLogManager         *logmanagermocks.MockLogManager
 	mockedHostMgr            *hostmocks.MockInternalHostServiceYARPCClient
 	mockedTask               *cachedmocks.MockTask
@@ -129,10 +130,12 @@ func (suite *TaskHandlerTestSuite) SetupTest() {
 	suite.mockedHostMgr = hostmocks.NewMockInternalHostServiceYARPCClient(suite.ctrl)
 	suite.mockedTask = cachedmocks.NewMockTask(suite.ctrl)
 	suite.mockedActiveRMTasks = activermtaskmocks.NewMockActiveRMTasks(suite.ctrl)
+	suite.mockedPodEventsOps = objectmocks.NewMockPodEventsOps(suite.ctrl)
 
 	suite.handler.jobConfigOps = suite.jobConfigOps
 	suite.handler.taskStore = suite.mockedTaskStore
 	suite.handler.updateStore = suite.mockedUpdateStore
+	suite.handler.podEventsOps = suite.mockedPodEventsOps
 	suite.handler.jobFactory = suite.mockedJobFactory
 	suite.handler.goalStateDriver = suite.mockedGoalStateDrive
 	suite.handler.resmgrClient = suite.mockedResmgrClient
@@ -217,8 +220,8 @@ func (suite *TaskHandlerTestSuite) TestGetTasks_Batch_Job() {
 		suite.mockedTaskStore.EXPECT().
 			GetTaskForJob(gomock.Any(), suite.testJobID.GetValue(), instanceID).
 			Return(taskInfoMap, nil),
-		suite.mockedTaskStore.EXPECT().
-			GetPodEvents(gomock.Any(), suite.testJobID.GetValue(), instanceID, "").
+		suite.mockedPodEventsOps.EXPECT().
+			GetAll(gomock.Any(), suite.testJobID.GetValue(), instanceID, "").
 			Return(events, nil),
 	)
 
@@ -268,8 +271,8 @@ func (suite *TaskHandlerTestSuite) TestGetTasks_Service_Job() {
 		suite.mockedTaskStore.EXPECT().
 			GetTaskForJob(gomock.Any(), suite.testJobID.GetValue(), instanceID).
 			Return(taskInfoMap, nil),
-		suite.mockedTaskStore.EXPECT().
-			GetPodEvents(gomock.Any(), suite.testJobID.GetValue(), instanceID, "").
+		suite.mockedPodEventsOps.EXPECT().
+			GetAll(gomock.Any(), suite.testJobID.GetValue(), instanceID, "").
 			Return(events, nil),
 	)
 
@@ -408,7 +411,7 @@ func (suite *TaskHandlerTestSuite) TestStopTasksWithRanges() {
 		suite.mockedTaskStore.EXPECT().
 			GetTasksForJobByRange(gomock.Any(), suite.testJobID, taskRanges[0]).Return(singleTaskInfo, nil),
 		suite.mockedCachedJob.EXPECT().
-			PatchTasks(gomock.Any(), runtimeDiffs).Return(nil),
+			PatchTasks(gomock.Any(), runtimeDiffs, false).Return(nil, nil, nil),
 		suite.mockedGoalStateDrive.EXPECT().
 			EnqueueTask(suite.testJobID, uint32(1), gomock.Any()).Return(),
 		suite.mockedCachedJob.EXPECT().GetJobType().Return(job.JobType_BATCH),
@@ -449,11 +452,14 @@ func (suite *TaskHandlerTestSuite) TestStopTasksSkipKillNotRunningTask() {
 		suite.mockedJobFactory.EXPECT().
 			AddJob(suite.testJobID).Return(suite.mockedCachedJob),
 		suite.mockedCachedJob.EXPECT().
-			GetConfig(gomock.Any()).Return(cachedtest.NewMockJobConfig(suite.ctrl, suite.testJobConfig), nil),
+			GetConfig(gomock.Any()).
+			Return(cachedtest.NewMockJobConfig(suite.ctrl, suite.testJobConfig), nil),
 		suite.mockedTaskStore.EXPECT().
-			GetTasksForJobByRange(gomock.Any(), suite.testJobID, taskRanges[0]).Return(taskInfos, nil),
+			GetTasksForJobByRange(gomock.Any(), suite.testJobID, taskRanges[0]).
+			Return(taskInfos, nil),
 		suite.mockedCachedJob.EXPECT().
-			PatchTasks(gomock.Any(), gomock.Any()).Return(nil),
+			PatchTasks(gomock.Any(), gomock.Any(), false).
+			Return(nil, nil, nil),
 	)
 
 	suite.mockedGoalStateDrive.EXPECT().
@@ -620,9 +626,11 @@ func (suite *TaskHandlerTestSuite) TestStopTasks_PatchFailure() {
 			GetConfig(gomock.Any()).
 			Return(cachedtest.NewMockJobConfig(suite.ctrl, suite.testJobConfig), nil),
 		suite.mockedTaskStore.EXPECT().
-			GetTasksForJobByRange(gomock.Any(), suite.testJobID, taskRanges[0]).Return(singleTaskInfo, nil),
+			GetTasksForJobByRange(gomock.Any(), suite.testJobID, taskRanges[0]).
+			Return(singleTaskInfo, nil),
 		suite.mockedCachedJob.EXPECT().
-			PatchTasks(gomock.Any(), gomock.Any()).Return(errors.New("test error")),
+			PatchTasks(gomock.Any(), gomock.Any(), false).
+			Return(nil, nil, errors.New("test error")),
 		suite.mockedCachedJob.EXPECT().GetJobType().Return(job.JobType_BATCH),
 		suite.mockedGoalStateDrive.EXPECT().
 			JobRuntimeDuration(job.JobType_BATCH).
@@ -692,9 +700,9 @@ func (suite *TaskHandlerTestSuite) TestStartAllTasks() {
 			GetRuntime(gomock.Any()).
 			Return(taskInfos[i].Runtime, nil)
 		if i != runningInstanceID {
-			suite.mockedCachedTask.EXPECT().
-				CompareAndSetTask(gomock.Any(), gomock.Any(), gomock.Any()).
-				Do(func(_ context.Context, runtime *task.RuntimeInfo, _ job.JobType) {
+			suite.mockedCachedJob.EXPECT().
+				CompareAndSetTask(gomock.Any(), gomock.Any(), gomock.Any(), false).
+				Do(func(_ context.Context, _ uint32, runtime *task.RuntimeInfo, _ bool) {
 					suite.Equal(runtime.State, task.TaskState_INITIALIZED)
 					suite.Equal(runtime.Healthy, task.HealthState_DISABLED)
 					suite.Equal(runtime.GoalState, task.TaskState_SUCCEEDED)
@@ -1067,8 +1075,8 @@ func (suite *TaskHandlerTestSuite) TestStartTasksCompareAndSetFailure() {
 					GoalState: task.TaskState_KILLED,
 				}, nil)
 
-			suite.mockedCachedTask.EXPECT().
-				CompareAndSetTask(gomock.Any(), gomock.Any(), gomock.Any()).
+			suite.mockedCachedJob.EXPECT().
+				CompareAndSetTask(gomock.Any(), gomock.Any(), gomock.Any(), false).
 				Return(nil, jobmgrcommon.UnexpectedVersionError)
 		}
 	}
@@ -1140,9 +1148,9 @@ func (suite *TaskHandlerTestSuite) TestStartTasksWithRanges() {
 	suite.mockedCachedTask.EXPECT().
 		GetRuntime(gomock.Any()).
 		Return(singleTaskInfo[1].Runtime, nil)
-	suite.mockedCachedTask.EXPECT().
-		CompareAndSetTask(gomock.Any(), gomock.Any(), gomock.Any()).
-		Do(func(_ context.Context, runtime *task.RuntimeInfo, _ job.JobType) {
+	suite.mockedCachedJob.EXPECT().
+		CompareAndSetTask(gomock.Any(), gomock.Any(), gomock.Any(), false).
+		Do(func(_ context.Context, _ uint32, runtime *task.RuntimeInfo, _ bool) {
 			suite.Equal(runtime.State, task.TaskState_INITIALIZED)
 			suite.Equal(runtime.Healthy, task.HealthState_DISABLED)
 			suite.Equal(runtime.GoalState, task.TaskState_SUCCEEDED)
@@ -1263,8 +1271,8 @@ func (suite *TaskHandlerTestSuite) TestGetPodEventsWithRunID() {
 			},
 		},
 	}
-	suite.mockedTaskStore.EXPECT().
-		GetPodEvents(gomock.Any(), testJob, uint32(testInstanceCount), testRunID).
+	suite.mockedPodEventsOps.EXPECT().
+		GetAll(gomock.Any(), testJob, uint32(testInstanceCount), testRunID).
 		Return(events, nil)
 	response, err := suite.handler.GetPodEvents(context.Background(), request)
 	suite.NoError(err)
@@ -1323,8 +1331,8 @@ func (suite *TaskHandlerTestSuite) TestGetPodEventsForAllRuns() {
 	}
 
 	for _, t := range tt {
-		suite.mockedTaskStore.EXPECT().
-			GetPodEvents(gomock.Any(), testJob, uint32(testInstanceCount), t.RunID).
+		suite.mockedPodEventsOps.EXPECT().
+			GetAll(gomock.Any(), testJob, uint32(testInstanceCount), t.RunID).
 			Return(t.Events, nil)
 	}
 	response, err := suite.handler.GetPodEvents(context.Background(), request)
@@ -1401,8 +1409,8 @@ func (suite *TaskHandlerTestSuite) TestGetPodEventsFiveRunsLimitToThree() {
 	}
 
 	for _, t := range tt {
-		suite.mockedTaskStore.EXPECT().
-			GetPodEvents(gomock.Any(), testJob, uint32(testInstanceCount), t.RunID).
+		suite.mockedPodEventsOps.EXPECT().
+			GetAll(gomock.Any(), testJob, uint32(testInstanceCount), t.RunID).
 			Return(t.Events, nil)
 	}
 	response, err := suite.handler.GetPodEvents(context.Background(), request)
@@ -1480,8 +1488,8 @@ func (suite *TaskHandlerTestSuite) TestGetPodEventsThreeRunsLimitToFive() {
 	}
 
 	for _, t := range tt {
-		suite.mockedTaskStore.EXPECT().
-			GetPodEvents(gomock.Any(), testJob, uint32(testInstanceCount), t.RunID).
+		suite.mockedPodEventsOps.EXPECT().
+			GetAll(gomock.Any(), testJob, uint32(testInstanceCount), t.RunID).
 			Return(t.Events, nil)
 	}
 	response, err := suite.handler.GetPodEvents(context.Background(), request)
@@ -1499,8 +1507,8 @@ func (suite *TaskHandlerTestSuite) TestGetPodEventsStoreError() {
 		RunId:      testRunID,
 	}
 
-	suite.mockedTaskStore.EXPECT().
-		GetPodEvents(gomock.Any(), testJob, uint32(testInstanceCount), testRunID).
+	suite.mockedPodEventsOps.EXPECT().
+		GetAll(gomock.Any(), testJob, uint32(testInstanceCount), testRunID).
 		Return(nil, fmt.Errorf("fake GetPodEvents error"))
 	_, err := suite.handler.GetPodEvents(context.Background(), request)
 	suite.Error(err)
@@ -1525,8 +1533,8 @@ func (suite *TaskHandlerTestSuite) TestGetPodEventsJobVersionParseError() {
 			},
 		},
 	}
-	suite.mockedTaskStore.EXPECT().
-		GetPodEvents(gomock.Any(), testJob, uint32(testInstanceCount), testRunID).
+	suite.mockedPodEventsOps.EXPECT().
+		GetAll(gomock.Any(), testJob, uint32(testInstanceCount), testRunID).
 		Return(events, nil)
 	_, err := suite.handler.GetPodEvents(context.Background(), request)
 	suite.Error(err)
@@ -1552,8 +1560,8 @@ func (suite *TaskHandlerTestSuite) TestGetPodEventsDesiredJobVersionParseError()
 			ConfigVersion: 1,
 		},
 	}
-	suite.mockedTaskStore.EXPECT().
-		GetPodEvents(gomock.Any(), testJob, uint32(testInstanceCount), testRunID).
+	suite.mockedPodEventsOps.EXPECT().
+		GetAll(gomock.Any(), testJob, uint32(testInstanceCount), testRunID).
 		Return(events, nil)
 	_, err := suite.handler.GetPodEvents(context.Background(), request)
 	suite.Error(err)
@@ -1585,8 +1593,8 @@ func (suite *TaskHandlerTestSuite) TestGetPodEventsPrevPodIDParseError() {
 		},
 	}
 
-	suite.mockedTaskStore.EXPECT().
-		GetPodEvents(gomock.Any(), testJob, uint32(testInstanceCount), testRunID).
+	suite.mockedPodEventsOps.EXPECT().
+		GetAll(gomock.Any(), testJob, uint32(testInstanceCount), testRunID).
 		Return(events, nil)
 	response, err := suite.handler.GetPodEvents(context.Background(), request)
 	suite.Error(err)
@@ -1603,8 +1611,8 @@ func (suite *TaskHandlerTestSuite) TestGetPodEventsNoEvents() {
 		RunId:      testRunID,
 	}
 
-	suite.mockedTaskStore.EXPECT().
-		GetPodEvents(gomock.Any(), testJob, uint32(testInstanceCount), testRunID).
+	suite.mockedPodEventsOps.EXPECT().
+		GetAll(gomock.Any(), testJob, uint32(testInstanceCount), testRunID).
 		Return([]*task.PodEvent{}, nil)
 	_, err := suite.handler.GetPodEvents(context.Background(), request)
 	suite.NoError(err)
@@ -1634,8 +1642,9 @@ func (suite *TaskHandlerTestSuite) TestBrowseSandboxPreviousTaskRun() {
 			GetJob(suite.testJobID).Return(suite.mockedCachedJob),
 		suite.mockedCachedJob.EXPECT().
 			GetConfig(gomock.Any()).Return(cachedtest.NewMockJobConfig(suite.ctrl, suite.testJobConfig), nil),
-		suite.mockedTaskStore.EXPECT().
-			GetPodEvents(gomock.Any(), suite.testJobID.GetValue(), uint32(0), testTaskID).
+		suite.mockedPodEventsOps.EXPECT().
+			GetAll(gomock.Any(), suite.testJobID.GetValue(), uint32(0),
+				testTaskID).
 			Return(events, nil),
 	)
 
@@ -1741,8 +1750,9 @@ func (suite *TaskHandlerTestSuite) TestBrowseSandboxListSandboxFileFailure() {
 			Return(
 				cachedtest.NewMockJobConfig(suite.ctrl, suite.testJobConfig),
 				nil),
-		suite.mockedTaskStore.EXPECT().
-			GetPodEvents(gomock.Any(), suite.testJobID.GetValue(), instanceID, testTaskID).
+		suite.mockedPodEventsOps.EXPECT().
+			GetAll(gomock.Any(), suite.testJobID.GetValue(), instanceID,
+				testTaskID).
 			Return(events, nil),
 		suite.mockedFrameworkInfoStore.EXPECT().
 			GetFrameworkID(gomock.Any(), _frameworkName).
@@ -1804,8 +1814,9 @@ func (suite *TaskHandlerTestSuite) TestBrowseSandboxGetMesosMasterInfoFailure() 
 			Return(
 				cachedtest.NewMockJobConfig(suite.ctrl, suite.testJobConfig),
 				nil),
-		suite.mockedTaskStore.EXPECT().
-			GetPodEvents(gomock.Any(), suite.testJobID.GetValue(), instanceID, testTaskID).
+		suite.mockedPodEventsOps.EXPECT().
+			GetAll(gomock.Any(), suite.testJobID.GetValue(), instanceID,
+				testTaskID).
 			Return(events, nil),
 		suite.mockedFrameworkInfoStore.EXPECT().
 			GetFrameworkID(gomock.Any(), _frameworkName).
@@ -1880,8 +1891,9 @@ func (suite *TaskHandlerTestSuite) TestBrowseSandboxListFilesSuccess() {
 			Return(
 				cachedtest.NewMockJobConfig(suite.ctrl, suite.testJobConfig),
 				nil),
-		suite.mockedTaskStore.EXPECT().
-			GetPodEvents(gomock.Any(), suite.testJobID.GetValue(), instanceID, testTaskID).
+		suite.mockedPodEventsOps.EXPECT().
+			GetAll(gomock.Any(), suite.testJobID.GetValue(), instanceID,
+				testTaskID).
 			Return(events, nil),
 		suite.mockedFrameworkInfoStore.EXPECT().
 			GetFrameworkID(gomock.Any(), _frameworkName).
@@ -1974,8 +1986,9 @@ func (suite *TaskHandlerTestSuite) TestBrowseSandboxListFilesSuccessAgentIP() {
 			Return(
 				cachedtest.NewMockJobConfig(suite.ctrl, suite.testJobConfig),
 				nil),
-		suite.mockedTaskStore.EXPECT().
-			GetPodEvents(gomock.Any(), suite.testJobID.GetValue(), instanceID, testTaskID).
+		suite.mockedPodEventsOps.EXPECT().
+			GetAll(gomock.Any(), suite.testJobID.GetValue(), instanceID,
+				testTaskID).
 			Return(events, nil),
 		suite.mockedFrameworkInfoStore.EXPECT().
 			GetFrameworkID(gomock.Any(), _frameworkName).
@@ -2386,8 +2399,12 @@ func (suite *TaskHandlerTestSuite) TestRestartAllTasks() {
 		suite.mockedCachedJob.EXPECT().
 			ID().Return(suite.testJobID).Times(len(taskInfos)),
 		suite.mockedCachedJob.EXPECT().
-			PatchTasks(gomock.Any(), gomock.Any()).
-			Do(func(ctx context.Context, runtimeDiffs map[uint32]jobmgrcommon.RuntimeDiff) {
+			PatchTasks(gomock.Any(), gomock.Any(), false).
+			Do(func(
+				ctx context.Context,
+				runtimeDiffs map[uint32]jobmgrcommon.RuntimeDiff,
+				_ bool,
+			) {
 				for instanceID, runtimeDiff := range runtimeDiffs {
 					mesosTaskID := runtimeDiff[jobmgrcommon.DesiredMesosTaskIDField].(*mesos.TaskID)
 					runID, err := util.ParseRunID(mesosTaskID.GetValue())
@@ -2399,8 +2416,7 @@ func (suite *TaskHandlerTestSuite) TestRestartAllTasks() {
 
 					suite.Equal(prevRunID+1, runID)
 				}
-			}).
-			Return(nil),
+			}).Return(nil, nil, nil),
 		suite.mockedGoalStateDrive.EXPECT().
 			EnqueueTask(suite.testJobID, gomock.Any(), gomock.Any()).Return().AnyTimes(),
 	)

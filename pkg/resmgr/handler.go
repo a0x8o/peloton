@@ -38,7 +38,7 @@ import (
 	"github.com/uber/peloton/pkg/resmgr/respool"
 	rmtask "github.com/uber/peloton/pkg/resmgr/task"
 
-	"github.com/hashicorp/go-multierror"
+	multierror "github.com/hashicorp/go-multierror"
 	"github.com/pkg/errors"
 	log "github.com/sirupsen/logrus"
 	"github.com/uber-go/tally"
@@ -503,6 +503,7 @@ func (h *ServiceHandler) SetPlacements(
 			},
 			t.TaskState_PLACED,
 			_reasonPlacementReceived)
+
 		h.rmTracker.SetPlacement(newPlacement)
 
 		err := h.placements.Enqueue(newPlacement)
@@ -600,31 +601,23 @@ func (h *ServiceHandler) GetTasksByHosts(ctx context.Context,
 
 func (h *ServiceHandler) removeTasksFromPlacements(
 	placement *resmgr.Placement,
-	tasks map[string]*peloton.TaskID,
+	taskSet map[string]struct{},
 ) *resmgr.Placement {
-	if len(tasks) == 0 {
+	if len(taskSet) == 0 {
 		return placement
 	}
-	var newTasks []*peloton.TaskID
 	var newTaskIDs []*resmgr.Placement_Task
 
 	log.WithFields(log.Fields{
-		"tasks_to_remove": tasks,
+		"tasks_to_remove": taskSet,
 		"orig_tasks":      placement.GetTaskIDs(),
 	}).Debug("Removing Tasks")
 
-	for _, pt := range placement.GetTasks() {
-		if _, ok := tasks[pt.GetValue()]; !ok {
-			newTasks = append(newTasks, pt)
-		}
-	}
-
 	for _, pt := range placement.GetTaskIDs() {
-		if _, ok := tasks[pt.GetPelotonTaskID().GetValue()]; !ok {
+		if _, ok := taskSet[pt.GetMesosTaskID().GetValue()]; !ok {
 			newTaskIDs = append(newTaskIDs, pt)
 		}
 	}
-	placement.Tasks = newTasks
 	placement.TaskIDs = newTaskIDs
 	return placement
 }
@@ -676,11 +669,12 @@ func (h *ServiceHandler) transitTasksInPlacement(
 	expectedStates []t.TaskState,
 	newState t.TaskState,
 	reason string) *resmgr.Placement {
-	invalidTasks := make(map[string]*peloton.TaskID)
+	invalidTaskSet := make(map[string]struct{})
 	for _, task := range placement.GetTaskIDs() {
 		rmTask := h.rmTracker.GetTask(task.GetPelotonTaskID())
-		if rmTask == nil {
-			invalidTasks[task.GetPelotonTaskID().GetValue()] = task.GetPelotonTaskID()
+		if rmTask == nil ||
+			task.GetMesosTaskID().GetValue() != rmTask.Task().GetTaskId().GetValue() {
+			invalidTaskSet[task.GetMesosTaskID().GetValue()] = struct{}{}
 			continue
 		}
 		state := rmTask.GetCurrentState().State
@@ -692,7 +686,7 @@ func (h *ServiceHandler) transitTasksInPlacement(
 				"new_state":      newState.String(),
 			}).Error("Failed to transit tasks in placement: " +
 				"task is not in expected state")
-			invalidTasks[task.GetPelotonTaskID().GetValue()] = task.GetPelotonTaskID()
+			invalidTaskSet[task.GetMesosTaskID().GetValue()] = struct{}{}
 		} else {
 			err := rmTask.TransitTo(
 				newState.String(),
@@ -702,11 +696,11 @@ func (h *ServiceHandler) transitTasksInPlacement(
 				log.WithError(err).
 					WithField("task_id", task.GetPelotonTaskID().GetValue()).
 					Info("Failed to transit tasks in placement")
-				invalidTasks[task.GetPelotonTaskID().GetValue()] = task.GetPelotonTaskID()
+				invalidTaskSet[task.GetMesosTaskID().GetValue()] = struct{}{}
 			}
 		}
 	}
-	return h.removeTasksFromPlacements(placement, invalidTasks)
+	return h.removeTasksFromPlacements(placement, invalidTaskSet)
 }
 
 // NotifyTaskUpdates is called by HM to notify task updates
@@ -1068,22 +1062,24 @@ func (h *ServiceHandler) GetPreemptibleTasks(
 			break
 		}
 
-		// Transit task state machine to PREEMPTING
-		if rmTask := h.rmTracker.GetTask(preemptionCandidate.Id); rmTask != nil {
-			err = rmTask.TransitTo(
-				t.TaskState_PREEMPTING.String(), statemachine.WithReason("preemption triggered"))
-			if err != nil {
-				// the task could have moved from RUNNING state
+		if preemptionCandidate.GetReason() == resmgr.PreemptionReason_PREEMPTION_REASON_REVOKE_RESOURCES {
+			// Transit task state machine to PREEMPTING
+			if rmTask := h.rmTracker.GetTask(preemptionCandidate.Id); rmTask != nil {
+				err = rmTask.TransitTo(
+					t.TaskState_PREEMPTING.String(), statemachine.WithReason("preemption triggered"))
+				if err != nil {
+					// the task could have moved from RUNNING state
+					log.WithError(err).
+						WithField("task_id", preemptionCandidate.Id.Value).
+						Error("failed to transit state for task")
+					continue
+				}
+			} else {
 				log.WithError(err).
 					WithField("task_id", preemptionCandidate.Id.Value).
-					Error("failed to transit state for task")
+					Error("failed to find task in the tracker")
 				continue
 			}
-		} else {
-			log.WithError(err).
-				WithField("task_id", preemptionCandidate.Id.Value).
-				Error("failed to find task in the tracker")
-			continue
 		}
 		preemptionCandidates = append(preemptionCandidates, preemptionCandidate)
 	}

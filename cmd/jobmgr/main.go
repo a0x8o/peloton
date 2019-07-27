@@ -25,6 +25,7 @@ import (
 	"github.com/uber/peloton/pkg/auth"
 	auth_impl "github.com/uber/peloton/pkg/auth/impl"
 	"github.com/uber/peloton/pkg/common"
+	"github.com/uber/peloton/pkg/common/api"
 	"github.com/uber/peloton/pkg/common/background"
 	"github.com/uber/peloton/pkg/common/buildversion"
 	"github.com/uber/peloton/pkg/common/config"
@@ -326,6 +327,10 @@ func main() {
 		cfg.Storage.Cassandra.CassandraConn.DataCenter = *datacenter
 	}
 
+	if cfg.JobManager.HostManagerAPIVersion == "" {
+		cfg.JobManager.HostManagerAPIVersion = api.V0
+	}
+
 	// Parse and setup peloton secrets
 	if *pelotonSecretFile != "" {
 		var secretsCfg config.PelotonSecretsConfig
@@ -529,10 +534,10 @@ func main() {
 		dispatcher,
 		common.PelotonHostManager,
 		jobFactory,
-		store, // store implements TaskStore
 		store, // store implements VolumeStore
 		ormStore,
 		rootScope,
+		cfg.JobManager.HostManagerAPIVersion,
 	)
 
 	goalStateDriver := goalstate.NewDriver(
@@ -548,6 +553,7 @@ func main() {
 		rootScope,
 		cfg.JobManager.GoalState,
 		cfg.JobManager.JobRuntimeCalculationViaCache,
+		cfg.JobManager.HostManagerAPIVersion,
 	)
 
 	// Init placement processor
@@ -565,7 +571,7 @@ func main() {
 	taskPreemptor := preemptor.New(
 		dispatcher,
 		common.PelotonResourceManager,
-		store, // store implements TaskStore
+		ormStore, // store implements TaskStore
 		jobFactory,
 		goalStateDriver,
 		&cfg.JobManager.Preemptor,
@@ -594,6 +600,7 @@ func main() {
 		goalStateDriver,
 		[]event.Listener{},
 		rootScope,
+		cfg.JobManager.HostManagerAPIVersion,
 	)
 
 	server := jobmgr.NewServer(
@@ -677,6 +684,7 @@ func main() {
 		store,
 		store,
 		store,
+		ormStore,
 		jobFactory,
 		goalStateDriver,
 		candidate,

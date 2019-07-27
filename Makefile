@@ -29,6 +29,7 @@ DC ?= all
 GEN_DIR = .gen
 UNAME = $(shell uname | tr '[:upper:]' '[:lower:]')
 
+GOKIND = bin/kind
 GOCOV = $(go get github.com/axw/gocov/gocov)
 GOCOV_XML = $(go get github.com/AlekSi/gocov-xml)
 GOLINT = $(go get golang.org/x/lint/golint)
@@ -38,6 +39,7 @@ PHAB_COMMENT = .phabricator-comment
 # See https://golang.org/doc/gdb for details of the flags
 GO_FLAGS = -gcflags '-N -l' -ldflags "-X main.version=$(PACKAGE_VERSION)"
 
+K8S ?= "--k8s"
 THIS_FILE := $(lastword $(MAKEFILE_LIST))
 
 ifeq ($(shell uname),Linux)
@@ -75,7 +77,7 @@ aurorabridge:
 build-mockgen:
 	go get ./vendor/github.com/golang/mock/mockgen
 
-get-gokind:
+$(GOKIND):
 	mkdir -p bin
 	wget -O $(shell pwd)/bin/kind https://github.com/kubernetes-sigs/kind/releases/download/0.2.1/kind-$(UNAME)-amd64
 	chmod a+x $(shell pwd)/bin/kind
@@ -180,6 +182,7 @@ endef
 
 mockgens: build-mockgen gens $(GOMOCK)
 	$(call local_mockgen,pkg/aurorabridge,RespoolLoader;EventPublisher)
+	$(call local_mockgen,pkg/aurorabridge/cache,JobIDCache)
 	$(call local_mockgen,pkg/aurorabridge/common,Random)
 	$(call local_mockgen,pkg/auth, SecurityManager;SecurityClient;User)
 	$(call local_mockgen,pkg/common/concurrency,Mapper)
@@ -202,9 +205,12 @@ mockgens: build-mockgen gens $(GOMOCK)
 	$(call local_mockgen,pkg/hostmgr/watchevent,WatchProcessor)
 	$(call local_mockgen,pkg/hostmgr/mesos/yarpc/encoding/mpb,SchedulerClient;MasterOperatorClient)
 	$(call local_mockgen,pkg/hostmgr/mesos/yarpc/transport/mhttp,Inbound)
+	$(call local_mockgen,pkg/hostmgr/p2k/hostcache,HostCache)
+	$(call local_mockgen,pkg/hostmgr/p2k/plugins,Plugin)
 	$(call local_mockgen,pkg/jobmgr/cached,JobFactory;Job;Task;JobConfigCache;Update)
 	$(call local_mockgen,pkg/jobmgr/goalstate,Driver)
 	$(call local_mockgen,pkg/jobmgr/task/activermtask,ActiveRMTasks)
+	$(call local_mockgen,pkg/jobmgr/task/lifecyclemgr,Manager)
 	$(call local_mockgen,pkg/jobmgr/task/event,Listener;StatusProcessor)
 	$(call local_mockgen,pkg/jobmgr/task/launcher,Launcher)
 	$(call local_mockgen,pkg/jobmgr/logmanager,LogManager)
@@ -214,13 +220,14 @@ mockgens: build-mockgen gens $(GOMOCK)
 	$(call local_mockgen,pkg/placement/plugins,Strategy)
 	$(call local_mockgen,pkg/placement/tasks,Service)
 	$(call local_mockgen,pkg/placement/reserver,Reserver)
+	$(call local_mockgen,pkg/placement/models,Offer;Task)
 	$(call local_mockgen,pkg/resmgr/respool,ResPool;Tree)
 	$(call local_mockgen,pkg/resmgr/preemption,Queue)
 	$(call local_mockgen,pkg/resmgr/queue,Queue;MultiLevelList)
 	$(call local_mockgen,pkg/resmgr/task,Scheduler;Tracker)
-	$(call local_mockgen,pkg/storage,JobStore;TaskStore;UpdateStore;FrameworkInfoStore;ResourcePoolStore;PersistentVolumeStore)
+	$(call local_mockgen,pkg/storage,JobStore;TaskStore;UpdateStore;FrameworkInfoStore;PersistentVolumeStore)
 	$(call local_mockgen,pkg/storage/cassandra/api,DataStore)
-	$(call local_mockgen,pkg/storage/objects,JobIndexOps;JobNameToIDOps;JobConfigOps;SecretInfoOps;JobRuntimeOps)
+	$(call local_mockgen,pkg/storage/objects,JobIndexOps;JobNameToIDOps;JobConfigOps;SecretInfoOps;JobRuntimeOps;ResPoolOps;PodEventsOps;JobUpdateEventsOps;ActiveJobsOps;TaskConfigV2Ops)
 	$(call local_mockgen,pkg/storage/orm,Client;Connector;Iterator)
 	$(call local_mockgen,.gen/peloton/api/v0/host/svc,HostServiceYARPCClient)
 	$(call local_mockgen,.gen/peloton/api/v0/job,JobManagerYARPCClient)
@@ -233,7 +240,8 @@ mockgens: build-mockgen gens $(GOMOCK)
 	$(call local_mockgen,.gen/peloton/api/v1alpha/job/stateless/svc,JobServiceYARPCClient;JobServiceServiceListJobsYARPCClient;JobServiceServiceListPodsYARPCClient;JobServiceServiceListJobsYARPCServer;JobServiceServiceListPodsYARPCServer)
 	$(call local_mockgen,.gen/peloton/api/v1alpha/watch/svc,WatchServiceYARPCClient;WatchServiceServiceWatchYARPCClient;WatchServiceServiceWatchYARPCServer)
 	$(call local_mockgen,.gen/peloton/private/jobmgrsvc,JobManagerServiceYARPCClient)
-	$(call local_mockgen,.gen/peloton/private/hostmgr/hostsvc,InternalHostServiceYARPCClient;InternalHostServiceServiceWatchEventYARPCServer)
+	$(call local_mockgen,.gen/peloton/private/hostmgr/v1alpha/svc,HostManagerServiceYARPCClient)
+	$(call local_mockgen,.gen/peloton/private/hostmgr/hostsvc,InternalHostServiceYARPCClient;InternalHostServiceServiceWatchHostSummaryEventYARPCServer;InternalHostServiceServiceWatchEventStreamEventYARPCServer)
 	$(call local_mockgen,.gen/peloton/private/resmgrsvc,ResourceManagerServiceYARPCClient)
 	$(call vendor_mockgen,go.uber.org/yarpc/encoding/json/outbound.go)
 
@@ -251,20 +259,20 @@ test_pkg: $(GOCOV) $(GENS) mockgens test-containers
 unit-test: $(GOCOV) $(GENS) mockgens
 	gocov test $(ALL_PKGS) --tags "unit" | gocov report
 
-integ-test: get-gokind
+integ-test: $(GOKIND)
 	ls -la $(shell pwd)/bin
 	PATH="$(PATH):$(shell pwd)/bin" ./tests/run-integration-tests.sh
 
-aurorabridge-integ-test: get-gokind
+aurorabridge-integ-test: $(GOKIND)
 	ls -la $(shell pwd)/bin
 	PATH="$(PATH):$(shell pwd)/bin" ./tests/run-aurorabridge-integration-tests.sh
 
 # launch peloton with PELOTON={any value}, default to none
 minicluster: $(GOKIND)
-	PELOTON=$(PELOTON) ./scripts/minicluster.sh setup
+	PATH="$(PATH):$(shell pwd)/bin" PELOTON=$(PELOTON) ./scripts/minicluster.sh setup $(K8S)
 
 minicluster-teardown: $(GOKIND)
-	./scripts/minicluster.sh teardown
+	PATH="$(PATH):$(shell pwd)/bin" ./scripts/minicluster.sh teardown
 
 # Clone the newest mimir-lib code. Do not manually edit anything under mimir-lib/*
 update-mimir-lib:
@@ -325,9 +333,9 @@ else
 	@./tools/packaging/docker-push.sh $(REGISTRY) $(IMAGE)
 endif
 
-failure-test-minicluster:
+failure-test-minicluster: $(GOKIND)
 	IMAGE=uber/peloton $(MAKE) -f $(THIS_FILE) docker
-	@./tests/run-failure-tests.sh minicluster
+	PATH="$(PATH):$(shell pwd)/bin" ./tests/run-failure-tests.sh minicluster
 
 failure-test-vcluster:
 	IMAGE= $(MAKE) -f $(THIS_FILE) docker docker-push

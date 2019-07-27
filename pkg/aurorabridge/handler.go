@@ -31,6 +31,7 @@ import (
 	pbquery "github.com/uber/peloton/.gen/peloton/api/v1alpha/query"
 	"github.com/uber/peloton/.gen/peloton/private/jobmgrsvc"
 	"github.com/uber/peloton/.gen/thrift/aurora/api"
+	"github.com/uber/peloton/pkg/aurorabridge/cache"
 	"github.com/uber/peloton/pkg/common/util"
 
 	"github.com/uber/peloton/pkg/aurorabridge/atop"
@@ -66,6 +67,7 @@ type ServiceHandler struct {
 	podClient     podsvc.PodServiceYARPCClient
 	respoolLoader RespoolLoader
 	random        common.Random
+	jobIdCache    cache.JobIDCache
 }
 
 // NewServiceHandler creates a new ServiceHandler.
@@ -77,6 +79,7 @@ func NewServiceHandler(
 	podClient podsvc.PodServiceYARPCClient,
 	respoolLoader RespoolLoader,
 	random common.Random,
+	jobIdCache cache.JobIDCache,
 ) (*ServiceHandler, error) {
 
 	config.normalize()
@@ -92,6 +95,7 @@ func NewServiceHandler(
 		podClient:     podClient,
 		respoolLoader: respoolLoader,
 		random:        random,
+		jobIdCache:    jobIdCache,
 	}, nil
 }
 
@@ -108,15 +112,13 @@ func (h *ServiceHandler) GetJobSummary(
 	defer func() {
 		h.metrics.
 			Procedures[ProcedureGetJobSummary].
-			ResponseCode.
 			ResponseCodes[resp.GetResponseCode()].
-			Inc(1)
+			Calls.Inc(1)
 
 		h.metrics.
 			Procedures[ProcedureGetJobSummary].
-			ResponseCodeLatency.
 			ResponseCodes[resp.GetResponseCode()].
-			Record(time.Since(startTime))
+			CallLatency.Record(time.Since(startTime))
 
 		if err != nil {
 			log.WithFields(log.Fields{
@@ -144,15 +146,17 @@ func (h *ServiceHandler) getJobSummary(
 	ctx context.Context,
 	role *string,
 ) (*api.Result, *auroraError) {
+	var jobIDs []*peloton.JobID
+	var err error
 
-	query := &api.TaskQuery{}
 	if role != nil && *role != "" {
-		query.Role = role
+		jobIDs, err = h.getJobIDsFromRoleCache(ctx, *role)
+	} else {
+		jobIDs, err = h.queryJobIDs(ctx, "", "", "")
 	}
 
-	jobIDs, err := h.getJobIDsFromTaskQuery(ctx, query)
 	if err != nil {
-		return nil, auroraErrorf("get job ids from task query: %s", err)
+		return nil, auroraErrorf("get job ids from role: %s", err)
 	}
 
 	var inputs []interface{}
@@ -233,15 +237,13 @@ func (h *ServiceHandler) GetTasksWithoutConfigs(
 	defer func() {
 		h.metrics.
 			Procedures[ProcedureGetTasksWithoutConfigs].
-			ResponseCode.
 			ResponseCodes[resp.GetResponseCode()].
-			Inc(1)
+			Calls.Inc(1)
 
 		h.metrics.
 			Procedures[ProcedureGetTasksWithoutConfigs].
-			ResponseCodeLatency.
 			ResponseCodes[resp.GetResponseCode()].
-			Record(time.Since(startTime))
+			CallLatency.Record(time.Since(startTime))
 
 		if err != nil {
 			log.WithFields(log.Fields{
@@ -538,15 +540,13 @@ func (h *ServiceHandler) GetConfigSummary(
 	defer func() {
 		h.metrics.
 			Procedures[ProcedureGetConfigSummary].
-			ResponseCode.
 			ResponseCodes[resp.GetResponseCode()].
-			Inc(1)
+			Calls.Inc(1)
 
 		h.metrics.
 			Procedures[ProcedureGetConfigSummary].
-			ResponseCodeLatency.
 			ResponseCodes[resp.GetResponseCode()].
-			Record(time.Since(startTime))
+			CallLatency.Record(time.Since(startTime))
 
 		if err != nil {
 			log.WithFields(log.Fields{
@@ -621,15 +621,13 @@ func (h *ServiceHandler) GetJobs(
 	defer func() {
 		h.metrics.
 			Procedures[ProcedureGetJobs].
-			ResponseCode.
 			ResponseCodes[resp.GetResponseCode()].
-			Inc(1)
+			Calls.Inc(1)
 
 		h.metrics.
 			Procedures[ProcedureGetJobs].
-			ResponseCodeLatency.
 			ResponseCodes[resp.GetResponseCode()].
-			Record(time.Since(startTime))
+			CallLatency.Record(time.Since(startTime))
 
 		if err != nil {
 			log.WithFields(log.Fields{
@@ -657,15 +655,17 @@ func (h *ServiceHandler) getJobs(
 	ctx context.Context,
 	ownerRole *string,
 ) (*api.Result, *auroraError) {
+	var jobIDs []*peloton.JobID
+	var err error
 
-	query := &api.TaskQuery{}
 	if ownerRole != nil && *ownerRole != "" {
-		query.Role = ownerRole
+		jobIDs, err = h.getJobIDsFromRoleCache(ctx, *ownerRole)
+	} else {
+		jobIDs, err = h.queryJobIDs(ctx, "", "", "")
 	}
 
-	jobIDs, err := h.getJobIDsFromTaskQuery(ctx, query)
 	if err != nil {
-		return nil, auroraErrorf("get job ids from task query: %s", err)
+		return nil, auroraErrorf("get job ids from role: %s", err)
 	}
 
 	var inputs []interface{}
@@ -746,15 +746,13 @@ func (h *ServiceHandler) GetJobUpdateSummaries(
 	defer func() {
 		h.metrics.
 			Procedures[ProcedureGetJobUpdateSummaries].
-			ResponseCode.
 			ResponseCodes[resp.GetResponseCode()].
-			Inc(1)
+			Calls.Inc(1)
 
 		h.metrics.
 			Procedures[ProcedureGetJobUpdateSummaries].
-			ResponseCodeLatency.
 			ResponseCodes[resp.GetResponseCode()].
-			Record(time.Since(startTime))
+			CallLatency.Record(time.Since(startTime))
 
 		if err != nil {
 			log.WithFields(log.Fields{
@@ -814,15 +812,13 @@ func (h *ServiceHandler) GetJobUpdateDetails(
 	defer func() {
 		h.metrics.
 			Procedures[ProcedureGetJobUpdateDetails].
-			ResponseCode.
 			ResponseCodes[resp.GetResponseCode()].
-			Inc(1)
+			Calls.Inc(1)
 
 		h.metrics.
 			Procedures[ProcedureGetJobUpdateDetails].
-			ResponseCodeLatency.
 			ResponseCodes[resp.GetResponseCode()].
-			Record(time.Since(startTime))
+			CallLatency.Record(time.Since(startTime))
 
 		if err != nil {
 			log.WithFields(log.Fields{
@@ -885,15 +881,13 @@ func (h *ServiceHandler) GetJobUpdateDiff(
 	defer func() {
 		h.metrics.
 			Procedures[ProcedureGetJobUpdateDiff].
-			ResponseCode.
 			ResponseCodes[resp.GetResponseCode()].
-			Inc(1)
+			Calls.Inc(1)
 
 		h.metrics.
 			Procedures[ProcedureGetJobUpdateDiff].
-			ResponseCodeLatency.
 			ResponseCodes[resp.GetResponseCode()].
-			Record(time.Since(startTime))
+			CallLatency.Record(time.Since(startTime))
 
 		if err != nil {
 			log.WithFields(log.Fields{
@@ -1028,15 +1022,13 @@ func (h *ServiceHandler) GetTierConfigs(
 	defer func() {
 		h.metrics.
 			Procedures[ProcedureGetTierConfigs].
-			ResponseCode.
 			ResponseCodes[resp.GetResponseCode()].
-			Inc(1)
+			Calls.Inc(1)
 
 		h.metrics.
 			Procedures[ProcedureGetTierConfigs].
-			ResponseCodeLatency.
 			ResponseCodes[resp.GetResponseCode()].
-			Record(time.Since(startTime))
+			CallLatency.Record(time.Since(startTime))
 
 		log.WithFields(log.Fields{
 			"result": result,
@@ -1061,15 +1053,13 @@ func (h *ServiceHandler) KillTasks(
 	defer func() {
 		h.metrics.
 			Procedures[ProcedureKillTasks].
-			ResponseCode.
 			ResponseCodes[resp.GetResponseCode()].
-			Inc(1)
+			Calls.Inc(1)
 
 		h.metrics.
 			Procedures[ProcedureKillTasks].
-			ResponseCodeLatency.
 			ResponseCodes[resp.GetResponseCode()].
-			Record(time.Since(startTime))
+			CallLatency.Record(time.Since(startTime))
 
 		var instancesArr []string
 		for instanceID := range instances {
@@ -1214,17 +1204,41 @@ func (h *ServiceHandler) StartJobUpdate(
 	resp := newResponse(result, err)
 
 	defer func() {
-		h.metrics.
-			Procedures[ProcedureStartJobUpdate].
-			ResponseCode.
-			ResponseCodes[resp.GetResponseCode()].
-			Inc(1)
+		updateService := request.GetTaskConfig().GetJob().GetRole()
+		responseCode := resp.GetResponseCode()
+		responseTime := time.Since(startTime)
 
-		h.metrics.
-			Procedures[ProcedureStartJobUpdate].
-			ResponseCodeLatency.
-			ResponseCodes[resp.GetResponseCode()].
-			Record(time.Since(startTime))
+		if len(updateService) > 0 {
+			h.metrics.
+				Procedures[ProcedureStartJobUpdate].
+				ResponseCodes[responseCode].
+				Scope.
+				Tagged(map[string]string{
+					TagService: updateService,
+				}).
+				Counter(MetricNameCalls).
+				Inc(1)
+			h.metrics.
+				Procedures[ProcedureStartJobUpdate].
+				ResponseCodes[responseCode].
+				Scope.
+				Tagged(map[string]string{
+					TagService: updateService,
+				}).
+				Timer(MetricNameCallLatency).
+				Record(responseTime)
+		} else {
+			h.metrics.
+				Procedures[ProcedureStartJobUpdate].
+				ResponseCodes[responseCode].
+				Calls.
+				Inc(1)
+			h.metrics.
+				Procedures[ProcedureStartJobUpdate].
+				ResponseCodes[responseCode].
+				CallLatency.
+				Record(responseTime)
+		}
 
 		if err != nil {
 			log.WithFields(log.Fields{
@@ -1265,15 +1279,13 @@ func (h *ServiceHandler) PauseJobUpdate(
 	defer func() {
 		h.metrics.
 			Procedures[ProcedurePauseJobUpdate].
-			ResponseCode.
 			ResponseCodes[resp.GetResponseCode()].
-			Inc(1)
+			Calls.Inc(1)
 
 		h.metrics.
 			Procedures[ProcedurePauseJobUpdate].
-			ResponseCodeLatency.
 			ResponseCodes[resp.GetResponseCode()].
-			Record(time.Since(startTime))
+			CallLatency.Record(time.Since(startTime))
 
 		if err != nil {
 			log.WithFields(log.Fields{
@@ -1337,15 +1349,13 @@ func (h *ServiceHandler) ResumeJobUpdate(
 	defer func() {
 		h.metrics.
 			Procedures[ProcedureResumeJobUpdate].
-			ResponseCode.
 			ResponseCodes[resp.GetResponseCode()].
-			Inc(1)
+			Calls.Inc(1)
 
 		h.metrics.
 			Procedures[ProcedureResumeJobUpdate].
-			ResponseCodeLatency.
 			ResponseCodes[resp.GetResponseCode()].
-			Record(time.Since(startTime))
+			CallLatency.Record(time.Since(startTime))
 
 		if err != nil {
 			log.WithFields(log.Fields{
@@ -1409,15 +1419,13 @@ func (h *ServiceHandler) AbortJobUpdate(
 	defer func() {
 		h.metrics.
 			Procedures[ProcedureAbortJobUpdate].
-			ResponseCode.
 			ResponseCodes[resp.GetResponseCode()].
-			Inc(1)
+			Calls.Inc(1)
 
 		h.metrics.
 			Procedures[ProcedureAbortJobUpdate].
-			ResponseCodeLatency.
 			ResponseCodes[resp.GetResponseCode()].
-			Record(time.Since(startTime))
+			CallLatency.Record(time.Since(startTime))
 
 		if err != nil {
 			log.WithFields(log.Fields{
@@ -1481,15 +1489,13 @@ func (h *ServiceHandler) RollbackJobUpdate(
 	defer func() {
 		h.metrics.
 			Procedures[ProcedureRollbackJobUpdate].
-			ResponseCode.
 			ResponseCodes[resp.GetResponseCode()].
-			Inc(1)
+			Calls.Inc(1)
 
 		h.metrics.
 			Procedures[ProcedureRollbackJobUpdate].
-			ResponseCodeLatency.
 			ResponseCodes[resp.GetResponseCode()].
-			Record(time.Since(startTime))
+			CallLatency.Record(time.Since(startTime))
 
 		if err != nil {
 			log.WithFields(log.Fields{
@@ -1607,15 +1613,13 @@ func (h *ServiceHandler) PulseJobUpdate(
 	defer func() {
 		h.metrics.
 			Procedures[ProcedurePulseJobUpdate].
-			ResponseCode.
 			ResponseCodes[resp.GetResponseCode()].
-			Inc(1)
+			Calls.Inc(1)
 
 		h.metrics.
 			Procedures[ProcedurePulseJobUpdate].
-			ResponseCodeLatency.
 			ResponseCodes[resp.GetResponseCode()].
-			Record(time.Since(startTime))
+			CallLatency.Record(time.Since(startTime))
 
 		if err != nil {
 			log.WithFields(log.Fields{
@@ -1945,14 +1949,14 @@ func (h *ServiceHandler) queryJobIDs(
 		return []*peloton.JobID{id}, nil
 	}
 
-	summaries, err := h.queryJobSummaries(ctx, role, env, name)
+	jobCache, err := h.queryJobCache(ctx, role, env, name)
 	if err != nil {
 		return nil, err
 	}
 
-	jobIDs := make([]*peloton.JobID, 0, len(summaries))
-	for _, summary := range summaries {
-		jobIDs = append(jobIDs, summary.GetJobId())
+	jobIDs := make([]*peloton.JobID, 0, len(jobCache))
+	for _, cache := range jobCache {
+		jobIDs = append(jobIDs, cache.GetJobId())
 	}
 	return jobIDs, nil
 }
@@ -1979,60 +1983,6 @@ func (h *ServiceHandler) getJobCacheFromJobKey(
 			Name:  atop.NewJobName(k),
 		},
 	}, nil
-}
-
-// queryJobSummaries takes optional job key components and returns the Peloton
-// job summaries which match the set parameters. E.g. queryJobSummaries("myservice", "", "")
-// will return summaries which match role=myservice.
-func (h *ServiceHandler) queryJobSummaries(
-	ctx context.Context,
-	role, env, name string,
-) ([]*stateless.JobSummary, error) {
-	labels := append(
-		label.BuildPartialAuroraJobKeyLabels(role, env, name),
-		common.BridgeJobLabel,
-	)
-
-	req := &statelesssvc.QueryJobsRequest{
-		Spec: &stateless.QuerySpec{
-			Labels: labels,
-			Pagination: &pbquery.PaginationSpec{
-				Limit:    h.config.QueryJobsLimit,
-				MaxLimit: h.config.QueryJobsLimit,
-			},
-		},
-	}
-	resp, err := h.jobClient.QueryJobs(ctx, req)
-	if err != nil {
-		return nil, err
-	}
-
-	// In peloton, query job by labels is implemented by "string contains",
-	// so need to filter unexpected jobs.
-	var summaries []*stateless.JobSummary
-	for _, s := range resp.GetRecords() {
-		// since we expect bridge-specific label keys to be present at most
-		// once, using a map is good enough here.
-		labelMap := make(map[string]string)
-		for _, l := range s.GetLabels() {
-			labelMap[l.GetKey()] = l.GetValue()
-		}
-
-		match := true
-		for _, el := range labels {
-			v, ok := labelMap[el.GetKey()]
-			if !ok || v != el.GetValue() {
-				match = false
-				break
-			}
-		}
-
-		if match {
-			summaries = append(summaries, s)
-		}
-	}
-
-	return summaries, nil
 }
 
 // queryJobCache calls jobmgr's private QueryJobCache API, passes the querying
@@ -2103,6 +2053,30 @@ func (h *ServiceHandler) getJobIDsFromTaskQuery(
 		return nil, errors.Wrapf(err, "get job ids")
 	}
 	return ids, nil
+}
+
+// getJobIDsFromRoleCache queries peloton job ids based on aurora JobKey role.
+// It will first look at the internal job id cache first,
+func (h *ServiceHandler) getJobIDsFromRoleCache(
+	ctx context.Context,
+	role string,
+) ([]*peloton.JobID, error) {
+	if ids := h.jobIdCache.GetJobIDs(role); len(ids) > 0 {
+		return ids, nil
+	}
+
+	jobCache, err := h.queryJobCache(ctx, role, "", "")
+	if err != nil {
+		return nil, err
+	}
+
+	h.jobIdCache.PopulateFromJobCache(role, jobCache)
+
+	jobIDs := make([]*peloton.JobID, 0, len(jobCache))
+	for _, cache := range jobCache {
+		jobIDs = append(jobIDs, cache.GetJobId())
+	}
+	return jobIDs, nil
 }
 
 // matchJobUpdateID matches a jobID workflow against updateID. Returns the entity

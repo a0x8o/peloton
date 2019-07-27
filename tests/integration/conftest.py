@@ -276,6 +276,12 @@ def hostmgr():
     return Container(util.HOST_MGRS)
 
 
+@pytest.fixture()
+def aurorabridge():
+    # TODO: We need to pick up the count dynamically.
+    return Container(util.AURORA_BRIDGE)
+
+
 @pytest.fixture
 def long_running_job(request):
     job = Job(job_file="long_running_job.yaml")
@@ -315,13 +321,6 @@ def host_affinity_job(request):
 
     request.addfinalizer(kill_host_affinity_job)
     return job
-
-
-# For unit tests running with test_job, it would be tested with both
-# long_running_job and stateless_job
-@pytest.fixture(params=[long_running_job, stateless_job])
-def test_job(request):
-    return request.param(request)
 
 
 # For unit tests of update/restart running with in_place, it would

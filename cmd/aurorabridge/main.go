@@ -26,6 +26,7 @@ import (
 	"github.com/uber/peloton/.gen/peloton/private/jobmgrsvc"
 	"github.com/uber/peloton/.gen/thrift/aurora/api/auroraschedulermanagerserver"
 	"github.com/uber/peloton/.gen/thrift/aurora/api/readonlyschedulerserver"
+	"github.com/uber/peloton/pkg/aurorabridge/cache"
 	auth_impl "github.com/uber/peloton/pkg/auth/impl"
 
 	"github.com/uber/peloton/pkg/aurorabridge"
@@ -232,6 +233,12 @@ func main() {
 			Fatal("Could not enable security feature")
 	}
 
+	rateLimitMiddleware, err := inbound.NewRateLimitInboundMiddleware(cfg.RateLimit)
+	if err != nil {
+		log.WithError(err).
+			Fatal("Could not create rate limit middleware")
+	}
+
 	authInboundMiddleware := inbound.NewAuthInboundMiddleware(securityManager)
 
 	securityClient, err := auth_impl.CreateNewSecurityClient(&cfg.Auth)
@@ -250,9 +257,9 @@ func main() {
 			Tally: rootScope,
 		},
 		InboundMiddleware: yarpc.InboundMiddleware{
-			Unary:  authInboundMiddleware,
-			Stream: authInboundMiddleware,
-			Oneway: authInboundMiddleware,
+			Unary:  yarpc.UnaryInboundMiddleware(rateLimitMiddleware, authInboundMiddleware),
+			Stream: yarpc.StreamInboundMiddleware(rateLimitMiddleware, authInboundMiddleware),
+			Oneway: yarpc.OnewayInboundMiddleware(rateLimitMiddleware, authInboundMiddleware),
 		},
 		OutboundMiddleware: yarpc.OutboundMiddleware{
 			Unary:  authOutboundMiddleware,
@@ -321,6 +328,7 @@ func main() {
 		podClient,
 		respoolLoader,
 		bridgecommon.RandomImpl{},
+		cache.NewJobIDCache(),
 	)
 	if err != nil {
 		log.Fatalf("Unable to create service handler: %v", err)

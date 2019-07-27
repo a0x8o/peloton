@@ -101,9 +101,12 @@ const (
 	MesosGPU = "gpus"
 	// MesosPorts resource kind
 	MesosPorts = "ports"
-)
 
-const (
+	// V0Api identifier string to determine if a job config API version
+	V0Api = "v0"
+	// V1AlphaApi identifier string to determine if a job config API version
+	V1AlphaApi = "v1alpha"
+
 	// SystemLabelKeyTemplate is the system label key template
 	SystemLabelKeyTemplate = "%s.%s"
 	// SystemLabelPrefix is the system label key name prefix
@@ -124,23 +127,21 @@ const (
 	// that indicates to Peloton that the agent will be used exclusively
 	// for certain workloads only.
 	PelotonExclusiveAttributeName = "peloton/exclusive"
+	// PelotonExclusiveNodeLabel is the label of exclusive node
+	PelotonExclusiveNodeLabel = PelotonExclusiveAttributeName
 	// PelotonAuroraBridgeExecutorIDPrefix is the prefix for the executor ID
 	// for tasks launched through thermos executor
 	PelotonAuroraBridgeExecutorIDPrefix = "thermos-"
-)
+	// HostNameKey is the special label key for hostname.
+	HostNameKey = "hostname"
 
-const (
 	// DefaultTaskConfigID is used for storing, and retrieving, the default
 	// task configuration, when no specific is available.
 	DefaultTaskConfigID = -1
-)
 
-const (
 	// AppLogField is the log field key for app name
 	AppLogField = "app"
-)
 
-const (
 	// TaskThrottleMessage indicates that the task is throttled due to repeated failures.
 	TaskThrottleMessage = "Task throttled due to failure"
 )

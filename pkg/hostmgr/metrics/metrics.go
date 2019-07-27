@@ -58,19 +58,14 @@ type Metrics struct {
 	ClusterCapacity     tally.Counter
 	ClusterCapacityFail tally.Counter
 
-	OfferOperations              tally.Counter
-	OfferOperationsFail          tally.Counter
-	OfferOperationsInvalid       tally.Counter
-	OfferOperationsInvalidOffers tally.Counter
-
 	RecoverySuccess tally.Counter
 	RecoveryFail    tally.Counter
 
 	GetDrainingHosts     tally.Counter
 	GetDrainingHostsFail tally.Counter
 
-	MarkHostsDrained     tally.Counter
-	MarkHostsDrainedFail tally.Counter
+	MarkHostDrained     tally.Counter
+	MarkHostDrainedFail tally.Counter
 
 	WatchEventCancel   tally.Counter
 	WatchEventOverflow tally.Counter
@@ -92,11 +87,6 @@ func NewMetrics(scope tally.Scope) *Metrics {
 		LaunchTasksFail:          scope.Counter("launch_tasks_fail"),
 		LaunchTasksInvalid:       scope.Counter("launch_tasks_invalid"),
 		LaunchTasksInvalidOffers: scope.Counter("launch_tasks_invalid_offers"),
-
-		OfferOperations:              scope.Counter("offer_operations"),
-		OfferOperationsFail:          scope.Counter("offer_operations_fail"),
-		OfferOperationsInvalid:       scope.Counter("offer_operations_invalid"),
-		OfferOperationsInvalidOffers: scope.Counter("offer_operations_invalid_offers"),
 
 		AcquireHostOffers:        scope.Counter("acquire_host_offers"),
 		AcquireHostOffersFail:    scope.Counter("acquire_host_offers_fail"),
@@ -134,8 +124,8 @@ func NewMetrics(scope tally.Scope) *Metrics {
 		GetDrainingHosts:     scope.Counter("get_draining_hosts"),
 		GetDrainingHostsFail: scope.Counter("get_draining_hosts_fail"),
 
-		MarkHostsDrained:     scope.Counter("mark_hosts_drained"),
-		MarkHostsDrainedFail: scope.Counter("mark_hosts_drained_fail"),
+		MarkHostDrained:     scope.Counter("mark_host_drained"),
+		MarkHostDrainedFail: scope.Counter("mark_host_drained_fail"),
 
 		WatchEventCancel:           watchEventScope.Counter("watch_event_cancel"),
 		WatchEventOverflow:         watchEventScope.Counter("watch_event_overflow"),

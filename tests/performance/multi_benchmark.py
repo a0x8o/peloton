@@ -16,6 +16,7 @@ from collections import Counter
 import json
 import os
 import pandas as pd
+import numpy as np
 import sys
 import threading
 import time
@@ -33,7 +34,7 @@ PERF_TEST_CONDUCTED = [
     ('JOB_GET', '_job_get.csv'),
     ('JOB_UPDATE', '_job_update.csv'),
     ('JOB_STATELESS_CREATE', '_job_stateless_create.csv'),
-    ('JOB_STATELESS_UPDATE', '_job_stateless_update.csv'),
+    # ('JOB_STATELESS_UPDATE', '_job_stateless_update.csv'),
     ('JOB_PARALLEL_STATELESS_UPDATE',
      '_job_parallel_stateless_update.csv'),
 ]
@@ -225,7 +226,7 @@ def main():
     # (total use 90% of capacity)
     pupdate_df = t.perf_test_stateless_parallel_updates()
     if pupdate_df is not None:
-        pupdate_df.to_csv(output_csv_files_list[5], sep='\t')
+        pupdate_df.to_csv(output_csv_files_list[4], sep='\t')
 
 
 def run_one_test(pf_client, num_tasks, instance_config, sleep_time, agent_num):
@@ -403,7 +404,8 @@ class PerformanceTest:
             }
         ]
         df = pd.DataFrame(
-            record, columns=["NumStartTasks", "Sleep(s)", "TotalTimeInSeconds"]
+            record, columns=["NumStartTasks", "Sleep(s)", "TotalTimeInSeconds"],
+            dtype=np.int64
         )
         print("Test StatelessCreate")
         print(df)
@@ -552,6 +554,7 @@ class PerformanceTest:
                 "BatchSize",
                 "AverageTimeInSeconds",
             ],
+            dtype=np.int64
         )
         print("Test ParallelStatelessUpdate")
         print(df)

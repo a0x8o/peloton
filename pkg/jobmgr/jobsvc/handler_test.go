@@ -28,6 +28,7 @@ import (
 	"github.com/uber/peloton/.gen/peloton/api/v0/respool"
 	respoolmocks "github.com/uber/peloton/.gen/peloton/api/v0/respool/mocks"
 	"github.com/uber/peloton/.gen/peloton/api/v0/task"
+	"github.com/uber/peloton/.gen/peloton/api/v1alpha/job/stateless"
 	"github.com/uber/peloton/.gen/peloton/private/models"
 	"github.com/uber/peloton/.gen/peloton/private/resmgrsvc"
 	resmocks "github.com/uber/peloton/.gen/peloton/private/resmgrsvc/mocks"
@@ -91,6 +92,7 @@ type JobHandlerTestSuite struct {
 	mockedGoalStateDriver *goalstatemocks.MockDriver
 	mockedJobStore        *storemocks.MockJobStore
 	mockedTaskStore       *storemocks.MockTaskStore
+	mockedActiveJobsOps   *objectmocks.MockActiveJobsOps
 	mockedJobIndexOps     *objectmocks.MockJobIndexOps
 	mockedSecretInfoOps   *objectmocks.MockSecretInfoOps
 	mockedJobConfigOps    *objectmocks.MockJobConfigOps
@@ -110,6 +112,7 @@ func (suite *JobHandlerTestSuite) initializeMocks() {
 	suite.mockedResmgrClient = resmocks.NewMockResourceManagerServiceYARPCClient(suite.ctrl)
 	suite.mockedCandidate = leadermocks.NewMockCandidate(suite.ctrl)
 	suite.mockedTaskStore = storemocks.NewMockTaskStore(suite.ctrl)
+	suite.mockedActiveJobsOps = objectmocks.NewMockActiveJobsOps(suite.ctrl)
 	suite.mockedJobIndexOps = objectmocks.NewMockJobIndexOps(suite.ctrl)
 	suite.mockedSecretInfoOps = objectmocks.NewMockSecretInfoOps(suite.ctrl)
 	suite.mockedJobConfigOps = objectmocks.NewMockJobConfigOps(suite.ctrl)
@@ -117,6 +120,7 @@ func (suite *JobHandlerTestSuite) initializeMocks() {
 
 	suite.handler.jobStore = suite.mockedJobStore
 	suite.handler.taskStore = suite.mockedTaskStore
+	suite.handler.activeJobsOps = suite.mockedActiveJobsOps
 	suite.handler.jobIndexOps = suite.mockedJobIndexOps
 	suite.handler.jobConfigOps = suite.mockedJobConfigOps
 	suite.handler.jobRuntimeOps = suite.mockedJobRuntimeOps
@@ -149,18 +153,10 @@ func (suite *JobHandlerTestSuite) setupMocks(
 			jobID,
 			gomock.Any(),
 			gomock.Any(),
+			nil,
 			gomock.Any(),
 		).
 		Return(nil).AnyTimes()
-	suite.mockedTaskStore.EXPECT().
-		CreateTaskConfig(
-			context.Background(),
-			gomock.Any(),
-			gomock.Any(),
-			gomock.Any(),
-			gomock.Any(),
-			gomock.Any(),
-		).Return(nil).AnyTimes()
 	suite.mockedCachedJob.EXPECT().
 		CreateTaskRuntimes(gomock.Any(), gomock.Any(), gomock.Any()).
 		Return(nil).AnyTimes()
@@ -168,16 +164,18 @@ func (suite *JobHandlerTestSuite) setupMocks(
 	suite.mockedJobFactory.EXPECT().AddJob(jobID).
 		Return(suite.mockedCachedJob).AnyTimes()
 	suite.mockedCachedJob.EXPECT().
-		Update(gomock.Any(), gomock.Any(), gomock.Any(), cached.UpdateCacheAndDB).
+		Update(
+			gomock.Any(),
+			gomock.Any(),
+			gomock.Any(),
+			nil,
+			cached.UpdateCacheAndDB).
 		Return(nil).AnyTimes()
 	suite.mockedGoalStateDriver.EXPECT().JobRuntimeDuration(job.JobType_BATCH).
 		Return(1 * time.Second).AnyTimes()
 	suite.mockedGoalStateDriver.EXPECT().EnqueueJob(jobID, gomock.Any()).AnyTimes()
 	suite.mockedGoalStateDriver.EXPECT().EnqueueTask(
 		jobID, gomock.Any(), gomock.Any()).AnyTimes()
-	suite.mockedTaskStore.EXPECT().
-		GetTaskStateSummaryForJob(context.Background(), gomock.Any()).
-		Return(map[string]uint32{}, nil).AnyTimes()
 }
 
 func (suite *JobHandlerTestSuite) SetupTest() {
@@ -261,6 +259,7 @@ func (suite *JobHandlerTestSuite) TestCreateJob_Success() {
 		gomock.Any(),
 		jobConfig,
 		gomock.Any(),
+		nil,
 	).Return(nil)
 
 	req := &job.CreateRequest{
@@ -292,6 +291,7 @@ func (suite *JobHandlerTestSuite) TestCreateJob_EmptyID() {
 		gomock.Any(),
 		jobConfig,
 		gomock.Any(),
+		nil,
 	).Return(nil)
 	suite.mockedGoalStateDriver.EXPECT().EnqueueJob(gomock.Any(), gomock.Any())
 	resp, err := suite.handler.Create(suite.context, &job.CreateRequest{
@@ -323,6 +323,7 @@ func (suite *JobHandlerTestSuite) TestCreateJob_InternalError() {
 		gomock.Any(),
 		jobConfig,
 		gomock.Any(),
+		nil,
 	).Return(errors.New("random error"))
 
 	resp, err := suite.handler.Create(suite.context, req)
@@ -358,6 +359,7 @@ func (suite *JobHandlerTestSuite) TestCreateJob_JobAlreadyExistErr() {
 		gomock.Any(),
 		jobConfig,
 		gomock.Any(),
+		nil,
 	).Return(alreayExistErr)
 
 	resp, err := suite.handler.Create(suite.context, req)
@@ -514,6 +516,7 @@ func (suite *JobHandlerTestSuite) TestCreateJob_ControllerTaskSucceed() {
 		gomock.Any(),
 		jobConfig,
 		gomock.Any(),
+		nil,
 	).Return(nil)
 
 	req := &job.CreateRequest{
@@ -547,6 +550,7 @@ func (suite *JobHandlerTestSuite) TestCreateJob_ControllerTaskSucceed() {
 		gomock.Any(),
 		jobConfig,
 		gomock.Any(),
+		nil,
 	).Return(nil)
 
 	req = &job.CreateRequest{
@@ -718,7 +722,7 @@ func (suite *JobHandlerTestSuite) TestCreateJobWithSecrets() {
 		Return(nil)
 
 	suite.mockedCachedJob.EXPECT().Create(
-		gomock.Any(), jobConfig, gomock.Any()).Return(nil)
+		gomock.Any(), jobConfig, gomock.Any(), nil).Return(nil)
 
 	// Create a job with a secret. This should pass
 	req := &job.CreateRequest{
@@ -753,7 +757,7 @@ func (suite *JobHandlerTestSuite) TestCreateJobWithSecrets() {
 		testSecretPath).           // secretPath
 		Return(nil)
 	suite.mockedCachedJob.EXPECT().Create(
-		gomock.Any(), jobConfig, gomock.Any()).Return(nil)
+		gomock.Any(), jobConfig, gomock.Any(), nil).Return(nil)
 	resp, err = suite.handler.Create(suite.context, req)
 	suite.Nil(err)
 
@@ -993,7 +997,11 @@ func (suite *JobHandlerTestSuite) TestJobScaleUp() {
 		AnyTimes()
 
 	suite.mockedCachedJob.EXPECT().
-		CompareAndSetConfig(gomock.Any(), gomock.Any(), gomock.Any()).
+		CompareAndSetConfig(
+			gomock.Any(),
+			gomock.Any(),
+			gomock.Any(),
+			nil).
 		Return(&job.JobConfig{
 			ChangeLog: &peloton.ChangeLog{
 				Version: 2,
@@ -1047,8 +1055,16 @@ func (suite *JobHandlerTestSuite) TestJobUpdateInstanceConfig() {
 		Get(context.Background(), jobID, gomock.Any()).
 		Return(oldJobConfig, configAddOn, nil)
 	suite.mockedCachedJob.EXPECT().
-		CompareAndSetConfig(gomock.Any(), gomock.Any(), gomock.Any()).
-		Do(func(_ context.Context, jobConfig *job.JobConfig, addOn *models.ConfigAddOn) {
+		CompareAndSetConfig(
+			gomock.Any(),
+			gomock.Any(),
+			gomock.Any(),
+			nil).
+		Do(func(
+			_ context.Context,
+			jobConfig *job.JobConfig,
+			addOn *models.ConfigAddOn,
+			_ *stateless.JobSpec) {
 			suite.NotNil(jobConfig.GetInstanceConfig()[0])
 			suite.True(jobConfig.GetInstanceConfig()[0].Controller)
 			suite.NotNil(jobConfig.GetInstanceConfig()[1])
@@ -1057,7 +1073,12 @@ func (suite *JobHandlerTestSuite) TestJobUpdateInstanceConfig() {
 			ChangeLog: &peloton.ChangeLog{Version: 2},
 		}, nil)
 	suite.mockedCachedJob.EXPECT().
-		Update(gomock.Any(), gomock.Any(), gomock.Any(), cached.UpdateCacheAndDB).
+		Update(
+			gomock.Any(),
+			gomock.Any(),
+			gomock.Any(),
+			nil,
+			cached.UpdateCacheAndDB).
 		Return(nil)
 	suite.mockedGoalStateDriver.EXPECT().
 		EnqueueJob(gomock.Any(), gomock.Any()).
@@ -1170,7 +1191,11 @@ func (suite *JobHandlerTestSuite) TestJobUpdateFailure() {
 			DefaultConfig: defaultConfig,
 		}, &models.ConfigAddOn{}, nil)
 	suite.mockedCachedJob.EXPECT().
-		CompareAndSetConfig(gomock.Any(), gomock.Any(), gomock.Any()).
+		CompareAndSetConfig(
+			gomock.Any(),
+			gomock.Any(),
+			gomock.Any(),
+			nil).
 		Return(nil, errors.New("random error"))
 	resp, err = suite.handler.Update(suite.context, &job.UpdateRequest{
 		Id: jobID,
@@ -1355,7 +1380,11 @@ func (suite *JobHandlerTestSuite) TestUpdateJobWithSecrets() {
 		Get(context.Background(), jobID, gomock.Any()).
 		Return(oldJobConfig, &models.ConfigAddOn{}, nil)
 	suite.mockedCachedJob.EXPECT().
-		CompareAndSetConfig(gomock.Any(), gomock.Any(), gomock.Any()).
+		CompareAndSetConfig(
+			gomock.Any(),
+			gomock.Any(),
+			gomock.Any(),
+			nil).
 		Return(&job.JobConfig{
 			ChangeLog: &peloton.ChangeLog{
 				Version: 2,
@@ -1390,7 +1419,11 @@ func (suite *JobHandlerTestSuite) TestUpdateJobWithSecrets() {
 		Get(context.Background(), jobID, gomock.Any()).
 		Return(oldJobConfig, &models.ConfigAddOn{}, nil)
 	suite.mockedCachedJob.EXPECT().
-		CompareAndSetConfig(gomock.Any(), gomock.Any(), gomock.Any()).
+		CompareAndSetConfig(
+			gomock.Any(),
+			gomock.Any(),
+			gomock.Any(),
+			nil).
 		Return(&job.JobConfig{
 			ChangeLog: &peloton.ChangeLog{
 				Version: 2,
@@ -1446,7 +1479,11 @@ func (suite *JobHandlerTestSuite) TestUpdateJobWithSecrets() {
 		string(updatedSecret.Value.Data)).
 		Return(nil)
 	suite.mockedCachedJob.EXPECT().
-		CompareAndSetConfig(gomock.Any(), gomock.Any(), gomock.Any()).
+		CompareAndSetConfig(
+			gomock.Any(),
+			gomock.Any(),
+			gomock.Any(),
+			nil).
 		Return(&job.JobConfig{
 			ChangeLog: &peloton.ChangeLog{
 				Version: 2,
@@ -1486,12 +1523,15 @@ func (suite *JobHandlerTestSuite) TestUpdateJobWithSecrets() {
 			}}, &models.ConfigAddOn{},
 			nil)
 	suite.mockedCachedJob.EXPECT().
-		CompareAndSetConfig(gomock.Any(), gomock.Any(), gomock.Any()).
-		Return(&job.JobConfig{
-			ChangeLog: &peloton.ChangeLog{
-				Version: 2,
-			},
-		}, nil)
+		CompareAndSetConfig(
+			gomock.Any(),
+			gomock.Any(),
+			gomock.Any(),
+			nil).Return(&job.JobConfig{
+		ChangeLog: &peloton.ChangeLog{
+			Version: 2,
+		},
+	}, nil)
 	suite.mockedSecretInfoOps.EXPECT().CreateSecret(
 		gomock.Any(),
 		jobID.Value,               // jobID
@@ -1822,7 +1862,12 @@ func (suite *JobHandlerTestSuite) TestJobRefresh() {
 		Return(jobConfig, &models.ConfigAddOn{}, nil)
 	suite.mockedJobFactory.EXPECT().AddJob(id).Return(suite.mockedCachedJob)
 	suite.mockedCachedJob.EXPECT().
-		Update(gomock.Any(), jobInfo, gomock.Any(), cached.UpdateCacheOnly).
+		Update(
+			gomock.Any(),
+			jobInfo,
+			gomock.Any(),
+			nil,
+			cached.UpdateCacheOnly).
 		Return(nil)
 	suite.mockedGoalStateDriver.EXPECT().EnqueueJob(id, gomock.Any())
 	_, err := suite.handler.Refresh(suite.context, &job.RefreshRequest{Id: id})
@@ -1915,7 +1960,7 @@ func (suite *JobHandlerTestSuite) TestJobGetCache_SUCCESS() {
 
 // TestJobGetActiveJobsFail tests failure to get active jobs list from DB
 func (suite *JobHandlerTestSuite) TestJobGetActiveJobsFail() {
-	suite.mockedJobStore.EXPECT().GetActiveJobs(context.Background()).
+	suite.mockedActiveJobsOps.EXPECT().GetAll(context.Background()).
 		Return(nil, fmt.Errorf("get active jobs err"))
 	_, err := suite.handler.GetActiveJobs(context.Background(),
 		&job.GetActiveJobsRequest{})
@@ -1927,8 +1972,8 @@ func (suite *JobHandlerTestSuite) TestJobGetActiveJobs() {
 	expectedJobIDs := []*peloton.JobID{
 		{Value: "my-job-1"},
 	}
-	suite.mockedJobStore.EXPECT().
-		GetActiveJobs(context.Background()).
+	suite.mockedActiveJobsOps.EXPECT().
+		GetAll(context.Background()).
 		Return(expectedJobIDs, nil)
 
 	resp, err := suite.handler.GetActiveJobs(context.Background(),

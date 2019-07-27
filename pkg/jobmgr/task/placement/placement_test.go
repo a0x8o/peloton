@@ -250,13 +250,16 @@ func (suite *PlacementTestSuite) TestTaskPlacementNoError() {
 		suite.cachedTask.EXPECT().
 			GetRuntime(gomock.Any()).Return(testTask.Runtime, nil),
 		suite.cachedJob.EXPECT().
-			PatchTasks(gomock.Any(), gomock.Any()).Return(nil),
+			PatchTasks(gomock.Any(), gomock.Any(), false).
+			Return(nil, nil, nil),
 		suite.cachedTask.EXPECT().
 			GetRuntime(gomock.Any()).Return(testTask.Runtime, nil),
 		suite.taskLauncher.EXPECT().
-			CreateLaunchableTasks(gomock.Any(), gomock.Any()).Return(nil, nil),
-		suite.taskLauncher.EXPECT().
-			ProcessPlacement(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil),
+			Launch(gomock.Any(), gomock.Any(), gomock.Any()).
+			Return(
+				map[string]*launcher.LaunchableTaskInfo{},
+				nil,
+			),
 		suite.goalStateDriver.EXPECT().
 			EnqueueTask(testTask.JobId, testTask.InstanceId, gomock.Any()).Return(),
 		suite.jobFactory.EXPECT().
@@ -341,20 +344,21 @@ func (suite *PlacementTestSuite) TestTaskPlacementKillSkippedTasksError() {
 		suite.cachedTask.EXPECT().
 			GetRuntime(gomock.Any()).Return(testTask.Runtime, nil),
 		suite.cachedJob.EXPECT().
-			PatchTasks(gomock.Any(), gomock.Any()).Return(nil),
+			PatchTasks(gomock.Any(), gomock.Any(), false).
+			Return(nil, nil, nil),
 		suite.cachedTask.EXPECT().
 			GetRuntime(gomock.Any()).Return(testTask.Runtime, nil),
 		suite.taskLauncher.EXPECT().
-			CreateLaunchableTasks(gomock.Any(), gomock.Any()).
-			Return(nil, map[string]*launcher.LaunchableTaskInfo{
+			Launch(gomock.Any(), gomock.Any(), gomock.Any()).Return(
+			map[string]*launcher.LaunchableTaskInfo{
 				taskID.GetValue(): {},
-			}),
+			},
+			nil,
+		),
 		suite.resMgrClient.EXPECT().
 			KillTasks(gomock.Any(), &resmgrsvc.KillTasksRequest{
 				Tasks: []*peloton.TaskID{taskID},
 			}).Return(nil, fmt.Errorf("fake kill error")),
-		suite.taskLauncher.EXPECT().
-			ProcessPlacement(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil),
 		suite.goalStateDriver.EXPECT().
 			EnqueueTask(testTask.JobId, testTask.InstanceId, gomock.Any()).Return(),
 		suite.jobFactory.EXPECT().
@@ -565,7 +569,8 @@ func (suite *PlacementTestSuite) TestTaskPlacementDBError() {
 		suite.cachedTask.EXPECT().
 			GetRuntime(gomock.Any()).Return(testTask.Runtime, nil),
 		suite.cachedJob.EXPECT().
-			PatchTasks(gomock.Any(), gomock.Any()).Return(fmt.Errorf("fake db error")),
+			PatchTasks(gomock.Any(), gomock.Any(), false).
+			Return(nil, nil, fmt.Errorf("fake db error")),
 	)
 
 	suite.pp.processPlacement(context.Background(), p)
@@ -611,14 +616,15 @@ func (suite *PlacementTestSuite) TestTaskPlacementError() {
 		suite.cachedTask.EXPECT().
 			GetRuntime(gomock.Any()).Return(testTask.Runtime, nil),
 		suite.cachedJob.EXPECT().
-			PatchTasks(gomock.Any(), gomock.Any()).Return(nil),
+			PatchTasks(gomock.Any(), gomock.Any(), false).
+			Return(nil, nil, nil),
 		suite.cachedTask.EXPECT().
 			GetRuntime(gomock.Any()).Return(testTask.Runtime, nil),
 		suite.taskLauncher.EXPECT().
-			CreateLaunchableTasks(gomock.Any(), gomock.Any()).
-			Return([]*hostsvc.LaunchableTask{{Id: taskID}}, nil),
-		suite.taskLauncher.EXPECT().
-			ProcessPlacement(gomock.Any(), gomock.Any(), gomock.Any()).Return(fmt.Errorf("fake launch error")),
+			Launch(gomock.Any(), gomock.Any(), gomock.Any()).
+			Return(
+				map[string]*launcher.LaunchableTaskInfo{},
+				fmt.Errorf("fake launch error")),
 		suite.resMgrClient.EXPECT().
 			KillTasks(gomock.Any(), &resmgrsvc.KillTasksRequest{
 				Tasks: []*peloton.TaskID{taskID},
@@ -627,7 +633,8 @@ func (suite *PlacementTestSuite) TestTaskPlacementError() {
 		suite.jobFactory.EXPECT().
 			AddJob(testTask.JobId).Return(suite.cachedJob),
 		suite.cachedJob.EXPECT().
-			PatchTasks(gomock.Any(), gomock.Any()).Return(nil),
+			PatchTasks(gomock.Any(), gomock.Any(), false).
+			Return(nil, nil, nil),
 		suite.goalStateDriver.EXPECT().
 			EnqueueTask(testTask.JobId, testTask.InstanceId, gomock.Any()).Return(),
 		suite.cachedJob.EXPECT().GetJobType().Return(job.JobType_BATCH),
@@ -680,14 +687,15 @@ func (suite *PlacementTestSuite) TestTaskPlacementPlacementResMgrError() {
 		suite.cachedTask.EXPECT().
 			GetRuntime(gomock.Any()).Return(testTask.Runtime, nil),
 		suite.cachedJob.EXPECT().
-			PatchTasks(gomock.Any(), gomock.Any()).Return(nil),
+			PatchTasks(gomock.Any(), gomock.Any(), false).
+			Return(nil, nil, nil),
 		suite.cachedTask.EXPECT().
 			GetRuntime(gomock.Any()).Return(testTask.Runtime, nil),
 		suite.taskLauncher.EXPECT().
-			CreateLaunchableTasks(gomock.Any(), gomock.Any()).Return(nil, nil),
-		suite.taskLauncher.EXPECT().
-			ProcessPlacement(gomock.Any(), gomock.Any(), gomock.Any()).
-			Return(fmt.Errorf("fake launch error")),
+			Launch(gomock.Any(), gomock.Any(), gomock.Any()).
+			Return(
+				map[string]*launcher.LaunchableTaskInfo{},
+				fmt.Errorf("fake launch error")),
 		suite.resMgrClient.EXPECT().
 			KillTasks(gomock.Any(), &resmgrsvc.KillTasksRequest{
 				Tasks: []*peloton.TaskID{taskID},
@@ -696,7 +704,8 @@ func (suite *PlacementTestSuite) TestTaskPlacementPlacementResMgrError() {
 		suite.jobFactory.EXPECT().
 			AddJob(testTask.JobId).Return(suite.cachedJob),
 		suite.cachedJob.EXPECT().
-			PatchTasks(gomock.Any(), gomock.Any()).Return(fmt.Errorf("fake db error")),
+			PatchTasks(gomock.Any(), gomock.Any(), false).
+			Return(nil, nil, fmt.Errorf("fake db error")),
 	)
 
 	suite.pp.processPlacement(context.Background(), p)

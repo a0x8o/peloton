@@ -20,7 +20,6 @@ import (
 
 	"github.com/uber/peloton/.gen/peloton/api/v0/job"
 	"github.com/uber/peloton/.gen/peloton/api/v0/peloton"
-	"github.com/uber/peloton/.gen/peloton/api/v0/respool"
 	"github.com/uber/peloton/.gen/peloton/api/v0/task"
 	"github.com/uber/peloton/.gen/peloton/api/v0/update"
 	"github.com/uber/peloton/.gen/peloton/api/v0/volume"
@@ -44,7 +43,6 @@ type Store interface {
 	TaskStore
 	UpdateStore
 	FrameworkInfoStore
-	ResourcePoolStore
 	PersistentVolumeStore
 }
 
@@ -55,19 +53,8 @@ type JobStore interface {
 	// DeleteJob deletes the job configuration, runtime
 	// and all tasks in DB of a given job
 	DeleteJob(ctx context.Context, jobID string) error
-	// GetJobsByStates gets all jobs in a given state
-	GetJobsByStates(ctx context.Context, state []job.JobState) ([]peloton.JobID, error)
 	// GetMaxJobConfigVersion returns the maximum version of configs of a given job
 	GetMaxJobConfigVersion(ctx context.Context, jobID string) (uint64, error)
-	// GetAllJobsInJobIndex returns job summary for all the jobs in the job index table
-	GetAllJobsInJobIndex(ctx context.Context) ([]*job.JobSummary, error)
-
-	// AddActiveJob adds job to active jobs table
-	AddActiveJob(ctx context.Context, id *peloton.JobID) error
-	// GetActiveJobs fetches all active jobs
-	GetActiveJobs(ctx context.Context) ([]*peloton.JobID, error)
-	// DeleteActiveJob deletes job from active jobs table
-	DeleteActiveJob(ctx context.Context, id *peloton.JobID) error
 }
 
 // TaskStore is the interface to store task states
@@ -91,24 +78,11 @@ type TaskStore interface {
 		runtime *task.RuntimeInfo,
 		jobType job.JobType) error
 
-	// CreateTaskConfig creates the task configuration
-	CreateTaskConfig(
-		ctx context.Context,
-		id *peloton.JobID,
-		instanceID int64,
-		taskConfig *task.TaskConfig,
-		configAddOn *models.ConfigAddOn,
-		version uint64,
-	) error
-
 	// GetTasksForJob gets the task info for all tasks in a job
 	GetTasksForJob(ctx context.Context, id *peloton.JobID) (map[uint32]*task.TaskInfo, error)
 	// GetTasksForJobAndStates gets the task info for all
 	// tasks in a given job and in a given state
 	GetTasksForJobAndStates(ctx context.Context, id *peloton.JobID, states []task.TaskState) (map[uint32]*task.TaskInfo, error)
-	// GetTaskIDsForJobAndState gets the task identifiers for all
-	// tasks in a given job and in a given state
-	GetTaskIDsForJobAndState(ctx context.Context, id *peloton.JobID, state string) ([]uint32, error)
 	// GetTaskRuntimesForJobByRange gets the task runtime for all
 	// tasks in a job with instanceID in the given range
 	GetTaskRuntimesForJobByRange(ctx context.Context, id *peloton.JobID, instanceRange *task.InstanceRange) (map[uint32]*task.RuntimeInfo, error)
@@ -117,8 +91,6 @@ type TaskStore interface {
 	GetTasksForJobByRange(ctx context.Context, id *peloton.JobID, Range *task.InstanceRange) (map[uint32]*task.TaskInfo, error)
 	// GetTaskForJob gets the task info for a given task
 	GetTaskForJob(ctx context.Context, jobID string, instanceID uint32) (map[uint32]*task.TaskInfo, error)
-	// GetTaskConfig gets the task config of a given task
-	GetTaskConfig(ctx context.Context, id *peloton.JobID, instanceID uint32, version uint64) (*task.TaskConfig, *models.ConfigAddOn, error)
 	// GetTaskConfigs gets the task config for all tasks in a job
 	// for all the instanceIDs provided in the input
 	GetTaskConfigs(ctx context.Context, id *peloton.JobID, instanceIDs []uint32, version uint64) (map[uint32]*task.TaskConfig, *models.ConfigAddOn, error)
@@ -126,14 +98,6 @@ type TaskStore interface {
 	GetTaskByID(ctx context.Context, taskID string) (*task.TaskInfo, error)
 	// QueryTasks queries for all tasks in a job matching the QuerySpec
 	QueryTasks(ctx context.Context, id *peloton.JobID, spec *task.QuerySpec) ([]*task.TaskInfo, uint32, error)
-	// GetTaskStateSummaryForJob gets the map state to instanceIDs
-	// (in that state) in a given job
-	GetTaskStateSummaryForJob(ctx context.Context, id *peloton.JobID) (map[string]uint32, error)
-	// GetPodEvents returns pod events (state transition for a job instance).
-	// limit parameter manages number of pod events to return
-	// and optional runID parameter to fetch pod events only for that run if
-	// not provided or unparseable then return for all runs
-	GetPodEvents(ctx context.Context, jobID string, instanceID uint32, podID ...string) ([]*task.PodEvent, error)
 	// DeleteTaskRuntime deletes the task runtime for a given job instance
 	DeleteTaskRuntime(ctx context.Context, id *peloton.JobID, instanceID uint32) error
 	// DeletePodEvents deletes the pod events for provided JobID, InstanceID and RunID in the range [fromRunID-toRunID)
@@ -206,21 +170,6 @@ type UpdateStore interface {
 		instanceID uint32,
 		limit uint32,
 	) ([]*stateless.WorkflowEvent, error)
-
-	// AddJobUpdateEvent adds an update state change event for a job
-	AddJobUpdateEvent(
-		ctx context.Context,
-		updateID *peloton.UpdateID,
-		updateType models.WorkflowType,
-		updateState update.State,
-	) error
-
-	// GetJobUpdateEvents gets update state events for a job
-	// in descending create timestamp order
-	GetJobUpdateEvents(
-		ctx context.Context,
-		updateID *peloton.UpdateID,
-	) ([]*stateless.WorkflowEvent, error)
 }
 
 // FrameworkInfoStore is the interface to store mesosStreamID for peloton frameworks
@@ -229,14 +178,6 @@ type FrameworkInfoStore interface {
 	SetMesosFrameworkID(ctx context.Context, frameworkName string, frameworkID string) error
 	GetMesosStreamID(ctx context.Context, frameworkName string) (string, error)
 	GetFrameworkID(ctx context.Context, frameworkName string) (string, error)
-}
-
-// ResourcePoolStore is the interface to store all the resource pool information
-type ResourcePoolStore interface {
-	CreateResourcePool(ctx context.Context, id *peloton.ResourcePoolID, Config *respool.ResourcePoolConfig, createdBy string) error
-	DeleteResourcePool(ctx context.Context, id *peloton.ResourcePoolID) error
-	UpdateResourcePool(ctx context.Context, id *peloton.ResourcePoolID, Config *respool.ResourcePoolConfig) error
-	GetAllResourcePools(ctx context.Context) (map[string]*respool.ResourcePoolConfig, error)
 }
 
 // PersistentVolumeStore is the interface to store all the persistent volume info
