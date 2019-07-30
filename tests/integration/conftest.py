@@ -159,7 +159,7 @@ def wait_for_mesos_master_leader(
     assert False, "timed out waiting for mesos master leader"
 
 
-def setup_minicluster():
+def setup_minicluster(enable_k8s=False):
     """
     setup minicluster
     """
@@ -168,7 +168,7 @@ def setup_minicluster():
         log.info("cluster mode")
     else:
         log.info("local minicluster mode")
-        setup(enable_peloton=True)
+        setup(enable_peloton=True, enable_k8s=enable_k8s)
         time.sleep(5)
 
 
@@ -193,9 +193,7 @@ def teardown_minicluster(dump_logs=False):
                 # TODO (varung): enable PE and mesos-master logs if needed
                 cli = Client(base_url="unix://var/run/docker.sock")
                 for c in ("peloton-jobmgr0",
-                          "peloton-resmgr0",
-                          "peloton-hostmgr0",
-                          "peloton-aurorabridge0"):
+                          "peloton-resmgr0"):
                     for l in cli.logs(c, stream=True):
                         # remove newline character when logging
                         log.info(l.rstrip())

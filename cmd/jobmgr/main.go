@@ -36,6 +36,7 @@ import (
 	"github.com/uber/peloton/pkg/common/rpc"
 	"github.com/uber/peloton/pkg/hostmgr/mesos/yarpc/peer"
 	"github.com/uber/peloton/pkg/jobmgr"
+	"github.com/uber/peloton/pkg/jobmgr/adminsvc"
 	"github.com/uber/peloton/pkg/jobmgr/cached"
 	"github.com/uber/peloton/pkg/jobmgr/goalstate"
 	"github.com/uber/peloton/pkg/jobmgr/jobsvc"
@@ -192,14 +193,6 @@ var (
 		Envar("JOB_TYPE").
 		Enum("BATCH", "SERVICE")
 
-	jobRuntimeCalculationViaCache = app.Flag(
-		"job-runtime-calculation-via-cache",
-		"Enable runtime re-calculation from cache "+
-			"when MV diverged").
-		Default("false").
-		Envar("JOB_RUNTIME_CALCULATION_VIA_CACHE").
-		Bool()
-
 	authType = app.Flag(
 		"auth-type",
 		"Define the auth type used, default to NOOP").
@@ -245,6 +238,13 @@ var (
 		Default("0").
 		Envar("EXECUTOR_SHUTDOWN_BURST_LIMIT").
 		Int()
+	hostMgrAPIVersionStr = app.Flag(
+		"hostmgr-api-version",
+		"Define the API Version of host manager",
+	).
+		Default("").
+		Envar("HOSTMGR_API_VERSION").
+		String()
 )
 
 func main() {
@@ -283,9 +283,6 @@ func main() {
 		cfg.JobManager.JobSvcCfg.EnableSecrets = true
 	}
 
-	if *jobRuntimeCalculationViaCache {
-		cfg.JobManager.JobRuntimeCalculationViaCache = true
-	}
 	// now, override any CLI flags in the loaded config.Config
 	if *httpPort != 0 {
 		cfg.JobManager.HTTPPort = *httpPort
@@ -327,6 +324,13 @@ func main() {
 		cfg.Storage.Cassandra.CassandraConn.DataCenter = *datacenter
 	}
 
+	if *hostMgrAPIVersionStr != "" {
+		hostMgrAPIVersion, err := api.ParseVersion(*hostMgrAPIVersionStr)
+		if err != nil {
+			log.WithError(err).Fatal("Failed to parse hostmgr-api-version")
+		}
+		cfg.JobManager.HostManagerAPIVersion = hostMgrAPIVersion
+	}
 	if cfg.JobManager.HostManagerAPIVersion == "" {
 		cfg.JobManager.HostManagerAPIVersion = api.V0
 	}
@@ -552,7 +556,6 @@ func main() {
 		job.JobType(job.JobType_value[*jobType]),
 		rootScope,
 		cfg.JobManager.GoalState,
-		cfg.JobManager.JobRuntimeCalculationViaCache,
 		cfg.JobManager.HostManagerAPIVersion,
 	)
 
@@ -708,6 +711,11 @@ func main() {
 		store, // store implements UpdateStore
 		goalStateDriver,
 		jobFactory,
+	)
+
+	adminsvc.InitServiceHandler(
+		dispatcher,
+		goalStateDriver,
 	)
 
 	// Start dispatch loop

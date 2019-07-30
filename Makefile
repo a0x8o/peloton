@@ -201,7 +201,6 @@ mockgens: build-mockgen gens $(GOMOCK)
 	$(call local_mockgen,pkg/hostmgr/summary,HostSummary)
 	$(call local_mockgen,pkg/hostmgr/reconcile,TaskReconciler)
 	$(call local_mockgen,pkg/hostmgr/reserver,Reserver)
-	$(call local_mockgen,pkg/hostmgr/task,StateManager)
 	$(call local_mockgen,pkg/hostmgr/watchevent,WatchProcessor)
 	$(call local_mockgen,pkg/hostmgr/mesos/yarpc/encoding/mpb,SchedulerClient;MasterOperatorClient)
 	$(call local_mockgen,pkg/hostmgr/mesos/yarpc/transport/mhttp,Inbound)
@@ -239,6 +238,7 @@ mockgens: build-mockgen gens $(GOMOCK)
 	$(call local_mockgen,.gen/peloton/api/v1alpha/pod/svc,PodServiceYARPCClient)
 	$(call local_mockgen,.gen/peloton/api/v1alpha/job/stateless/svc,JobServiceYARPCClient;JobServiceServiceListJobsYARPCClient;JobServiceServiceListPodsYARPCClient;JobServiceServiceListJobsYARPCServer;JobServiceServiceListPodsYARPCServer)
 	$(call local_mockgen,.gen/peloton/api/v1alpha/watch/svc,WatchServiceYARPCClient;WatchServiceServiceWatchYARPCClient;WatchServiceServiceWatchYARPCServer)
+	$(call local_mockgen,.gen/peloton/api/v1alpha/admin/svc,AdminServiceYARPCClient)
 	$(call local_mockgen,.gen/peloton/private/jobmgrsvc,JobManagerServiceYARPCClient)
 	$(call local_mockgen,.gen/peloton/private/hostmgr/v1alpha/svc,HostManagerServiceYARPCClient)
 	$(call local_mockgen,.gen/peloton/private/hostmgr/hostsvc,InternalHostServiceYARPCClient;InternalHostServiceServiceWatchHostSummaryEventYARPCServer;InternalHostServiceServiceWatchEventStreamEventYARPCServer)
@@ -259,9 +259,13 @@ test_pkg: $(GOCOV) $(GENS) mockgens test-containers
 unit-test: $(GOCOV) $(GENS) mockgens
 	gocov test $(ALL_PKGS) --tags "unit" | gocov report
 
-integ-test: $(GOKIND)
+batch-integ-test: $(GOKIND)
 	ls -la $(shell pwd)/bin
-	PATH="$(PATH):$(shell pwd)/bin" ./tests/run-integration-tests.sh
+	PATH="$(PATH):$(shell pwd)/bin" ./tests/run-batch-integration-tests.sh
+
+stateless-integ-test: $(GOKIND)
+	ls -la $(shell pwd)/bin
+	PATH="$(PATH):$(shell pwd)/bin" ./tests/run-stateless-integration-tests.sh
 
 aurorabridge-integ-test: $(GOKIND)
 	ls -la $(shell pwd)/bin

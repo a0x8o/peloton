@@ -83,23 +83,24 @@ func (suite *DriverTestSuite) SetupTest() {
 	suite.jobFactory = cachedmocks.NewMockJobFactory(suite.ctrl)
 	suite.mockedPodEventsOps = objectmocks.NewMockPodEventsOps(suite.ctrl)
 	suite.goalStateDriver = &driver{
-		jobEngine:                     suite.jobGoalStateEngine,
-		taskEngine:                    suite.taskGoalStateEngine,
-		updateEngine:                  suite.updateGoalStateEngine,
-		jobStore:                      suite.jobStore,
-		taskStore:                     suite.taskStore,
-		activeJobsOps:                 suite.activeJobsOps,
-		jobConfigOps:                  suite.jobConfigOps,
-		jobRuntimeOps:                 suite.jobRuntimeOps,
-		podEventsOps:                  suite.mockedPodEventsOps,
-		jobFactory:                    suite.jobFactory,
-		mtx:                           NewMetrics(tally.NoopScope),
-		jobScope:                      tally.NoopScope,
-		cfg:                           &Config{},
-		jobType:                       job.JobType_BATCH,
-		jobRuntimeCalculationViaCache: false,
+		jobEngine:     suite.jobGoalStateEngine,
+		taskEngine:    suite.taskGoalStateEngine,
+		updateEngine:  suite.updateGoalStateEngine,
+		jobStore:      suite.jobStore,
+		taskStore:     suite.taskStore,
+		activeJobsOps: suite.activeJobsOps,
+		jobConfigOps:  suite.jobConfigOps,
+		jobRuntimeOps: suite.jobRuntimeOps,
+		podEventsOps:  suite.mockedPodEventsOps,
+		jobFactory:    suite.jobFactory,
+		mtx:           NewMetrics(tally.NoopScope),
+		jobScope:      tally.NoopScope,
+		cfg:           &Config{},
+		jobType:       job.JobType_BATCH,
 	}
 	suite.goalStateDriver.cfg.normalize()
+	suite.goalStateDriver.setState(stopped)
+	suite.goalStateDriver.setCacheState(cleaned)
 	suite.cachedJob = cachedmocks.NewMockJob(suite.ctrl)
 	suite.jobID = &peloton.JobID{Value: uuid.NewRandom().String()}
 	suite.updateID = &peloton.UpdateID{Value: uuid.NewRandom().String()}
@@ -139,7 +140,6 @@ func (suite *DriverTestSuite) TestNewDriver() {
 		job.JobType_SERVICE,
 		tally.NoopScope,
 		config,
-		false,
 		api.V0,
 	)
 	suite.NotNil(dr)
@@ -157,7 +157,6 @@ func (suite *DriverTestSuite) TestNewDriver() {
 		job.JobType_SERVICE,
 		tally.NoopScope,
 		config,
-		false,
 		api.V1Alpha,
 	)
 	suite.NotNil(dr)
@@ -661,6 +660,168 @@ func (suite *DriverTestSuite) TestEngineStartStop() {
 	suite.jobGoalStateEngine.EXPECT().Delete(gomock.Any())
 	suite.updateGoalStateEngine.EXPECT().Delete(gomock.Any())
 
-	suite.goalStateDriver.Stop()
+	suite.goalStateDriver.Stop(true)
 	suite.False(suite.goalStateDriver.Started())
+}
+
+// Test the case of starting a driver that has already been started
+func (suite *DriverTestSuite) TestEngineStartAlreadyStartedDriver() {
+	// noop for starting a starting driver with clean cache
+	suite.goalStateDriver.setState(starting)
+	suite.goalStateDriver.setCacheState(cleaned)
+	suite.goalStateDriver.Start()
+	suite.Equal(suite.goalStateDriver.getState(), starting)
+
+	// noop for starting a started driver with clean cache
+	suite.goalStateDriver.setState(started)
+	suite.goalStateDriver.setCacheState(cleaned)
+	suite.goalStateDriver.Start()
+	suite.Equal(suite.goalStateDriver.getState(), started)
+
+	// noop for starting a starting driver with populated cache
+	suite.goalStateDriver.setState(starting)
+	suite.goalStateDriver.setCacheState(populated)
+	suite.goalStateDriver.Start()
+	suite.Equal(suite.goalStateDriver.getState(), starting)
+
+	// noop for starting a started driver with populated cache
+	suite.goalStateDriver.setState(started)
+	suite.goalStateDriver.setCacheState(populated)
+	suite.goalStateDriver.Start()
+	suite.Equal(suite.goalStateDriver.getState(), started)
+}
+
+// Test the case of starting a driver that is stopped but with cache populated
+func (suite *DriverTestSuite) TestEngineStartStoppedDriverWithCachePopulated() {
+	// start the stopping engines without loading cache
+	suite.jobGoalStateEngine.EXPECT().Start()
+	suite.taskGoalStateEngine.EXPECT().Start()
+	suite.updateGoalStateEngine.EXPECT().Start()
+
+	suite.goalStateDriver.setState(stopping)
+	suite.goalStateDriver.setCacheState(populated)
+	suite.goalStateDriver.Start()
+	suite.Equal(suite.goalStateDriver.getState(), started)
+
+	// start the stopped engines without loading cache
+	suite.jobGoalStateEngine.EXPECT().Start()
+	suite.taskGoalStateEngine.EXPECT().Start()
+	suite.updateGoalStateEngine.EXPECT().Start()
+
+	suite.goalStateDriver.setState(stopped)
+	suite.goalStateDriver.setCacheState(populated)
+	suite.goalStateDriver.Start()
+	suite.Equal(suite.goalStateDriver.getState(), started)
+}
+
+// Test the case of starting a driver that is stopped and with cache populated
+func (suite *DriverTestSuite) TestEngineStartStoppedDriverWithoutCachePopulated() {
+	// start the stopped engines and load cache
+	suite.activeJobsOps.EXPECT().GetAll(gomock.Any()).Return(nil, nil)
+	suite.jobGoalStateEngine.EXPECT().Start()
+	suite.taskGoalStateEngine.EXPECT().Start()
+	suite.updateGoalStateEngine.EXPECT().Start()
+
+	suite.goalStateDriver.setState(stopping)
+	suite.goalStateDriver.setCacheState(cleaned)
+	suite.goalStateDriver.Start()
+	suite.Equal(suite.goalStateDriver.getState(), started)
+
+	// start the stopped engines and load cache
+	suite.activeJobsOps.EXPECT().GetAll(gomock.Any()).Return(nil, nil)
+	suite.jobGoalStateEngine.EXPECT().Start()
+	suite.taskGoalStateEngine.EXPECT().Start()
+	suite.updateGoalStateEngine.EXPECT().Start()
+
+	suite.goalStateDriver.setState(stopped)
+	suite.goalStateDriver.setCacheState(cleaned)
+	suite.goalStateDriver.Start()
+	suite.Equal(suite.goalStateDriver.getState(), started)
+}
+
+// Test the case of stopping a driver that has already been stopped without cleaning cache
+func (suite *DriverTestSuite) TestEngineStopStoppedDriverWithoutCleanUpCache() {
+	// noop for starting a stopping driver with clean cache
+	suite.goalStateDriver.setState(stopping)
+	suite.goalStateDriver.setCacheState(cleaned)
+	suite.goalStateDriver.Stop(false)
+	suite.Equal(suite.goalStateDriver.getState(), stopping)
+
+	// noop for starting a stopped driver with clean cache
+	suite.goalStateDriver.setState(stopped)
+	suite.goalStateDriver.setCacheState(cleaned)
+	suite.goalStateDriver.Stop(false)
+	suite.Equal(suite.goalStateDriver.getState(), stopped)
+
+	// noop for stopping a stopping driver with populated cache
+	suite.goalStateDriver.setState(stopping)
+	suite.goalStateDriver.setCacheState(populated)
+	suite.goalStateDriver.Stop(false)
+	suite.Equal(suite.goalStateDriver.getState(), stopping)
+
+	// noop for stopping a stopped driver with populated cache
+	suite.goalStateDriver.setState(stopped)
+	suite.goalStateDriver.setCacheState(populated)
+	suite.goalStateDriver.Stop(false)
+	suite.Equal(suite.goalStateDriver.getState(), stopped)
+}
+
+// Test the case of stopping a driver that has already been stopped with cleaning cache
+func (suite *DriverTestSuite) TestEngineStopStoppedDriverWithCleanUpCache() {
+	// noop for starting a stopping driver with clean cache
+	suite.goalStateDriver.setState(stopping)
+	suite.goalStateDriver.setCacheState(cleaned)
+	suite.goalStateDriver.Stop(true)
+	suite.Equal(suite.goalStateDriver.getState(), stopping)
+
+	// noop for starting a stopped driver with clean cache
+	suite.goalStateDriver.setState(stopped)
+	suite.goalStateDriver.setCacheState(cleaned)
+	suite.goalStateDriver.Stop(true)
+	suite.Equal(suite.goalStateDriver.getState(), stopped)
+
+	// cache needs to be cleaned up
+	cachedTask := cachedmocks.NewMockTask(suite.ctrl)
+	cachedUpdate := cachedmocks.NewMockUpdate(suite.ctrl)
+	taskMap := make(map[uint32]cached.Task)
+	taskMap[0] = cachedTask
+
+	jobMap := make(map[string]cached.Job)
+	jobMap[suite.jobID.GetValue()] = suite.cachedJob
+
+	updateMap := make(map[string]cached.Update)
+	updateMap[suite.updateID.GetValue()] = cachedUpdate
+
+	suite.jobGoalStateEngine.EXPECT().Stop()
+	suite.taskGoalStateEngine.EXPECT().Stop()
+	suite.updateGoalStateEngine.EXPECT().Stop()
+	suite.jobFactory.EXPECT().GetAllJobs().Return(jobMap)
+	suite.cachedJob.EXPECT().GetAllTasks().Return(taskMap)
+	suite.cachedJob.EXPECT().GetAllWorkflows().Return(updateMap)
+	suite.taskGoalStateEngine.EXPECT().Delete(gomock.Any())
+	suite.jobGoalStateEngine.EXPECT().Delete(gomock.Any())
+	suite.updateGoalStateEngine.EXPECT().Delete(gomock.Any())
+
+	suite.goalStateDriver.setState(stopping)
+	suite.goalStateDriver.setCacheState(populated)
+	suite.goalStateDriver.Stop(true)
+	suite.Equal(suite.goalStateDriver.getState(), stopped)
+	suite.Equal(suite.goalStateDriver.getCacheState(), cleaned)
+
+	// cache needs to be cleaned up
+	suite.jobGoalStateEngine.EXPECT().Stop()
+	suite.taskGoalStateEngine.EXPECT().Stop()
+	suite.updateGoalStateEngine.EXPECT().Stop()
+	suite.jobFactory.EXPECT().GetAllJobs().Return(jobMap)
+	suite.cachedJob.EXPECT().GetAllTasks().Return(taskMap)
+	suite.cachedJob.EXPECT().GetAllWorkflows().Return(updateMap)
+	suite.taskGoalStateEngine.EXPECT().Delete(gomock.Any())
+	suite.jobGoalStateEngine.EXPECT().Delete(gomock.Any())
+	suite.updateGoalStateEngine.EXPECT().Delete(gomock.Any())
+
+	suite.goalStateDriver.setState(stopped)
+	suite.goalStateDriver.setCacheState(populated)
+	suite.goalStateDriver.Stop(true)
+	suite.Equal(suite.goalStateDriver.getState(), stopped)
+	suite.Equal(suite.goalStateDriver.getCacheState(), cleaned)
 }
