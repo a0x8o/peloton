@@ -326,18 +326,26 @@ func (s *HostMgrOfferHandlerTestSuite) TestStatusUpdateDedupe() {
 
 	s.store.EXPECT().
 		GetFrameworkID(gomock.Any(), gomock.Eq(_frameworkName)).
-		Return(value, nil).AnyTimes()
+		Return(value, nil).
+		AnyTimes()
 	s.store.EXPECT().
 		GetMesosStreamID(gomock.Any(), gomock.Eq(_frameworkName)).
-		Return(_streamID, nil).AnyTimes()
-	s.schedulerClient.EXPECT().Call(_streamID, msg).Return(nil)
+		Return(_streamID, nil).
+		AnyTimes()
+	// Acknowledge call can happen multiple times, as multiple go-routines
+	// process simultaneously
+	s.schedulerClient.EXPECT().
+		Call(_streamID, msg).
+		Return(nil).
+		MinTimes(1)
 
 	handler.EventPurged(items)
 	handler.UpdateCounters()
 
 	// Four ack are deduped
-	s.Equal(int64(4), s.testScope.Snapshot().Counters()["task_update_ack_dedupe+"].Value())
-	s.Equal(float64(1), s.testScope.Snapshot().Gauges()["task_ack_map_size+"].Value())
+	// Since ack uses multiple go-routines, can not use precise values for comparison
+	s.True(s.testScope.Snapshot().Counters()["task_update_ack_dedupe+"].Value() <= int64(4))
+	s.True(s.testScope.Snapshot().Gauges()["task_ack_map_size+"].Value() >= float64(1))
 
 	time.Sleep(500 * time.Millisecond)
 }

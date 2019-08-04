@@ -462,6 +462,8 @@ func main() {
 			Fatal("Could not create rate limit middleware")
 	}
 	authInboundMiddleware := inbound.NewAuthInboundMiddleware(securityManager)
+	apiLockInboundMiddleware := inbound.NewAPILockInboundMiddleware(&cfg.APILock)
+
 	yarpcMetricsMiddleware := &inbound.YAPRCMetricsInboundMiddleware{Scope: rootScope.SubScope("yarpc")}
 
 	securityClient, err := auth_impl.CreateNewSecurityClient(&cfg.Auth)
@@ -480,9 +482,9 @@ func main() {
 			Tally: rootScope,
 		},
 		InboundMiddleware: yarpc.InboundMiddleware{
-			Unary:  yarpc.UnaryInboundMiddleware(rateLimitMiddleware, authInboundMiddleware, yarpcMetricsMiddleware),
-			Stream: yarpc.StreamInboundMiddleware(rateLimitMiddleware, authInboundMiddleware, yarpcMetricsMiddleware),
-			Oneway: yarpc.OnewayInboundMiddleware(rateLimitMiddleware, authInboundMiddleware, yarpcMetricsMiddleware),
+			Unary:  yarpc.UnaryInboundMiddleware(apiLockInboundMiddleware, rateLimitMiddleware, authInboundMiddleware, yarpcMetricsMiddleware),
+			Stream: yarpc.StreamInboundMiddleware(apiLockInboundMiddleware, rateLimitMiddleware, authInboundMiddleware, yarpcMetricsMiddleware),
+			Oneway: yarpc.OnewayInboundMiddleware(apiLockInboundMiddleware, rateLimitMiddleware, authInboundMiddleware, yarpcMetricsMiddleware),
 		},
 		OutboundMiddleware: yarpc.OutboundMiddleware{
 			Unary:  authOutboundMiddleware,
@@ -538,7 +540,6 @@ func main() {
 		dispatcher,
 		common.PelotonHostManager,
 		jobFactory,
-		store, // store implements VolumeStore
 		ormStore,
 		rootScope,
 		cfg.JobManager.HostManagerAPIVersion,
@@ -552,7 +553,6 @@ func main() {
 		store, // store implements UpdateStore
 		ormStore,
 		jobFactory,
-		launcher.GetLauncher(),
 		job.JobType(job.JobType_value[*jobType]),
 		rootScope,
 		cfg.JobManager.GoalState,
@@ -716,6 +716,7 @@ func main() {
 	adminsvc.InitServiceHandler(
 		dispatcher,
 		goalStateDriver,
+		apiLockInboundMiddleware,
 	)
 
 	// Start dispatch loop

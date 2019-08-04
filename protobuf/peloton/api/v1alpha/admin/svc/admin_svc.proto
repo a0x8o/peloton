@@ -10,6 +10,11 @@ option java_package = "peloton.api.v1alpha.admin.svc";
 // Component that can be locked/unlocked
 enum Component {
     GoalStateEngine = 0;
+    Read = 1;
+    Write = 2;
+    Kill = 3;
+    // Not supported yet
+    Launch = 4;
 }
 
 // Message for faliure to lock/unlock a component

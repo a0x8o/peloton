@@ -636,10 +636,18 @@ var (
 	admin = app.Command("admin", "administrative APIs")
 	// command for locking down components
 	lock           = admin.Command("lock", "lock down components in peloton")
-	lockComponents = lock.Arg("components", "components to lockdown").Enums("GoalStateEngine")
+	lockComponents = lock.Arg("components", "components to lockdown. "+
+		"Now support GoalStateEngine, Read, Write, Kill").
+		Enums("GoalStateEngine", "Read", "Write", "Kill")
 	// command for unlock components
 	unlock           = admin.Command("unlock", "remove lock down components in peloton")
-	unlockComponents = unlock.Arg("components", "components to remove lockdown").Enums("GoalStateEngine")
+	unlockComponents = unlock.Arg("components", "components to remove lockdown. "+
+		"Now support GoalStateEngine, Read, Write").
+		Enums("GoalStateEngine", "Read", "Write", "Kill")
+
+	// Top level hostcache commands
+	hostcache     = hostmgr.Command("hostcache", "manage hostcache")
+	hostcacheDump = hostcache.Command("dump", "dump hostcache contents")
 )
 
 // TaskRangeValue allows us to define a new target type for kingpin to allow specifying ranges of tasks with from:to syntax as a TaskRangeFlag
@@ -851,6 +859,8 @@ func main() {
 		err = client.HostMaintenanceCompleteAction(*hostMaintenanceCompleteHostname)
 	case hostQuery.FullCommand():
 		err = client.HostQueryAction(*hostQueryStates)
+	case hostcacheDump.FullCommand():
+		err = client.HostCacheDump()
 	case jobMgrThrottledPods.FullCommand():
 		err = client.JobMgrGetThrottledPods()
 	case jobMgrQueryJobCache.FullCommand():

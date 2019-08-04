@@ -38,6 +38,8 @@ const (
 	PelotonResourceManager = "peloton-resmgr"
 	// PelotonHostManager application name
 	PelotonHostManager = "peloton-hostmgr"
+	// PelotonV1HostManager application name
+	PelotonV1HostManager = "peloton-v1-hostmgr"
 	// PelotonPlacement application name
 	PelotonPlacement = "peloton-placement"
 	// PelotonCLI application name
@@ -45,6 +47,8 @@ const (
 	// PelotonAuroraBridge application name
 	PelotonAuroraBridge = "peloton-aurorabridge"
 
+	// Cqos advisor application name
+	QoSAdvisorService = "qosadvisorservice"
 	// PlacementRole is the leadership election role for placement engine
 	PlacementRole = "placement"
 	// HostManagerRole is the leadership election role for hostmgr
