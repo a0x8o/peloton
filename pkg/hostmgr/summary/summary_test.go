@@ -17,6 +17,7 @@ package summary
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strconv"
 	"testing"
 	"time"
@@ -25,7 +26,6 @@ import (
 	"github.com/uber/peloton/.gen/peloton/api/v0/peloton"
 	"github.com/uber/peloton/.gen/peloton/api/v0/task"
 	"github.com/uber/peloton/.gen/peloton/private/hostmgr/hostsvc"
-
 	"github.com/uber/peloton/pkg/common"
 	"github.com/uber/peloton/pkg/common/constraints"
 	constraint_mocks "github.com/uber/peloton/pkg/common/constraints/mocks"
@@ -524,6 +524,7 @@ func (suite *HostOfferSummaryTestSuite) TestScarceResourcesConstraint() {
 				offerMap,
 				tt.filter,
 				nil,
+				nil,
 				scalar.FromMesosResources(tt.agent.GetResources()),
 				tt.scarceResourceType),
 			tt.msg,
@@ -613,7 +614,7 @@ func (suite *HostOfferSummaryTestSuite) TestSlackResourcesConstraint() {
 			},
 		}
 
-		match := s.TryMatch(filter, nil)
+		match := s.TryMatch(filter, nil, nil)
 		suite.Equal(tt.wantResult, match.Result,
 			"test case is %s", ttName)
 
@@ -823,7 +824,7 @@ func (suite *HostOfferSummaryTestSuite) TestTryMatchSchedulingConstraint() {
 				Return(tt.evaluateRes, tt.evaluateErr)
 		}
 		mockProcessor.EXPECT().NotifyEventChange(gomock.Any())
-		match := s.TryMatch(filter, mockEvaluator)
+		match := s.TryMatch(filter, mockEvaluator, nil)
 		suite.Equal(tt.wantResult, match.Result,
 			"test case is %s", ttName)
 
@@ -914,7 +915,8 @@ func (suite *HostOfferSummaryTestSuite) TestTryMatchHostOnHeld() {
 			nil,
 			offer.GetHostname(),
 			supportedSlackResourceTypes,
-			time.Duration(30*time.Second), mockProcessor).(*hostSummary)
+			time.Duration(30*time.Second),
+			mockProcessor).(*hostSummary)
 		s.status = tt.initialStatus
 		s.offerIDgenerator = seqIDGenerator(tt.offerID)
 
@@ -947,7 +949,7 @@ func (suite *HostOfferSummaryTestSuite) TestTryMatchHostOnHeld() {
 				Return(tt.evaluateRes, tt.evaluateErr)
 		}
 		mockProcessor.EXPECT().NotifyEventChange(gomock.Any())
-		match := s.TryMatch(filter, mockEvaluator)
+		match := s.TryMatch(filter, mockEvaluator, nil)
 		suite.Equal(tt.wantResult, match.Result,
 			"test case is %s", ttName)
 
@@ -962,6 +964,167 @@ func (suite *HostOfferSummaryTestSuite) TestTryMatchHostOnHeld() {
 		_, _, afterStatus := s.UnreservedAmount()
 		suite.Equal(tt.afterStatus, afterStatus, "test case is %s", ttName)
 	}
+}
+
+func (suite *HostOfferSummaryTestSuite) TestTryMatchTaskAffinity() {
+	defer suite.ctrl.Finish()
+
+	taskID := "673b91dd-f7ce-4c83-a0d2-4057878ea50a-1-1"
+	taskID2 := "473b91dd-f7ce-4c83-a0d2-4057878ea50a-1-1"
+	offer := suite.createUnreservedMesosOffer("offer-id")
+	offers := suite.createUnreservedMesosOffers(5)
+	ctrl := gomock.NewController(suite.T())
+	mockEvaluator := constraint_mocks.NewMockEvaluator(ctrl)
+	mockProcessor := watchmocks.NewMockWatchProcessor(ctrl)
+	lv := constraints.GetHostLabelValues(_testAgent, offer.Attributes)
+	seqIDGenerator := func(i string) func() string {
+		return func() string {
+			return i
+		}
+	}
+	label := &peloton.Label{
+		Key:   "key1",
+		Value: "value1",
+	}
+	filterHostLimit1 := &hostsvc.HostFilter{
+		SchedulingConstraint: &task.Constraint{
+			Type: task.Constraint_LABEL_CONSTRAINT,
+			LabelConstraint: &task.LabelConstraint{
+				Kind:        task.LabelConstraint_TASK,
+				Label:       label,
+				Requirement: 1,
+			},
+		},
+	}
+	filterHostLimit2 := &hostsvc.HostFilter{
+		SchedulingConstraint: &task.Constraint{
+			Type: task.Constraint_LABEL_CONSTRAINT,
+			LabelConstraint: &task.LabelConstraint{
+				Kind:        task.LabelConstraint_TASK,
+				Label:       label,
+				Requirement: 2,
+			},
+		},
+	}
+	filterHostLimit1DifferentService := &hostsvc.HostFilter{
+		SchedulingConstraint: &task.Constraint{
+			Type: task.Constraint_LABEL_CONSTRAINT,
+			LabelConstraint: &task.LabelConstraint{
+				Kind: task.LabelConstraint_TASK,
+				Label: &peloton.Label{
+					Key:   "key2",
+					Value: "value2",
+				},
+				Requirement: 1,
+			},
+		},
+	}
+
+	hs := New(
+		nil,
+		offer.GetHostname(),
+		nil,
+		time.Duration(30*time.Second),
+		mockProcessor).(*hostSummary)
+	hs.offerIDgenerator = seqIDGenerator("1")
+	hs.status = ReadyHost
+	hs.AddMesosOffers(context.Background(), offers)
+
+	mockEvaluator.
+		EXPECT().
+		Evaluate(
+			gomock.Eq(filterHostLimit1.SchedulingConstraint),
+			gomock.Eq(lv)).
+		Return(constraints.EvaluateResultMatch, nil).
+		AnyTimes()
+	mockEvaluator.
+		EXPECT().
+		Evaluate(
+			gomock.Eq(filterHostLimit2.SchedulingConstraint),
+			gomock.Eq(lv)).
+		Return(constraints.EvaluateResultMatch, nil).
+		AnyTimes()
+	mockEvaluator.
+		EXPECT().
+		Evaluate(
+			gomock.Eq(filterHostLimit1DifferentService.SchedulingConstraint),
+			gomock.Eq(lv)).
+		Return(constraints.EvaluateResultMatch, nil).
+		AnyTimes()
+	mockProcessor.
+		EXPECT().
+		NotifyEventChange(gomock.Any()).
+		AnyTimes()
+
+	// No tasks running on this host, so task is matched
+	match := hs.TryMatch(
+		filterHostLimit1,
+		mockEvaluator,
+		nil,
+	)
+	suite.Equal(hostsvc.HostFilterResult_MATCH, match.Result)
+
+	hs.UpdateTasksOnHost(taskID,
+		task.TaskState_LAUNCHED,
+		&task.TaskInfo{
+			Config: &task.TaskConfig{
+				Labels: []*peloton.Label{label},
+			},
+			Runtime: &task.RuntimeInfo{
+				State: task.TaskState_LAUNCHED,
+			},
+		},
+	)
+	hs.status = ReadyHost
+	hs.AddMesosOffers(context.Background(), offers)
+
+	// One task is running, try to place task of same service with host limit 1
+	match = hs.TryMatch(
+		filterHostLimit1,
+		mockEvaluator,
+		nil,
+	)
+	suite.Equal(hostsvc.HostFilterResult_MISMATCH_CONSTRAINTS, match.Result)
+
+	// One task is running, now try to place task of same service with host limit 2
+	match = hs.TryMatch(
+		filterHostLimit2,
+		mockEvaluator,
+		nil,
+	)
+	suite.Equal(hostsvc.HostFilterResult_MATCH, match.Result)
+
+	hs.UpdateTasksOnHost(taskID2,
+		task.TaskState_LAUNCHED,
+		&task.TaskInfo{
+			Config: &task.TaskConfig{
+				Labels: []*peloton.Label{label},
+			},
+			Runtime: &task.RuntimeInfo{
+				State: task.TaskState_LAUNCHED,
+			},
+		},
+	)
+	hs.status = ReadyHost
+	hs.AddMesosOffers(context.Background(), offers)
+
+	// Two tasks are running on same host for same service,
+	// now thrid task cannot run with host limit 2
+	match = hs.TryMatch(
+		filterHostLimit2,
+		mockEvaluator,
+		nil,
+	)
+	suite.Equal(hostsvc.HostFilterResult_MISMATCH_CONSTRAINTS, match.Result)
+
+	// Two tasks running for same service on same host,
+	// try to place one task of different service on same host
+	match = hs.TryMatch(
+		filterHostLimit1DifferentService,
+		mockEvaluator,
+		nil,
+	)
+	suite.Equal(hostsvc.HostFilterResult_MATCH, match.Result)
 }
 
 func (suite *HostOfferSummaryTestSuite) TestResetExpiredPlacingOfferStatus() {
@@ -1001,7 +1164,12 @@ func (suite *HostOfferSummaryTestSuite) TestResetExpiredPlacingOfferStatus() {
 	}
 	suite.watchProcessor.EXPECT().NotifyEventChange(gomock.Any()).AnyTimes()
 	for _, tt := range testTable {
-		s := New(nil, hostname, supportedSlackResourceTypes, time.Duration(30*time.Second), suite.watchProcessor).(*hostSummary)
+		s := New(
+			nil,
+			hostname,
+			supportedSlackResourceTypes,
+			time.Duration(30*time.Second),
+			suite.watchProcessor).(*hostSummary)
 		s.status = tt.initialStatus
 		s.statusPlacingOfferExpiration = tt.statusPlacingOfferExpiration
 		s.AddMesosOffers(context.Background(), offers)
@@ -1013,7 +1181,11 @@ func (suite *HostOfferSummaryTestSuite) TestResetExpiredPlacingOfferStatus() {
 		}
 	}
 
-	s := New(nil, hostname, supportedSlackResourceTypes, time.Duration(30*time.Second), suite.watchProcessor).(*hostSummary)
+	s := New(nil,
+		hostname,
+		supportedSlackResourceTypes,
+		time.Duration(30*time.Second),
+		suite.watchProcessor).(*hostSummary)
 	s.AddMesosOffers(context.Background(), offers)
 	s.statusPlacingOfferExpiration = now.Add(-10 * time.Minute)
 	invalidCacheStatus := s.CasStatus(PlacingHost, ReadyHost)
@@ -1130,7 +1302,12 @@ func (suite *HostOfferSummaryTestSuite) TestResetExpiredHeldOfferStatus() {
 	}
 
 	for _, tt := range testTable {
-		s := New(nil, "host1", supportedSlackResourceTypes, time.Duration(30*time.Second), suite.watchProcessor).(*hostSummary)
+		s := New(
+			nil,
+			"host1",
+			supportedSlackResourceTypes,
+			time.Duration(30*time.Second),
+			suite.watchProcessor).(*hostSummary)
 		s.status = tt.initialStatus
 		for _, task := range tt.tasksHeld {
 			s.heldTasks[task.taskHeld.GetValue()] = task.statusHeldHostExpiration
@@ -1228,12 +1405,28 @@ func (suite *HostOfferSummaryTestSuite) TestClaimForUnreservedOffersForLaunch() 
 		for _, heldTask := range tt.heldTasks {
 			s.HoldForTask(heldTask)
 		}
+
+		var launchableTask []*hostsvc.LaunchableTask
+		for _, t := range tt.claimTasks {
+			mesosTaskID := fmt.Sprintf("%s-%d", t.GetValue(), 1)
+			launchableTask = append(launchableTask, &hostsvc.LaunchableTask{
+				TaskId: &mesos.TaskID{
+					Value: &mesosTaskID,
+				},
+				Config: &task.TaskConfig{
+					Name: t.GetValue(),
+				},
+			})
+		}
+
 		suite.Len(s.GetHeldTask(), len(tt.heldTasks))
 		suite.watchProcessor.EXPECT().NotifyEventChange(gomock.Any()).AnyTimes()
-		_, err := s.ClaimForLaunch(offers[0].GetId().GetValue(), tt.claimTasks...)
+		_, err := s.ClaimForLaunch(offers[0].GetId().GetValue(), launchableTask, tt.claimTasks...)
 		if err != nil {
 			suite.Equal(err.Error(), tt.err.Error(), tt.name)
 		}
+
+		suite.Equal(len(tt.claimTasks), len(s.GetTasks()), tt.name)
 		suite.Equal(s.status, tt.afterStatus, tt.name)
 		suite.Equal(s.readyCount.Load(), tt.expectedReadyCount, tt.name)
 		summaryOffers := s.GetOffers(Unreserved)
@@ -1249,10 +1442,20 @@ func (suite *HostOfferSummaryTestSuite) TestHoldAndReleaseTask() {
 	defer suite.ctrl.Finish()
 
 	hostname0 := "hostname-0"
-	hs0 := New(nil, hostname0, supportedSlackResourceTypes, time.Duration(30*time.Second), suite.watchProcessor).(*hostSummary)
+	hs0 := New(
+		nil,
+		hostname0,
+		supportedSlackResourceTypes,
+		time.Duration(30*time.Second),
+		suite.watchProcessor).(*hostSummary)
 
 	hostname1 := "hostname-1"
-	hs1 := New(nil, hostname1, supportedSlackResourceTypes, time.Duration(30*time.Second), suite.watchProcessor).(*hostSummary)
+	hs1 := New(
+		nil,
+		hostname1,
+		supportedSlackResourceTypes,
+		time.Duration(30*time.Second),
+		suite.watchProcessor).(*hostSummary)
 
 	suite.watchProcessor.EXPECT().NotifyEventChange(gomock.Any()).AnyTimes()
 	t1 := &peloton.TaskID{Value: "t1"}
@@ -1293,4 +1496,36 @@ func (suite *HostOfferSummaryTestSuite) TestReturnPlacingHost() {
 	suite.NoError(hs.ReturnPlacingHost())
 	suite.Equal(hs.GetHostStatus(), HeldHost)
 
+}
+
+// Tests host to task map is updated correctly on terminal and non-terminal
+// task update status.
+func (suite *HostOfferSummaryTestSuite) TestHostToTaskMap() {
+	defer suite.ctrl.Finish()
+
+	taskID := "673b91dd-f7ce-4c83-a0d2-4057878ea50a-1-1"
+
+	hs := New(
+		nil,
+		_testAgent,
+		supportedSlackResourceTypes,
+		time.Duration(30*time.Second),
+		suite.watchProcessor).(*hostSummary)
+	suite.watchProcessor.EXPECT().NotifyEventChange(gomock.Any()).AnyTimes()
+
+	// Add task first time on recovery or launch
+	hs.UpdateTasksOnHost(taskID, task.TaskState_LAUNCHED, &task.TaskInfo{
+		Config: &task.TaskConfig{},
+		Runtime: &task.RuntimeInfo{
+			State: task.TaskState_LAUNCHED,
+		},
+	})
+
+	// update task state in host_to_task_map
+	hs.UpdateTasksOnHost(taskID, task.TaskState_RUNNING, nil)
+	suite.Equal(1, len(hs.GetTasks()))
+
+	// On terminal event, remove the task from host_to_task_map
+	hs.UpdateTasksOnHost(taskID, task.TaskState_SUCCEEDED, nil)
+	suite.Equal(0, len(hs.GetTasks()))
 }

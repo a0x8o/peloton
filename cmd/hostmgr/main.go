@@ -21,7 +21,6 @@ import (
 	"time"
 
 	"github.com/uber/peloton/.gen/peloton/private/resmgrsvc"
-
 	cqos "github.com/uber/peloton/.gen/qos/v1alpha1"
 	"github.com/uber/peloton/pkg/auth"
 	auth_impl "github.com/uber/peloton/pkg/auth/impl"
@@ -38,6 +37,7 @@ import (
 	"github.com/uber/peloton/pkg/hostmgr"
 	bin_packing "github.com/uber/peloton/pkg/hostmgr/binpacking"
 	"github.com/uber/peloton/pkg/hostmgr/host"
+	"github.com/uber/peloton/pkg/hostmgr/hostpool/manager"
 	"github.com/uber/peloton/pkg/hostmgr/hostsvc"
 	"github.com/uber/peloton/pkg/hostmgr/mesos"
 	"github.com/uber/peloton/pkg/hostmgr/mesos/yarpc/encoding/mpb"
@@ -224,6 +224,12 @@ var (
 		"Enable k8s plugin").
 		Envar("ENABLE_K8S").
 		Bool()
+
+	enableHostPool = app.Flag(
+		"enable-host-pool",
+		"Enable Host Pool Management").
+		Envar("ENABLE_HOST_POOL").
+		Bool()
 )
 
 func main() {
@@ -347,6 +353,11 @@ func main() {
 
 	if *qoSAdvisorServiceAddress != "" {
 		cfg.HostManager.QoSAdvisorService.Address = *qoSAdvisorServiceAddress
+	}
+
+	if *enableHostPool {
+		log.Info("Host Pool Management Enabled")
+		cfg.HostManager.EnableHostPool = *enableHostPool
 	}
 
 	log.WithField("config", cfg).Info("Loaded Host Manager configuration")
@@ -488,6 +499,7 @@ func main() {
 	}
 
 	authOutboundMiddleware := outbound.NewAuthOutboundMiddleware(securityClient)
+	leaderCheckMiddleware := &inbound.LeaderCheckInboundMiddleware{}
 
 	dispatcher := yarpc.NewDispatcher(yarpc.Config{
 		Name:      common.PelotonHostManager,
@@ -497,9 +509,9 @@ func main() {
 			Tally: rootScope,
 		},
 		InboundMiddleware: yarpc.InboundMiddleware{
-			Unary:  authInboundMiddleware,
-			Oneway: authInboundMiddleware,
-			Stream: authInboundMiddleware,
+			Unary:  yarpc.UnaryInboundMiddleware(authInboundMiddleware, leaderCheckMiddleware),
+			Oneway: yarpc.OnewayInboundMiddleware(authInboundMiddleware, leaderCheckMiddleware),
+			Stream: yarpc.StreamInboundMiddleware(authInboundMiddleware, leaderCheckMiddleware),
 		},
 		OutboundMiddleware: yarpc.OutboundMiddleware{
 			Unary:  authOutboundMiddleware,
@@ -597,10 +609,12 @@ func main() {
 	if err != nil {
 		log.WithError(err).Fatal("Cannot register reconciler background worker.")
 	}
+
+	metric := hostmetric.NewMetrics(rootScope)
 	if cfg.HostManager.QoSAdvisorService.Address != "" {
-		bin_packing.Init(cQosClient)
+		bin_packing.Init(cQosClient, metric)
 	} else {
-		bin_packing.Init(nil)
+		bin_packing.Init(nil, nil)
 	}
 
 	log.WithField("ranker_name", cfg.HostManager.BinPacking).
@@ -611,10 +625,14 @@ func main() {
 			Fatal("Ranker not found")
 	}
 
-	metric := hostmetric.NewMetrics(rootScope)
 	watchevent.InitWatchProcessor(cfg.HostManager.Watch, metric)
 	watchProcessor := watchevent.GetWatchProcessor()
 
+	// Initialize offer pool event handler with nil host pool manager.
+	// TODO: Refactor event stream handler and move it out of offer package
+	//  to avoid circular dependency, since now offer pool event handler requires
+	//  host pool manager, and host pool manager requires event stream handler
+	//  which is part of offer pool event handler.
 	offer.InitEventHandler(
 		dispatcher,
 		rootScope,
@@ -625,17 +643,36 @@ func main() {
 		defaultRanker,
 		cfg.HostManager,
 		watchProcessor,
+		nil,
 	)
+
+	// Construct host pool manager if it is enabled.
+	var hostPoolManager manager.HostPoolManager
+	if cfg.HostManager.EnableHostPool {
+		hostPoolManager = manager.New(
+			cfg.HostManager.HostPoolReconcileInterval,
+			offer.GetEventHandler().GetEventStreamHandler(),
+			rootScope,
+		)
+		hostPoolManager.Start()
+		defer hostPoolManager.Stop()
+
+		// Set host pool manager in offer pool event handler.
+		offer.GetEventHandler().SetHostPoolManager(hostPoolManager)
+	}
 
 	maintenanceQueue := queue.NewMaintenanceQueue()
 
-	if cfg.K8s.Enabled {
-		podEventCh := make(chan *scalar.PodEvent, k8s.EventChanSize)
-		hostEventCh := make(chan *scalar.HostEvent, k8s.EventChanSize)
+	plugin := plugins.NewNoopPlugin()
+	var hostCache hostcache.HostCache
+	podEventCh := make(chan *scalar.PodEvent, k8s.EventChanSize)
+	hostEventCh := make(chan *scalar.HostEvent, k8s.EventChanSize)
 
-		// If k8s config file is present, this will return a k8s plugin, else a
-		// mesos plugin, for now.
-		plugin, err := plugins.New(
+	// If k8s is enabled, return a k8s plugin.
+	// TODO: start MesosPlugin after it's implemented.
+	if cfg.K8s.Enabled {
+		var err error
+		plugin, err = plugins.NewK8sPlugin(
 			cfg.K8s.Kubeconfig,
 			podEventCh,
 			hostEventCh,
@@ -643,36 +680,31 @@ func main() {
 		if err != nil {
 			log.WithError(err).Fatal("Cannot init host manager plugin.")
 		}
-
-		// Create host cache instance.
-		hc := hostcache.New(hostEventCh, podEventCh, plugin)
-
-		pem := podeventmanager.New(
-			dispatcher,
-			podEventCh,
-			plugin,
-			cfg.HostManager.TaskUpdateBufferSize,
-			rootScope)
-
-		// This should start the event stream for pods and hosts
-		// TODO: do this after leader election (T3224499).
-		hc.Start()
-		defer hc.Stop()
-
-		// Start plugin event listeners to listen for scheduler events
-		// TODO: do this after leader election (T3224499).
-		plugin.Start()
-		defer plugin.Stop()
-
-		// Create v1alpha hostmgr internal service handler.
-		hostmgrsvc.NewServiceHandler(
-			dispatcher,
-			rootScope,
-			plugin,
-			hc,
-			pem,
-		)
 	}
+
+	// Create host cache instance.
+	hostCache = hostcache.New(
+		hostEventCh,
+		backgroundManager,
+		rootScope,
+	)
+
+	pem := podeventmanager.New(
+		dispatcher,
+		podEventCh,
+		plugin,
+		hostCache,
+		cfg.HostManager.TaskUpdateBufferSize,
+		rootScope)
+
+	// Create v1alpha hostmgr internal service handler.
+	hostmgrsvc.NewServiceHandler(
+		dispatcher,
+		rootScope,
+		plugin,
+		hostCache,
+		pem,
+	)
 
 	// Create new hostmgr internal service handler.
 	serviceHandler := hostmgr.NewServiceHandler(
@@ -688,27 +720,30 @@ func main() {
 		cfg.HostManager.SlackResourceTypes,
 		maintenanceHostInfoMap,
 		watchProcessor,
+		hostPoolManager,
+	)
+
+	drainer := host.NewDrainer(
+		cfg.HostManager.HostDrainerPeriod,
+		cfg.Mesos.Framework.Role,
+		masterOperatorClient,
+		maintenanceQueue,
+		maintenanceHostInfoMap,
 	)
 
 	hostsvc.InitServiceHandler(
 		dispatcher,
 		rootScope,
-		masterOperatorClient,
-		maintenanceQueue,
-		maintenanceHostInfoMap,
+		drainer,
+		hostPoolManager,
 	)
 
 	recoveryHandler := hostmgr.NewRecoveryHandler(
 		rootScope,
+		store,
+		ormStore,
 		maintenanceQueue,
 		masterOperatorClient,
-		maintenanceHostInfoMap,
-	)
-
-	drainer := host.NewDrainer(
-		cfg.HostManager.HostDrainerPeriod,
-		masterOperatorClient,
-		maintenanceQueue,
 		maintenanceHostInfoMap,
 	)
 
@@ -725,13 +760,18 @@ func main() {
 		drainer,
 		serviceHandler.GetReserver(),
 		watchProcessor,
+		plugin,
+		hostCache,
 	)
 	server.Start()
 
-	// Start dispatch loop
+	// Start dispatch loop.
 	if err := dispatcher.Start(); err != nil {
 		log.Fatalf("Could not start rpc server: %v", err)
 	}
+
+	// Set nomination for leader check middleware
+	leaderCheckMiddleware.SetNomination(server)
 
 	candidate, err := leader.NewCandidate(
 		cfg.Election,
@@ -748,7 +788,7 @@ func main() {
 	}
 	defer candidate.Stop()
 
-	// Start dispatch loop
+	// Start dispatch loop.
 	if err := dispatcher.Start(); err != nil {
 		log.Fatalf("Could not start rpc server: %v", err)
 	}
@@ -759,10 +799,10 @@ func main() {
 		"grpcPort": cfg.HostManager.GRPCPort,
 	}).Info("Started host manager")
 
-	// we can *honestly* say the server is booted up now
+	// We can *honestly* say the server is booted up now.
 	health.InitHeartbeat(rootScope, cfg.Health, candidate)
 
-	// start collecting runtime metrics
+	// Start collecting runtime metrics.
 	defer metrics.StartCollectingRuntimeMetrics(
 		rootScope,
 		cfg.Metrics.RuntimeMetrics.Enabled,

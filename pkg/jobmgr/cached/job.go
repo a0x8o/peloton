@@ -38,7 +38,6 @@ import (
 	stringsutil "github.com/uber/peloton/pkg/common/util/strings"
 	jobmgrcommon "github.com/uber/peloton/pkg/jobmgr/common"
 	goalstateutil "github.com/uber/peloton/pkg/jobmgr/util/goalstate"
-	taskutil "github.com/uber/peloton/pkg/jobmgr/util/task"
 
 	"github.com/golang/protobuf/proto"
 	"github.com/pborman/uuid"
@@ -537,7 +536,7 @@ func (j *job) CreateTaskConfigs(
 		}
 	}
 
-	return taskutil.RunInParallel(
+	return util.RunInParallel(
 		j.ID().GetValue(),
 		instanceIDList,
 		createSingleTaskConfig)
@@ -563,7 +562,7 @@ func (j *job) CreateTaskRuntimes(
 		t := j.addTaskToJobMap(id)
 		return t.createTask(ctx, runtime, owner)
 	}
-	return taskutil.RunInParallel(
+	return util.RunInParallel(
 		j.ID().GetValue(),
 		getIdsFromRuntimeMap(runtimes),
 		createSingleTask)
@@ -597,7 +596,7 @@ func (j *job) PatchTasks(
 		return t.(*task).patchTask(ctx, runtimeDiffs[id])
 	}
 
-	err = taskutil.RunInParallel(
+	err = util.RunInParallel(
 		j.ID().GetValue(),
 		instancesSucceeded,
 		patchSingleTask)
@@ -628,7 +627,7 @@ func (j *job) ReplaceTasks(
 	}
 
 	instancesReplaced = getIdsFromTaskInfoMap(taskInfos)
-	err = taskutil.RunInParallel(
+	err = util.RunInParallel(
 		j.ID().GetValue(),
 		instancesReplaced,
 		replaceSingleTask)
@@ -1594,6 +1593,13 @@ func (j *job) filterRuntimeDiffsBySLA(
 				delete(instanceAvailabilityInfo.killedInstances, i)
 				instanceAvailabilityInfo.unavailableInstances[i] = true
 
+			// If restart/kill is due to job update or if the instance has failed,
+			// mark the instance unavailable
+			case pbtask.TerminationStatus_TERMINATION_STATUS_REASON_KILLED_FOR_UPDATE,
+				pbtask.TerminationStatus_TERMINATION_STATUS_REASON_FAILED:
+				delete(instanceAvailabilityInfo.killedInstances, i)
+				instanceAvailabilityInfo.unavailableInstances[i] = true
+
 			default:
 				delete(instanceAvailabilityInfo.unavailableInstances, i)
 				instanceAvailabilityInfo.killedInstances[i] = true
@@ -2089,7 +2095,9 @@ func getInstanceAvailability(
 	// the termination reason to determine whether to mark it UNAVAILABLE or KILLED.
 	if terminationStatus != nil {
 		switch terminationStatus.GetReason() {
-		case pbtask.TerminationStatus_TERMINATION_STATUS_REASON_KILLED_HOST_MAINTENANCE:
+		case pbtask.TerminationStatus_TERMINATION_STATUS_REASON_KILLED_HOST_MAINTENANCE,
+			pbtask.TerminationStatus_TERMINATION_STATUS_REASON_KILLED_FOR_UPDATE,
+			pbtask.TerminationStatus_TERMINATION_STATUS_REASON_FAILED:
 			return jobmgrcommon.InstanceAvailability_UNAVAILABLE
 		default:
 			return jobmgrcommon.InstanceAvailability_KILLED
@@ -2099,7 +2107,7 @@ func getInstanceAvailability(
 	// If the current mesos-task-id/config-version do not match with desired
 	// mesos-task-id/config-version and the termination status is not set,
 	// mark the instance KILLED. This is because we always set termination status
-	// with the appropriate reason whenever it is SLA aware killed (host-maintenanace/update)
+	// with the appropriate reason whenever it is SLA aware killed (host-maintenance/update)
 	if currentState.MesosTaskID.GetValue() != goalState.MesosTaskID.GetValue() ||
 		currentState.ConfigVersion != goalState.ConfigVersion {
 		return jobmgrcommon.InstanceAvailability_KILLED

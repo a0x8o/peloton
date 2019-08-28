@@ -20,7 +20,6 @@ import (
 	"testing"
 
 	mesos "github.com/uber/peloton/.gen/mesos/v1"
-	mesosmaintenance "github.com/uber/peloton/.gen/mesos/v1/maintenance"
 	mesosmaster "github.com/uber/peloton/.gen/mesos/v1/master"
 	hpb "github.com/uber/peloton/.gen/peloton/api/v0/host"
 	svcpb "github.com/uber/peloton/.gen/peloton/api/v0/host/svc"
@@ -28,8 +27,9 @@ import (
 	"github.com/uber/peloton/pkg/common/stringset"
 	"github.com/uber/peloton/pkg/hostmgr/host"
 	hm "github.com/uber/peloton/pkg/hostmgr/host/mocks"
+	"github.com/uber/peloton/pkg/hostmgr/hostpool"
+	hpm_mock "github.com/uber/peloton/pkg/hostmgr/hostpool/manager/mocks"
 	ym "github.com/uber/peloton/pkg/hostmgr/mesos/yarpc/encoding/mpb/mocks"
-	qm "github.com/uber/peloton/pkg/hostmgr/queue/mocks"
 
 	"github.com/golang/mock/gomock"
 	log "github.com/sirupsen/logrus"
@@ -37,7 +37,7 @@ import (
 	"github.com/uber-go/tally"
 )
 
-type HostSvcHandlerTestSuite struct {
+type hostSvcHandlerTestSuite struct {
 	suite.Suite
 
 	ctx                      context.Context
@@ -49,12 +49,13 @@ type HostSvcHandlerTestSuite struct {
 	drainingMachines         []*mesos.MachineID
 	mockCtrl                 *gomock.Controller
 	handler                  *serviceHandler
+	mockDrainer              *hm.MockDrainer
 	mockMasterOperatorClient *ym.MockMasterOperatorClient
-	mockMaintenanceQueue     *qm.MockMaintenanceQueue
 	mockMaintenanceMap       *hm.MockMaintenanceHostInfoMap
+	mockHostPoolManager      *hpm_mock.MockHostPoolManager
 }
 
-func (suite *HostSvcHandlerTestSuite) SetupSuite() {
+func (suite *hostSvcHandlerTestSuite) SetupSuite() {
 	suite.handler = &serviceHandler{
 		metrics: NewMetrics(tally.NoopScope),
 	}
@@ -84,15 +85,17 @@ func (suite *HostSvcHandlerTestSuite) SetupSuite() {
 	suite.drainingMachines = append(suite.drainingMachines, suite.drainingMachine)
 }
 
-func (suite *HostSvcHandlerTestSuite) SetupTest() {
+func (suite *hostSvcHandlerTestSuite) SetupTest() {
 	suite.mockCtrl = gomock.NewController(suite.T())
 	suite.ctx = context.Background()
 	suite.mockMasterOperatorClient = ym.NewMockMasterOperatorClient(suite.mockCtrl)
-	suite.mockMaintenanceQueue = qm.NewMockMaintenanceQueue(suite.mockCtrl)
 	suite.mockMaintenanceMap = hm.NewMockMaintenanceHostInfoMap(suite.mockCtrl)
-	suite.handler.operatorMasterClient = suite.mockMasterOperatorClient
-	suite.handler.maintenanceQueue = suite.mockMaintenanceQueue
-	suite.handler.maintenanceHostInfoMap = suite.mockMaintenanceMap
+	suite.mockDrainer = hm.NewMockDrainer(suite.mockCtrl)
+	suite.mockHostPoolManager = hpm_mock.NewMockHostPoolManager(
+		suite.mockCtrl,
+	)
+	suite.handler.hostPoolManager = suite.mockHostPoolManager
+	suite.handler.drainer = suite.mockDrainer
 
 	response := suite.makeAgentsResponse()
 	loader := &host.Loader{
@@ -108,7 +111,7 @@ func (suite *HostSvcHandlerTestSuite) SetupTest() {
 	loader.Load(nil)
 }
 
-func (suite *HostSvcHandlerTestSuite) makeAgentsResponse() *mesosmaster.Response_GetAgents {
+func (suite *hostSvcHandlerTestSuite) makeAgentsResponse() *mesosmaster.Response_GetAgents {
 	response := &mesosmaster.Response_GetAgents{
 		Agents: []*mesosmaster.Response_GetAgents_Agent{},
 	}
@@ -137,195 +140,67 @@ func (suite *HostSvcHandlerTestSuite) makeAgentsResponse() *mesosmaster.Response
 }
 
 func TestHostSvcHandler(t *testing.T) {
-	suite.Run(t, new(HostSvcHandlerTestSuite))
+	suite.Run(t, new(hostSvcHandlerTestSuite))
 }
 
-func (suite *HostSvcHandlerTestSuite) TearDownTest() {
-	log.Info("tearing down HostSvcHandlerTestSuite")
+func (suite *hostSvcHandlerTestSuite) TearDownTest() {
+	log.Info("tearing down hostSvcHandlerTestSuite")
 	suite.mockCtrl.Finish()
 }
 
-func (suite *HostSvcHandlerTestSuite) TestStartMaintenance() {
-	hostname := suite.upMachine.GetHostname()
-	hostInfo := &hpb.HostInfo{
-		Hostname: hostname,
-		Ip:       suite.upMachine.GetIp(),
-		State:    hpb.HostState_HOST_STATE_DRAINING,
-	}
-
-	gomock.InOrder(
-		suite.mockMasterOperatorClient.EXPECT().GetMaintenanceSchedule().
-			Return(&mesosmaster.Response_GetMaintenanceSchedule{
-				Schedule: &mesosmaintenance.Schedule{},
-			}, nil),
-		suite.mockMasterOperatorClient.EXPECT().
-			UpdateMaintenanceSchedule(gomock.Any()).Return(nil),
-		suite.mockMaintenanceMap.EXPECT().
-			AddHostInfo(hostInfo),
-		suite.mockMaintenanceQueue.EXPECT().
-			Enqueue(hostname).Return(nil),
-	)
-
+func (suite *hostSvcHandlerTestSuite) TestStartMaintenance() {
+	hostname := "host1"
+	suite.mockDrainer.EXPECT().StartMaintenance(gomock.Any(), hostname).Return(nil)
 	resp, err := suite.handler.StartMaintenance(
 		suite.ctx,
 		&svcpb.StartMaintenanceRequest{
 			Hostname: hostname,
 		})
 	suite.NoError(err)
-	suite.Equal(&svcpb.StartMaintenanceResponse{
-		Hostname: hostname,
-	}, resp)
-}
+	suite.Equal(
+		&svcpb.StartMaintenanceResponse{Hostname: hostname},
+		resp)
 
-func (suite *HostSvcHandlerTestSuite) TestStartMaintenanceError() {
-	hostname := suite.upMachine.GetHostname()
-	hostInfo := &hpb.HostInfo{
-		Hostname: hostname,
-		Ip:       suite.upMachine.GetIp(),
-		State:    hpb.HostState_HOST_STATE_DRAINING,
-	}
-
-	// Test error while getting maintenance schedule
-	suite.mockMasterOperatorClient.EXPECT().
-		GetMaintenanceSchedule().
-		Return(nil, fmt.Errorf("fake GetMaintenanceSchedule error"))
-	response, err := suite.handler.StartMaintenance(suite.ctx,
+	hostname = "host2"
+	suite.mockDrainer.EXPECT().StartMaintenance(gomock.Any(), hostname).
+		Return(fmt.Errorf("sonmething went wrong"))
+	resp, err = suite.handler.StartMaintenance(
+		suite.ctx,
 		&svcpb.StartMaintenanceRequest{
 			Hostname: hostname,
-		})
-	suite.Error(err)
-	suite.Nil(response)
-
-	// Test error while posting maintenance schedule
-	suite.mockMasterOperatorClient.EXPECT().
-		GetMaintenanceSchedule().
-		Return(&mesosmaster.Response_GetMaintenanceSchedule{
-			Schedule: &mesosmaintenance.Schedule{},
-		}, nil)
-	suite.mockMasterOperatorClient.EXPECT().
-		UpdateMaintenanceSchedule(gomock.Any()).
-		Return(fmt.Errorf("fake UpdateMaintenanceSchedule error"))
-	response, err = suite.handler.StartMaintenance(suite.ctx,
-		&svcpb.StartMaintenanceRequest{
-			Hostname: hostname,
-		})
-	suite.Error(err)
-	suite.Nil(response)
-
-	// Test error while enqueuing in maintenance queue
-	gomock.InOrder(
-		suite.mockMasterOperatorClient.EXPECT().
-			GetMaintenanceSchedule().
-			Return(&mesosmaster.Response_GetMaintenanceSchedule{
-				Schedule: &mesosmaintenance.Schedule{},
-			}, nil),
-		suite.mockMasterOperatorClient.EXPECT().
-			UpdateMaintenanceSchedule(gomock.Any()).Return(nil),
-		suite.mockMaintenanceMap.EXPECT().
-			AddHostInfo(hostInfo),
-		suite.mockMaintenanceQueue.EXPECT().
-			Enqueue(hostname).Return(fmt.Errorf("fake Enqueue error")),
+		},
 	)
-	response, err = suite.handler.StartMaintenance(suite.ctx,
-		&svcpb.StartMaintenanceRequest{
-			Hostname: hostname,
-		})
 	suite.Error(err)
-	suite.Nil(response)
-
-	// Test Unknown host error
-	response, err = suite.handler.StartMaintenance(suite.ctx, &svcpb.StartMaintenanceRequest{
-		Hostname: "invalid",
-	})
-	suite.Error(err)
-	suite.Nil(response)
-
-	// TestExtractIPFromMesosAgentPID error
-	pid := "invalidPID"
-	host.GetAgentMap().RegisteredAgents[hostname].Pid = &pid
-	response, err = suite.handler.StartMaintenance(suite.ctx, &svcpb.StartMaintenanceRequest{
-		Hostname: hostname,
-	})
-	suite.Error(err)
-	suite.Nil(response)
-
-	// Test 'No registered agents' error
-	loader := &host.Loader{
-		OperatorClient:         suite.mockMasterOperatorClient,
-		Scope:                  tally.NewTestScope("", map[string]string{}),
-		MaintenanceHostInfoMap: hm.NewMockMaintenanceHostInfoMap(suite.mockCtrl),
-	}
-	suite.mockMasterOperatorClient.EXPECT().Agents().Return(nil, nil)
-	loader.Load(nil)
-	response, err = suite.handler.StartMaintenance(suite.ctx, &svcpb.StartMaintenanceRequest{
-		Hostname: hostname,
-	})
-	suite.Error(err)
-	suite.Nil(response)
+	suite.Nil(resp)
 }
 
-func (suite *HostSvcHandlerTestSuite) TestCompleteMaintenance() {
-	hostname := suite.downMachine.GetHostname()
-	hostInfo := &hpb.HostInfo{
-		Hostname: hostname,
-		Ip:       suite.downMachine.GetIp(),
-		State:    hpb.HostState_HOST_STATE_DOWN,
-	}
-
-	suite.mockMaintenanceMap.EXPECT().
-		GetDownHostInfos([]string{}).
-		Return([]*hpb.HostInfo{hostInfo})
-	suite.mockMasterOperatorClient.EXPECT().
-		StopMaintenance([]*mesos.MachineID{suite.downMachine}).Return(nil)
-	suite.mockMaintenanceMap.EXPECT().
-		RemoveHostInfo(hostname)
-
-	resp, err := suite.handler.CompleteMaintenance(suite.ctx,
+func (suite *hostSvcHandlerTestSuite) TestCompleteMaintenance() {
+	hostname := "host1"
+	suite.mockDrainer.EXPECT().CompleteMaintenance(gomock.Any(), hostname).Return(nil)
+	resp, err := suite.handler.CompleteMaintenance(
+		suite.ctx,
 		&svcpb.CompleteMaintenanceRequest{
 			Hostname: hostname,
 		})
 	suite.NoError(err)
-	suite.Equal(&svcpb.CompleteMaintenanceResponse{
-		Hostname: hostname,
-	}, resp)
-}
+	suite.Equal(
+		&svcpb.CompleteMaintenanceResponse{Hostname: hostname},
+		resp)
 
-func (suite *HostSvcHandlerTestSuite) TestCompleteMaintenanceError() {
-	// Test error while stopping maintenance
-	hostname := suite.downMachine.GetHostname()
-	hostInfo := &hpb.HostInfo{
-		Hostname: hostname,
-		Ip:       suite.downMachine.GetIp(),
-		State:    hpb.HostState_HOST_STATE_DOWN,
-	}
-
-	suite.mockMaintenanceMap.EXPECT().
-		GetDownHostInfos([]string{}).
-		Return([]*hpb.HostInfo{hostInfo})
-	suite.mockMasterOperatorClient.EXPECT().
-		StopMaintenance([]*mesos.MachineID{suite.downMachine}).
-		Return(fmt.Errorf("fake StopMaintenance error"))
-
-	resp, err := suite.handler.CompleteMaintenance(suite.ctx,
+	hostname = "host2"
+	suite.mockDrainer.EXPECT().CompleteMaintenance(gomock.Any(), hostname).
+		Return(fmt.Errorf("something went wrong"))
+	resp, err = suite.handler.CompleteMaintenance(
+		suite.ctx,
 		&svcpb.CompleteMaintenanceRequest{
 			Hostname: hostname,
-		})
-	suite.Error(err)
-	suite.Nil(resp)
-
-	// Test 'Host not down' error
-	suite.mockMaintenanceMap.EXPECT().
-		GetDownHostInfos([]string{}).
-		Return([]*hpb.HostInfo{})
-	resp, err = suite.handler.CompleteMaintenance(suite.ctx,
-		&svcpb.CompleteMaintenanceRequest{
-			Hostname: "anyhostname",
-		})
+		},
+	)
 	suite.Error(err)
 	suite.Nil(resp)
 }
 
-func (suite *HostSvcHandlerTestSuite) TestQueryHosts() {
+func (suite *hostSvcHandlerTestSuite) TestQueryHosts() {
 	var (
 		hostInfos         []*hpb.HostInfo
 		drainingHostInfos []*hpb.HostInfo
@@ -358,11 +233,11 @@ func (suite *HostSvcHandlerTestSuite) TestQueryHosts() {
 		})
 	}
 
-	suite.mockMaintenanceMap.EXPECT().
+	suite.mockDrainer.EXPECT().
 		GetDrainingHostInfos([]string{}).
 		Return(drainingHostInfos).
 		AnyTimes()
-	suite.mockMaintenanceMap.EXPECT().
+	suite.mockDrainer.EXPECT().
 		GetDownHostInfos([]string{}).
 		Return(downHostsInfos).
 		AnyTimes()
@@ -435,7 +310,7 @@ func (suite *HostSvcHandlerTestSuite) TestQueryHosts() {
 	}
 }
 
-func (suite *HostSvcHandlerTestSuite) TestQueryHostsError() {
+func (suite *hostSvcHandlerTestSuite) TestQueryHostsError() {
 	// Test ExtractIPFromMesosAgentPID error
 	hostname := "testhost"
 	pid := "invalidPID"
@@ -446,12 +321,12 @@ func (suite *HostSvcHandlerTestSuite) TestQueryHostsError() {
 		Pid: &pid,
 	}
 
-	suite.mockMaintenanceMap.EXPECT().
+	suite.mockDrainer.EXPECT().
 		GetDrainingHostInfos(gomock.Any()).
-		Return([]*hpb.HostInfo{})
-	suite.mockMaintenanceMap.EXPECT().
+		Return([]*hpb.HostInfo{}).Times(2)
+	suite.mockDrainer.EXPECT().
 		GetDownHostInfos(gomock.Any()).
-		Return([]*hpb.HostInfo{})
+		Return([]*hpb.HostInfo{}).Times(2)
 
 	resp, err := suite.handler.QueryHosts(suite.ctx, &svcpb.QueryHostsRequest{
 		HostStates: []hpb.HostState{
@@ -471,15 +346,6 @@ func (suite *HostSvcHandlerTestSuite) TestQueryHostsError() {
 	suite.mockMasterOperatorClient.EXPECT().Agents().Return(nil, nil)
 	loader.Load(nil)
 
-	gomock.InOrder(
-		suite.mockMaintenanceMap.EXPECT().
-			GetDrainingHostInfos(gomock.Any()).
-			Return([]*hpb.HostInfo{}),
-		suite.mockMaintenanceMap.EXPECT().
-			GetDownHostInfos(gomock.Any()).
-			Return([]*hpb.HostInfo{}),
-	)
-
 	resp, err = suite.handler.QueryHosts(suite.ctx, &svcpb.QueryHostsRequest{
 		HostStates: []hpb.HostState{
 			hpb.HostState_HOST_STATE_UP,
@@ -487,4 +353,167 @@ func (suite *HostSvcHandlerTestSuite) TestQueryHostsError() {
 	})
 	suite.NoError(err)
 	suite.NotNil(resp)
+}
+
+// TestHostPoolsNotEnabled exercises the host-pools APIs when
+// host-pool is disabled
+func (suite *hostSvcHandlerTestSuite) TestHostPoolsNotEnabled() {
+	suite.handler.hostPoolManager = nil
+
+	_, err := suite.handler.ListHostPools(
+		suite.ctx,
+		&svcpb.ListHostPoolsRequest{},
+	)
+	suite.Error(err)
+
+	_, err = suite.handler.CreateHostPool(
+		suite.ctx,
+		&svcpb.CreateHostPoolRequest{Name: "foo"},
+	)
+	suite.Error(err)
+
+	_, err = suite.handler.DeleteHostPool(
+		suite.ctx,
+		&svcpb.DeleteHostPoolRequest{Name: "foo"},
+	)
+	suite.Error(err)
+
+	_, err = suite.handler.ChangeHostPool(
+		suite.ctx,
+		&svcpb.ChangeHostPoolRequest{},
+	)
+	suite.Error(err)
+}
+
+// TestListHostPools tests ListHostPools API method
+func (suite *hostSvcHandlerTestSuite) TestListHostPools() {
+	scope := tally.NoopScope
+	pool1 := hostpool.New("pool1", scope)
+	pool1.Add("h1")
+	pool1.Add("h2")
+
+	pool2 := hostpool.New("pool2", scope)
+	pool2.Add("h3")
+
+	pools := map[string]hostpool.HostPool{
+		pool1.ID(): pool1,
+		pool2.ID(): pool2,
+	}
+
+	suite.mockHostPoolManager.EXPECT().Pools().Return(pools)
+
+	resp, err := suite.handler.ListHostPools(
+		suite.ctx,
+		&svcpb.ListHostPoolsRequest{},
+	)
+	suite.NoError(err)
+	suite.NotNil(resp)
+
+	suite.Equal(2, len(resp.Pools))
+	for _, p := range resp.Pools {
+		if p.GetName() == "pool1" {
+			suite.ElementsMatch([]string{"h1", "h2"}, p.GetHosts())
+		} else if p.GetName() == "pool2" {
+			suite.ElementsMatch([]string{"h3"}, p.GetHosts())
+		} else {
+			suite.Fail("Unknown pool %s", p.GetName())
+		}
+	}
+}
+
+// TestCreateHostPools tests CreateHostPools API method
+func (suite *hostSvcHandlerTestSuite) TestCreateHostPool() {
+
+	// success case
+	suite.mockHostPoolManager.EXPECT().GetPool("new-pool").
+		Return(nil, fmt.Errorf("not found"))
+	suite.mockHostPoolManager.EXPECT().RegisterPool("new-pool")
+
+	resp, err := suite.handler.CreateHostPool(
+		suite.ctx,
+		&svcpb.CreateHostPoolRequest{Name: "new-pool"},
+	)
+	suite.NoError(err)
+	suite.NotNil(resp)
+
+	// exisiting pool
+	suite.mockHostPoolManager.EXPECT().GetPool("old-pool").
+		Return(nil, nil)
+	_, err = suite.handler.CreateHostPool(
+		suite.ctx,
+		&svcpb.CreateHostPoolRequest{Name: "old-pool"},
+	)
+	suite.Error(err)
+
+	// Bad pool name
+	_, err = suite.handler.CreateHostPool(
+		suite.ctx,
+		&svcpb.CreateHostPoolRequest{},
+	)
+	suite.Error(err)
+}
+
+// TestDeleteHostPools tests DeleteHostPools API method
+func (suite *hostSvcHandlerTestSuite) TestDeleteHostPool() {
+
+	// success case
+	suite.mockHostPoolManager.EXPECT().GetPool("old-pool").
+		Return(nil, nil)
+	suite.mockHostPoolManager.EXPECT().DeregisterPool("old-pool")
+
+	resp, err := suite.handler.DeleteHostPool(
+		suite.ctx,
+		&svcpb.DeleteHostPoolRequest{Name: "old-pool"},
+	)
+	suite.NoError(err)
+	suite.NotNil(resp)
+
+	// non-existing pool
+	suite.mockHostPoolManager.EXPECT().GetPool("bad-pool").
+		Return(nil, fmt.Errorf("not found"))
+	_, err = suite.handler.DeleteHostPool(
+		suite.ctx,
+		&svcpb.DeleteHostPoolRequest{Name: "bad-pool"},
+	)
+	suite.Error(err)
+
+	// delete default pool
+	_, err = suite.handler.DeleteHostPool(
+		suite.ctx,
+		&svcpb.DeleteHostPoolRequest{Name: "default"},
+	)
+	suite.Error(err)
+}
+
+// TestChangeHostPools tests ChangeHostPools API method
+func (suite *hostSvcHandlerTestSuite) TestChangeHostPool() {
+	// success case
+	suite.mockHostPoolManager.EXPECT().
+		ChangeHostPool("h1", "p1", "p2").
+		Return(nil)
+
+	resp, err := suite.handler.ChangeHostPool(
+		suite.ctx,
+		&svcpb.ChangeHostPoolRequest{
+			Hostname:        "h1",
+			SourcePool:      "p1",
+			DestinationPool: "p2",
+		},
+	)
+	suite.NoError(err)
+	suite.NotNil(resp)
+
+	// bad request
+	suite.mockHostPoolManager.EXPECT().
+		ChangeHostPool("h1-does-not-exist", "p1", "p2").
+		Return(fmt.Errorf("not found"))
+	_, err = suite.handler.ChangeHostPool(
+		suite.ctx,
+		&svcpb.ChangeHostPoolRequest{
+			Hostname:        "h1-does-not-exist",
+			SourcePool:      "p1",
+			DestinationPool: "p2",
+		},
+	)
+	suite.Error(err)
 }

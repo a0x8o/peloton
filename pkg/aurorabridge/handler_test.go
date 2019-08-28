@@ -22,7 +22,6 @@ import (
 	"strconv"
 	"testing"
 
-	"github.com/pborman/uuid"
 	"github.com/uber/peloton/.gen/peloton/api/v1alpha/job/stateless"
 	statelesssvc "github.com/uber/peloton/.gen/peloton/api/v1alpha/job/stateless/svc"
 	jobmocks "github.com/uber/peloton/.gen/peloton/api/v1alpha/job/stateless/svc/mocks"
@@ -30,14 +29,12 @@ import (
 	"github.com/uber/peloton/.gen/peloton/api/v1alpha/pod"
 	podsvc "github.com/uber/peloton/.gen/peloton/api/v1alpha/pod/svc"
 	podmocks "github.com/uber/peloton/.gen/peloton/api/v1alpha/pod/svc/mocks"
-	pbquery "github.com/uber/peloton/.gen/peloton/api/v1alpha/query"
 	"github.com/uber/peloton/.gen/peloton/private/jobmgrsvc"
 	jobmgrmocks "github.com/uber/peloton/.gen/peloton/private/jobmgrsvc/mocks"
 	"github.com/uber/peloton/.gen/thrift/aurora/api"
 	cachemocks "github.com/uber/peloton/pkg/aurorabridge/cache/mocks"
 	commonmocks "github.com/uber/peloton/pkg/aurorabridge/common/mocks"
 	aurorabridgemocks "github.com/uber/peloton/pkg/aurorabridge/mocks"
-	"github.com/uber/peloton/pkg/common/util"
 
 	"github.com/uber/peloton/pkg/aurorabridge/atop"
 	"github.com/uber/peloton/pkg/aurorabridge/common"
@@ -45,8 +42,11 @@ import (
 	"github.com/uber/peloton/pkg/aurorabridge/label"
 	"github.com/uber/peloton/pkg/aurorabridge/mockutil"
 	"github.com/uber/peloton/pkg/aurorabridge/opaquedata"
+	"github.com/uber/peloton/pkg/common/config"
+	"github.com/uber/peloton/pkg/common/util"
 
 	"github.com/golang/mock/gomock"
+	"github.com/pborman/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/suite"
 	"github.com/uber-go/tally"
@@ -72,7 +72,7 @@ type ServiceHandlerTestSuite struct {
 	jobIdCache     *cachemocks.MockJobIDCache
 
 	config        ServiceHandlerConfig
-	thermosConfig atop.ThermosExecutorConfig
+	thermosConfig config.ThermosExecutorConfig
 
 	handler *ServiceHandler
 }
@@ -99,7 +99,7 @@ func (suite *ServiceHandlerTestSuite) SetupTest() {
 		GetTasksWithoutConfigsWorkers: 25,
 		StopPodWorkers:                25,
 		PodRunsDepth:                  2,
-		ThermosExecutor: atop.ThermosExecutorConfig{
+		ThermosExecutor: config.ThermosExecutorConfig{
 			Path: "/usr/share/aurora/bin/thermos_executor.pex",
 		},
 		EnableInPlace: true,
@@ -323,19 +323,10 @@ func (suite *ServiceHandlerTestSuite) TestGetConfigSummaryFailure() {
 
 	suite.expectGetJobIDFromJobName(jobKey, jobID)
 
-	suite.jobClient.EXPECT().
-		QueryPods(gomock.Any(), &statelesssvc.QueryPodsRequest{
-			JobId: jobID,
-			Spec: &pod.QuerySpec{
-				Pagination: &pbquery.PaginationSpec{
-					Limit: instanceCount,
-				},
-			},
-			Pagination: &pbquery.PaginationSpec{
-				Limit: instanceCount,
-			},
-		}).
-		Return(nil, errors.New("unable to query pods"))
+	suite.podClient.EXPECT().
+		GetPod(gomock.Any(), gomock.Any()).
+		Return(nil, errors.New("unable to query pods")).
+		AnyTimes()
 
 	suite.jobClient.EXPECT().
 		GetJob(gomock.Any(), &statelesssvc.GetJobRequest{
@@ -366,12 +357,26 @@ func (suite *ServiceHandlerTestSuite) TestGetConfigSummarySuccess() {
 	mdLabel := label.NewAuroraMetadataLabels(fixture.AuroraMetadata())
 
 	suite.expectGetJobIDFromJobName(jobKey, jobID)
-	suite.expectQueryPods(jobID,
-		[]*peloton.PodName{{Value: podName}},
-		mdLabel,
-		entityVersion,
-		1,
-	)
+	suite.podClient.EXPECT().GetPod(gomock.Any(), &podsvc.GetPodRequest{
+		PodName:    &peloton.PodName{Value: podName},
+		StatusOnly: false,
+		Limit:      1,
+	}).Return(&podsvc.GetPodResponse{
+		Current: &pod.PodInfo{
+			Spec: &pod.PodSpec{
+				PodName:    &peloton.PodName{Value: podName},
+				Labels:     mdLabel,
+				Containers: []*pod.ContainerSpec{{}},
+			},
+			Status: &pod.PodStatus{
+				PodId:   &peloton.PodID{Value: podName + "-" + strconv.Itoa(1)},
+				Host:    "peloton-host-0",
+				State:   pod.PodState_POD_STATE_RUNNING,
+				Version: entityVersion,
+			},
+		},
+	}, nil)
+
 	suite.jobClient.EXPECT().
 		GetJob(gomock.Any(), &statelesssvc.GetJobRequest{
 			SummaryOnly: true,
@@ -1404,46 +1409,6 @@ func (suite *ServiceHandlerTestSuite) expectGetJobSummary(
 		}, nil)
 }
 
-func (suite *ServiceHandlerTestSuite) expectQueryPods(
-	jobID *peloton.JobID,
-	podNames []*peloton.PodName,
-	labels []*peloton.Label,
-	entityVersion *peloton.EntityVersion,
-	currentRunID int,
-) {
-	var pods []*pod.PodInfo
-	for _, podName := range podNames {
-		pods = append(pods, &pod.PodInfo{
-			Spec: &pod.PodSpec{
-				PodName:    podName,
-				Labels:     labels,
-				Containers: []*pod.ContainerSpec{{}},
-			},
-			Status: &pod.PodStatus{
-				PodId:   &peloton.PodID{Value: podName.GetValue() + "-" + strconv.Itoa(currentRunID)},
-				Host:    "peloton-host-0",
-				State:   pod.PodState_POD_STATE_RUNNING,
-				Version: entityVersion,
-			},
-		})
-	}
-
-	suite.jobClient.EXPECT().
-		QueryPods(gomock.Any(), &statelesssvc.QueryPodsRequest{
-			JobId: jobID,
-			Spec: &pod.QuerySpec{
-				PodStates: nil,
-				Pagination: &pbquery.PaginationSpec{
-					Limit: uint32(len(podNames)),
-				},
-			},
-			Pagination: &pbquery.PaginationSpec{
-				Limit: uint32(len(podNames)),
-			},
-		}).
-		Return(&statelesssvc.QueryPodsResponse{Pods: pods}, nil)
-}
-
 // TestGetTasksWithoutConfigs_ParallelismSuccess tests parallelism for
 // GetTasksWithoutConfig success scenario
 func (suite *ServiceHandlerTestSuite) TestGetTasksWithoutConfigs_ParallelismSuccess() {
@@ -1466,6 +1431,27 @@ func (suite *ServiceHandlerTestSuite) TestGetTasksWithoutConfigs_ParallelismSucc
 		podNames = append(podNames, podName)
 
 		suite.podClient.EXPECT().
+			GetPod(gomock.Any(), &podsvc.GetPodRequest{
+				PodName:    podName,
+				StatusOnly: false,
+				Limit:      1,
+			}).Return(&podsvc.GetPodResponse{
+			Current: &pod.PodInfo{
+				Spec: &pod.PodSpec{
+					PodName:    podName,
+					Labels:     labels,
+					Containers: []*pod.ContainerSpec{{}},
+				},
+				Status: &pod.PodStatus{
+					PodId:   podID,
+					Host:    "peloton-host-0",
+					State:   pod.PodState_POD_STATE_RUNNING,
+					Version: entityVersion,
+				},
+			},
+		}, nil)
+
+		suite.podClient.EXPECT().
 			GetPodEvents(gomock.Any(), &podsvc.GetPodEventsRequest{
 				PodName: podName,
 			}).
@@ -1482,12 +1468,73 @@ func (suite *ServiceHandlerTestSuite) TestGetTasksWithoutConfigs_ParallelismSucc
 			}, nil)
 	}
 
-	suite.expectQueryPods(jobID, podNames, labels, entityVersion, 1)
-
 	resp, err := suite.handler.GetTasksWithoutConfigs(suite.ctx, query)
 	suite.NoError(err)
 	suite.Equal(api.ResponseCodeOk, resp.GetResponseCode())
 	suite.Len(resp.GetResult().GetScheduleStatusResult().GetTasks(), 1000)
+}
+
+// TestGetTasksWithoutConfigs_ParallelismFailure tests parallelism for
+// GetTasksWithoutConfig failure scenario
+func (suite *ServiceHandlerTestSuite) TestGetTasksWithoutConfigs_GetPodParallelismFailure() {
+	defer goleak.VerifyNoLeaks(suite.T())
+
+	query := fixture.AuroraTaskQuery()
+	jobKey := query.GetJobKeys()[0]
+	jobID := fixture.PelotonJobID()
+	entityVersion := fixture.PelotonEntityVersion()
+	labels := fixture.DefaultPelotonJobLabels(jobKey)
+
+	suite.expectGetJobSummary(jobKey, jobID, 1000)
+
+	var podNames []*peloton.PodName
+	for i := 0; i < 1000; i++ {
+		podName := &peloton.PodName{
+			Value: util.CreatePelotonTaskID(jobID.GetValue(), uint32(i)),
+		}
+		podID := &peloton.PodID{Value: podName.GetValue() + "-1"}
+		podNames = append(podNames, podName)
+
+		if i%100 == 0 {
+			suite.podClient.EXPECT().
+				GetPod(gomock.Any(), &podsvc.GetPodRequest{
+					PodName:    podName,
+					StatusOnly: false,
+					Limit:      1,
+				}).
+				Return(&podsvc.GetPodResponse{},
+					errors.New("failed to get pod events")).
+				MaxTimes(1)
+			continue
+		}
+
+		suite.podClient.EXPECT().
+			GetPod(gomock.Any(), &podsvc.GetPodRequest{
+				PodName:    podName,
+				StatusOnly: false,
+				Limit:      1,
+			}).Return(&podsvc.GetPodResponse{
+			Current: &pod.PodInfo{
+				Spec: &pod.PodSpec{
+					PodName:    podName,
+					Labels:     labels,
+					Containers: []*pod.ContainerSpec{{}},
+				},
+				Status: &pod.PodStatus{
+					PodId:   podID,
+					Host:    "peloton-host-0",
+					State:   pod.PodState_POD_STATE_RUNNING,
+					Version: entityVersion,
+				},
+			},
+		}, nil).MaxTimes(1)
+	}
+
+	resp, err := suite.handler.GetTasksWithoutConfigs(suite.ctx, query)
+	suite.NoError(err)
+	suite.Equal(api.ResponseCodeError, resp.GetResponseCode())
+	suite.Len(resp.GetResult().GetScheduleStatusResult().GetTasks(), 0)
+	suite.NotEmpty(resp.GetDetails())
 }
 
 // TestGetTasksWithoutConfigs_ParallelismFailure tests parallelism for
@@ -1510,6 +1557,27 @@ func (suite *ServiceHandlerTestSuite) TestGetTasksWithoutConfigs_ParallelismFail
 		}
 		podID := &peloton.PodID{Value: podName.GetValue() + "-1"}
 		podNames = append(podNames, podName)
+
+		suite.podClient.EXPECT().
+			GetPod(gomock.Any(), &podsvc.GetPodRequest{
+				PodName:    podName,
+				StatusOnly: false,
+				Limit:      1,
+			}).Return(&podsvc.GetPodResponse{
+			Current: &pod.PodInfo{
+				Spec: &pod.PodSpec{
+					PodName:    podName,
+					Labels:     labels,
+					Containers: []*pod.ContainerSpec{{}},
+				},
+				Status: &pod.PodStatus{
+					PodId:   podID,
+					Host:    "peloton-host-0",
+					State:   pod.PodState_POD_STATE_RUNNING,
+					Version: entityVersion,
+				},
+			},
+		}, nil)
 
 		if i%100 == 0 {
 			suite.podClient.EXPECT().
@@ -1539,8 +1607,6 @@ func (suite *ServiceHandlerTestSuite) TestGetTasksWithoutConfigs_ParallelismFail
 			}, nil).
 			MaxTimes(1)
 	}
-
-	suite.expectQueryPods(jobID, podNames, labels, entityVersion, 1)
 
 	resp, err := suite.handler.GetTasksWithoutConfigs(suite.ctx, query)
 	suite.NoError(err)
@@ -1663,14 +1729,31 @@ func (suite *ServiceHandlerTestSuite) TestGetTasksWithoutConfigs_QueryPreviousRu
 		},
 	}
 
-	expectedPodNames := make(map[string]struct{})
 	expectedTaskIds := make(map[string]struct{})
-
 	for _, e := range expectPods {
 		podName := &peloton.PodName{Value: jobID.GetValue() + "-" + e.instanceID}
-		expectedPodNames[podName.GetValue()] = struct{}{}
-
 		podID := &peloton.PodID{Value: podName.GetValue() + "-" + e.runID}
+
+		suite.podClient.EXPECT().
+			GetPod(gomock.Any(), &podsvc.GetPodRequest{
+				PodName:    podName,
+				StatusOnly: false,
+				Limit:      1,
+			}).Return(&podsvc.GetPodResponse{
+			Current: &pod.PodInfo{
+				Spec: &pod.PodSpec{
+					PodName:    podName,
+					Labels:     labels,
+					Containers: []*pod.ContainerSpec{{}},
+				},
+				Status: &pod.PodStatus{
+					PodId:   podID,
+					Host:    "peloton-host-0",
+					State:   pod.PodState_POD_STATE_RUNNING,
+					Version: entityVersion,
+				},
+			},
+		}, nil).AnyTimes()
 
 		var prevPodID *peloton.PodID
 		if e.prevRunID != "" {
@@ -1714,14 +1797,6 @@ func (suite *ServiceHandlerTestSuite) TestGetTasksWithoutConfigs_QueryPreviousRu
 		}
 	}
 
-	// Sets up QueryPods for the specific jobID - the result
-	// contains a list of pods from current run
-	var podNames []*peloton.PodName
-	for p := range expectedPodNames {
-		podNames = append(podNames, &peloton.PodName{Value: p})
-	}
-	suite.expectQueryPods(jobID, podNames, labels, entityVersion, 3)
-
 	resp, err := suite.handler.GetTasksWithoutConfigs(suite.ctx, query)
 	suite.NoError(err)
 	suite.Equal(api.ResponseCodeOk, resp.GetResponseCode())
@@ -1733,6 +1808,268 @@ func (suite *ServiceHandlerTestSuite) TestGetTasksWithoutConfigs_QueryPreviousRu
 		_, ok := expectedTaskIds[t.GetAssignedTask().GetTaskId()]
 		suite.True(ok)
 	}
+}
+
+// TestGetTasksWithoutConfigs_MultiJobsSuccess tests parallel fetching of
+// multiple jobs on GetTasksWithoutConfig success scenario
+func (suite *ServiceHandlerTestSuite) TestGetTasksWithoutConfigs_MultiJobsSuccess() {
+	defer goleak.VerifyNoLeaks(suite.T())
+
+	query := &api.TaskQuery{Role: ptr.String("role")}
+	jobKeys := []*api.JobKey{
+		{Role: ptr.String("role"), Environment: ptr.String("env"), Name: ptr.String("name1")},
+		{Role: ptr.String("role"), Environment: ptr.String("env"), Name: ptr.String("name2")},
+		{Role: ptr.String("role"), Environment: ptr.String("env"), Name: ptr.String("name3")},
+	}
+	jobIDs := []*peloton.JobID{
+		fixture.PelotonJobID(),
+		fixture.PelotonJobID(),
+		fixture.PelotonJobID(),
+	}
+	var labels [][]*peloton.Label
+	for _, jobKey := range jobKeys {
+		labels = append(labels, fixture.DefaultPelotonJobLabels(jobKey))
+	}
+
+	var jobCache []*jobmgrsvc.QueryJobCacheResponse_JobCache
+	for i := range jobIDs {
+		jobCache = append(jobCache, &jobmgrsvc.QueryJobCacheResponse_JobCache{
+			JobId: jobIDs[i],
+			Name:  atop.NewJobName(jobKeys[i]),
+		})
+	}
+	entityVersion := fixture.PelotonEntityVersion()
+
+	suite.jobmgrClient.EXPECT().
+		QueryJobCache(gomock.Any(), &jobmgrsvc.QueryJobCacheRequest{
+			Spec: &jobmgrsvc.QueryJobCacheRequest_CacheQuerySpec{
+				Labels: []*peloton.Label{
+					label.NewAuroraJobKeyRole("role"),
+					common.BridgeJobLabel,
+				},
+			},
+		}).
+		Return(&jobmgrsvc.QueryJobCacheResponse{
+			Result: jobCache,
+		}, nil)
+
+	for i, jobID := range jobIDs {
+		if i == 1 {
+			// Expect handler to skip jobs with "not found error"
+			suite.jobClient.EXPECT().
+				GetJob(gomock.Any(), &statelesssvc.GetJobRequest{
+					SummaryOnly: true,
+					JobId:       jobID,
+				}).
+				Return(nil, yarpcerrors.NotFoundErrorf("job not found"))
+		} else {
+			suite.jobClient.EXPECT().
+				GetJob(gomock.Any(), &statelesssvc.GetJobRequest{
+					SummaryOnly: true,
+					JobId:       jobID,
+				}).
+				Return(&statelesssvc.GetJobResponse{
+					Summary: &stateless.JobSummary{
+						JobId:         jobID,
+						Name:          atop.NewJobName(jobKeys[i]),
+						InstanceCount: 1000,
+					},
+				}, nil)
+		}
+	}
+
+	for i, jobID := range jobIDs {
+		if i == 1 {
+			continue
+		}
+
+		label := labels[i]
+		for j := 0; j < 1000; j++ {
+			podName := &peloton.PodName{
+				Value: util.CreatePelotonTaskID(jobID.GetValue(), uint32(j)),
+			}
+			podID := &peloton.PodID{Value: podName.GetValue() + "-1"}
+
+			suite.podClient.EXPECT().
+				GetPod(gomock.Any(), &podsvc.GetPodRequest{
+					PodName:    podName,
+					StatusOnly: false,
+					Limit:      1,
+				}).Return(&podsvc.GetPodResponse{
+				Current: &pod.PodInfo{
+					Spec: &pod.PodSpec{
+						PodName:    podName,
+						Labels:     label,
+						Containers: []*pod.ContainerSpec{{}},
+					},
+					Status: &pod.PodStatus{
+						PodId:   podID,
+						Host:    "peloton-host-0",
+						State:   pod.PodState_POD_STATE_RUNNING,
+						Version: entityVersion,
+					},
+				},
+			}, nil)
+
+			suite.podClient.EXPECT().
+				GetPodEvents(gomock.Any(), &podsvc.GetPodEventsRequest{
+					PodName: podName,
+				}).
+				Return(&podsvc.GetPodEventsResponse{
+					Events: []*pod.PodEvent{
+						{
+							PodId:       podID,
+							Timestamp:   "2019-01-03T22:14:58Z",
+							Message:     "",
+							ActualState: pod.PodState_POD_STATE_RUNNING.String(),
+							Hostname:    "peloton-host-0",
+						},
+					},
+				}, nil)
+		}
+	}
+
+	resp, err := suite.handler.GetTasksWithoutConfigs(suite.ctx, query)
+	suite.NoError(err)
+	suite.Equal(api.ResponseCodeOk, resp.GetResponseCode())
+	suite.Len(resp.GetResult().GetScheduleStatusResult().GetTasks(), 2000)
+}
+
+// TestGetTasksWithoutConfigs_MultiJobsFailure tests parallel fetching of
+// multiple jobs on GetTasksWithoutConfig failure scenario
+func (suite *ServiceHandlerTestSuite) TestGetTasksWithoutConfigs_MultiJobsFailure() {
+	defer goleak.VerifyNoLeaks(suite.T())
+
+	query := &api.TaskQuery{Role: ptr.String("role")}
+	jobKeys := []*api.JobKey{
+		{Role: ptr.String("role"), Environment: ptr.String("env"), Name: ptr.String("name1")},
+		{Role: ptr.String("role"), Environment: ptr.String("env"), Name: ptr.String("name2")},
+		{Role: ptr.String("role"), Environment: ptr.String("env"), Name: ptr.String("name3")},
+	}
+	jobIDs := []*peloton.JobID{
+		fixture.PelotonJobID(),
+		fixture.PelotonJobID(),
+		fixture.PelotonJobID(),
+	}
+	var labels [][]*peloton.Label
+	for _, jobKey := range jobKeys {
+		labels = append(labels, fixture.DefaultPelotonJobLabels(jobKey))
+	}
+	var jobCache []*jobmgrsvc.QueryJobCacheResponse_JobCache
+	for i := range jobIDs {
+		jobCache = append(jobCache, &jobmgrsvc.QueryJobCacheResponse_JobCache{
+			JobId: jobIDs[i],
+			Name:  atop.NewJobName(jobKeys[i]),
+		})
+	}
+	entityVersion := fixture.PelotonEntityVersion()
+
+	suite.jobmgrClient.EXPECT().
+		QueryJobCache(gomock.Any(), &jobmgrsvc.QueryJobCacheRequest{
+			Spec: &jobmgrsvc.QueryJobCacheRequest_CacheQuerySpec{
+				Labels: []*peloton.Label{
+					label.NewAuroraJobKeyRole("role"),
+					common.BridgeJobLabel,
+				},
+			},
+		}).
+		Return(&jobmgrsvc.QueryJobCacheResponse{
+			Result: jobCache,
+		}, nil)
+
+	for i, jobID := range jobIDs {
+		if i == 1 {
+			// Expect handler to skip jobs with "not found error"
+			suite.jobClient.EXPECT().
+				GetJob(gomock.Any(), &statelesssvc.GetJobRequest{
+					SummaryOnly: true,
+					JobId:       jobID,
+				}).
+				Return(nil, yarpcerrors.NotFoundErrorf("job not found"))
+		} else {
+			suite.jobClient.EXPECT().
+				GetJob(gomock.Any(), &statelesssvc.GetJobRequest{
+					SummaryOnly: true,
+					JobId:       jobID,
+				}).
+				Return(&statelesssvc.GetJobResponse{
+					Summary: &stateless.JobSummary{
+						JobId:         jobID,
+						Name:          atop.NewJobName(jobKeys[i]),
+						InstanceCount: 1000,
+					},
+				}, nil)
+		}
+	}
+
+	for i, jobID := range jobIDs {
+		if i == 1 {
+			continue
+		}
+
+		label := labels[i]
+		for j := 0; j < 1000; j++ {
+			podName := &peloton.PodName{
+				Value: util.CreatePelotonTaskID(jobID.GetValue(), uint32(j)),
+			}
+			podID := &peloton.PodID{Value: podName.GetValue() + "-1"}
+
+			suite.podClient.EXPECT().
+				GetPod(gomock.Any(), &podsvc.GetPodRequest{
+					PodName:    podName,
+					StatusOnly: false,
+					Limit:      1,
+				}).Return(&podsvc.GetPodResponse{
+				Current: &pod.PodInfo{
+					Spec: &pod.PodSpec{
+						PodName:    podName,
+						Labels:     label,
+						Containers: []*pod.ContainerSpec{{}},
+					},
+					Status: &pod.PodStatus{
+						PodId:   podID,
+						Host:    "peloton-host-0",
+						State:   pod.PodState_POD_STATE_RUNNING,
+						Version: entityVersion,
+					},
+				},
+			}, nil)
+
+			if i%100 == 0 {
+				suite.podClient.EXPECT().
+					GetPodEvents(gomock.Any(), &podsvc.GetPodEventsRequest{
+						PodName: podName,
+					}).
+					Return(&podsvc.GetPodEventsResponse{},
+						errors.New("failed to get pod events")).
+					MaxTimes(1)
+				continue
+			}
+
+			suite.podClient.EXPECT().
+				GetPodEvents(gomock.Any(), &podsvc.GetPodEventsRequest{
+					PodName: podName,
+				}).
+				Return(&podsvc.GetPodEventsResponse{
+					Events: []*pod.PodEvent{
+						{
+							PodId:       podID,
+							Timestamp:   "2019-01-03T22:14:58Z",
+							Message:     "",
+							ActualState: pod.PodState_POD_STATE_RUNNING.String(),
+							Hostname:    "peloton-host-0",
+						},
+					},
+				}, nil).
+				MaxTimes(1)
+		}
+	}
+
+	resp, err := suite.handler.GetTasksWithoutConfigs(suite.ctx, query)
+	suite.NoError(err)
+	suite.Equal(api.ResponseCodeError, resp.GetResponseCode())
+	suite.Len(resp.GetResult().GetScheduleStatusResult().GetTasks(), 0)
+	suite.NotEmpty(resp.GetDetails())
 }
 
 // Ensures that KillTasks maps to StopPods correctly.
@@ -3983,4 +4320,50 @@ func (suite *ServiceHandlerTestSuite) TestChangeBridgeUpdateLabel() {
 	p3n := suite.handler.changeBridgeUpdateLabel(p3)
 	suite.Len(p3.GetLabels(), 1)
 	suite.Equal(common.BridgeUpdateLabelKey, p3n.GetLabels()[1].GetKey())
+}
+
+// TestGetPodRunsLimit tests getPodRunsLimit
+func TestGetPodRunsLimit(t *testing.T) {
+	testCases := []struct {
+		name         string
+		podsNum      uint32
+		podsMax      uint32
+		podRunsDepth uint32
+		wantPodRuns  uint32
+	}{
+		{
+			name:         "test total pods less than pod max",
+			podsNum:      100,
+			podsMax:      1000,
+			podRunsDepth: 5,
+			wantPodRuns:  5,
+		},
+		{
+			name:         "test total pods larger than pod max, calculated depth larger than min pod run depth",
+			podsNum:      300,
+			podsMax:      1000,
+			podRunsDepth: 6,
+			wantPodRuns:  4,
+		},
+		{
+			name:         "test total pods larger than pod max, calculated depth less than min pod run depth",
+			podsNum:      1000,
+			podsMax:      1000,
+			podRunsDepth: 5,
+			wantPodRuns:  minPodRunsDepth,
+		},
+		{
+			name:         "test total pods larger than pod max, calculated depth less than min pod run depth, but pod_runs_depth is less min_pod_runs_depth",
+			podsNum:      1000,
+			podsMax:      1000,
+			podRunsDepth: 1,
+			wantPodRuns:  util.Min(1, minPodRunsDepth),
+		},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			l := getPodRunsLimit(tc.podsNum, tc.podsMax, tc.podRunsDepth)
+			assert.Equal(t, tc.wantPodRuns, l)
+		})
+	}
 }

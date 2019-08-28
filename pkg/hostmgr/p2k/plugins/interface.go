@@ -17,9 +17,7 @@ package plugins
 import (
 	"context"
 
-	pbpod "github.com/uber/peloton/.gen/peloton/api/v1alpha/pod"
-
-	"github.com/uber/peloton/pkg/hostmgr/p2k/plugins/k8s"
+	"github.com/uber/peloton/pkg/hostmgr/models"
 	"github.com/uber/peloton/pkg/hostmgr/p2k/scalar"
 )
 
@@ -27,31 +25,20 @@ import (
 // different underlying cluster management systems.
 type Plugin interface {
 	// Start the plugin.
-	Start()
+	Start() error
 
 	// Stop the plugin.
 	Stop()
 
-	// LaunchPod launches a pod on a host.
-	LaunchPod(podSpec *pbpod.PodSpec, podID, hostname string) error
+	// LaunchPods launch a list of pods on a host.
+	LaunchPods(ctx context.Context, pods []*models.LaunchablePod, hostname string) error
 
 	// KillPod kills a pod on a host.
-	KillPod(podID string) error
+	KillPod(ctx context.Context, podID string) error
 
 	// AckPodEvent is only implemented by mesos plugin. For K8s this is a noop.
 	AckPodEvent(ctx context.Context, event *scalar.PodEvent)
 
 	// ReconcileHosts will return the current state of hosts in the cluster.
 	ReconcileHosts() ([]*scalar.HostInfo, error)
-}
-
-// New returns a new instance of Plugin based on the input config.
-func New(
-	configPath string,
-	podEventsCh chan<- *scalar.PodEvent,
-	hostEventCh chan<- *scalar.HostEvent,
-) (Plugin, error) {
-	// Input is config, initialize either mesos plugin or k8s plugin based on
-	// input config. for now keep k8s plugin as default.
-	return k8s.NewK8sManager(configPath, podEventsCh, hostEventCh)
 }

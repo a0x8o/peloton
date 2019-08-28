@@ -46,6 +46,8 @@ const (
 	PelotonCLI = "peloton-cli"
 	// PelotonAuroraBridge application name
 	PelotonAuroraBridge = "peloton-aurorabridge"
+	// PelotonAPIProxy application name
+	PelotonAPIProxy = "peloton-api-proxy"
 
 	// Cqos advisor application name
 	QoSAdvisorService = "qosadvisorservice"
@@ -151,10 +153,18 @@ const (
 
 	// DefaultHostPoolID is the ID of default host pool.
 	DefaultHostPoolID = "default"
+
+	// HostPoolKey is the key of host pool constraint.
+	HostPoolKey = "host_pool"
 )
 
 const (
 	// ReservedProtobufFieldPrefix represents the field prefixes in protobuf generated
 	// code that is private to generated code, and should not be used by peloton.
 	ReservedProtobufFieldPrefix = "XXX_"
+)
+
+const (
+	// RPCPelotonV0HostServiceName is the name of Peloton rpc host service.
+	RPCPelotonV0HostServiceName = "peloton.api.v0.host.svc.HostService"
 )

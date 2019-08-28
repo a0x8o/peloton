@@ -487,6 +487,10 @@ var (
 	jobMgrQueryJobCacheLabels = jobMgrQueryJobCache.Flag("labels", "labels").Default("").Short('l').String()
 	jobMgrQueryJobCacheName   = jobMgrQueryJobCache.Flag("name", "name of the job to return").Default("").Short('n').String()
 
+	jobMgrInstanceAvailability          = jobMgr.Command("instance-availability", "get instance availability information")
+	jobMgrInstanceAvailabilityName      = jobMgrInstanceAvailability.Arg("job", "job identifier").Required().String()
+	jobMgrInstanceAvailabilityInstances = jobMgrInstanceAvailability.Flag("instances", "comma separated instance ids to filter").Default("").Short('i').String()
+
 	// Top level resource manager state command
 	resMgr      = app.Command("resmgr", "fetch resource manager state")
 	resMgrTasks = resMgr.Command("tasks", "fetch resource manager task state")
@@ -619,11 +623,40 @@ var (
 	offers = hostmgr.Command("offers", "list all outstanding offers")
 
 	// command for listing hosts
-	getHosts          = hostmgr.Command("hosts", "list all hosts matching the query")
-	getHostsCPU       = getHosts.Flag("cpu", "compare cpu cores available at the host, ignore if not provided").Short('c').Default("0").Float64()
-	getHostsGPU       = getHosts.Flag("gpu", "compare gpu cores available at the host, ignore if not provided").Short('g').Default("0").Float64()
-	getHostsCmpLess   = getHosts.Flag("less", "list hosts with resources less than cpu and/or gpu cores specified (default to greater than and equal to if not specified)").Short('l').Default("false").Bool()
-	getHostsHostnames = getHosts.Flag("hosts", "filter the hosts based on the comma separated hostnames provided").String()
+	getHosts    = hostmgr.Command("hosts", "list all hosts matching the query")
+	getHostsCPU = getHosts.Flag(
+		"cpu",
+		"compare cpu cores available at the host, ignore if not provided",
+	).Short('c').
+		Default("0").
+		Float64()
+	getHostsGPU = getHosts.Flag(
+		"gpu",
+		"compare gpu cores available at the host, ignore if not provided",
+	).Short('g').
+		Default("0").
+		Float64()
+	getHostsMem = getHosts.Flag(
+		"mem",
+		"compare memory available at the host, ignore if not provided",
+	).Default("0").
+		Float64()
+	getHostsDisk = getHosts.Flag(
+		"disk",
+		"compare disk available at the host, ignore if not provided",
+	).Default("0").
+		Float64()
+	getHostsCmpLess = getHosts.Flag(
+		"less",
+		"list hosts with resources less than resources specified (default to "+
+			"greater than and equal to if not specified)",
+	).Short('l').
+		Default("false").
+		Bool()
+	getHostsHostnames = getHosts.Flag(
+		"hosts",
+		"filter the hosts based on the comma separated hostnames provided",
+	).String()
 
 	// command to watch mesos events update present in the event stream
 	watchEventMesosUpdate = hostmgr.Command("events-mesos-update", "watch mesos event update received from mesos")
@@ -648,6 +681,52 @@ var (
 	// Top level hostcache commands
 	hostcache     = hostmgr.Command("hostcache", "manage hostcache")
 	hostcacheDump = hostcache.Command("dump", "dump hostcache contents")
+
+	// Top level hostpool commands
+	hostpool = hostmgr.Command("hostpool", "manage host pools")
+
+	hostpoolList = hostpool.Command("list", "list all pools")
+
+	hostpoolListHosts     = hostpool.Command("list-hosts", "list hosts in a pool")
+	hostpoolListHostsName = hostpoolListHosts.Arg(
+		"name",
+		"name of host pool").
+		Required().
+		String()
+
+	hostpoolCreate     = hostpool.Command("create", "create a host pool")
+	hostpoolCreateName = hostpoolCreate.Arg(
+		"name",
+		"name of host pool").
+		Required().
+		String()
+
+	hostpoolDelete     = hostpool.Command("delete", "delete a host pool")
+	hostpoolDeleteName = hostpoolDelete.Arg(
+		"name",
+		"name of host pool").
+		Required().
+		String()
+
+	hostpoolChangePool = hostpool.Command(
+		"change",
+		"change host pool of a host")
+	hostpoolChangePoolHost = hostpoolChangePool.Arg(
+		"host",
+		"name of host").
+		Required().
+		String()
+	hostpoolChangePoolDest = hostpoolChangePool.Arg(
+		"dest",
+		"destination pool of host").
+		Required().
+		String()
+	hostpoolChangePoolSource = hostpoolChangePool.Flag(
+		"source",
+		"source pool of host").
+		Short('s').
+		Default("").
+		String()
 )
 
 // TaskRangeValue allows us to define a new target type for kingpin to allow specifying ranges of tasks with from:to syntax as a TaskRangeFlag
@@ -832,6 +911,8 @@ func main() {
 		err = client.JobGetCacheAction(*jobGetCacheName)
 	case jobGetActiveJobs.FullCommand():
 		err = client.JobGetActiveJobsAction()
+	case jobMgrInstanceAvailability.FullCommand():
+		err = client.JobMgrGetInstanceAvailabilityInfoForJob(*jobMgrInstanceAvailabilityName, *jobMgrInstanceAvailabilityInstances)
 	case taskGet.FullCommand():
 		err = client.TaskGetAction(*taskGetJobName, *taskGetInstanceID)
 	case taskGetCache.FullCommand():
@@ -914,7 +995,14 @@ func main() {
 	case offers.FullCommand():
 		err = client.OffersGetAction()
 	case getHosts.FullCommand():
-		err = client.HostsGetAction(*getHostsCPU, *getHostsGPU, *getHostsCmpLess, *getHostsHostnames)
+		err = client.HostsGetAction(
+			*getHostsCPU,
+			*getHostsGPU,
+			*getHostsMem,
+			*getHostsDisk,
+			*getHostsCmpLess,
+			*getHostsHostnames,
+		)
 	case disableKillTasks.FullCommand():
 		err = client.DisableKillTasksAction()
 	case podGetEvents.FullCommand():
@@ -1054,6 +1142,19 @@ func main() {
 		err = client.LockComponents(*lockComponents)
 	case unlock.FullCommand():
 		err = client.UnlockComponents(*unlockComponents)
+	case hostpoolList.FullCommand():
+		err = client.HostPoolList()
+	case hostpoolListHosts.FullCommand():
+		err = client.HostPoolListHosts(*hostpoolListHostsName)
+	case hostpoolCreate.FullCommand():
+		err = client.HostPoolCreate(*hostpoolCreateName)
+	case hostpoolDelete.FullCommand():
+		err = client.HostPoolDelete(*hostpoolDeleteName)
+	case hostpoolChangePool.FullCommand():
+		err = client.HostPoolChangePool(
+			*hostpoolChangePoolHost,
+			*hostpoolChangePoolSource,
+			*hostpoolChangePoolDest)
 	default:
 		app.Fatalf("Unknown command %s", cmd)
 	}

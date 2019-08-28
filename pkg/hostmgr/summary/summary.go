@@ -17,14 +17,15 @@ package summary
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
 	mesos "github.com/uber/peloton/.gen/mesos/v1"
 	"github.com/uber/peloton/.gen/peloton/api/v0/peloton"
+	"github.com/uber/peloton/.gen/peloton/api/v0/task"
 	halphapb "github.com/uber/peloton/.gen/peloton/api/v1alpha/host"
 	"github.com/uber/peloton/.gen/peloton/private/hostmgr/hostsvc"
-
 	"github.com/uber/peloton/pkg/common/constraints"
 	"github.com/uber/peloton/pkg/common/util"
 	"github.com/uber/peloton/pkg/hostmgr/host"
@@ -116,11 +117,19 @@ type HostSummary interface {
 	// and unreserved offer.
 	HasAnyOffer() bool
 
+	// GetTasks returns tasks placed or running on this host.
+	GetTasks() []*mesos.TaskID
+
+	// UpdateTasksOnHost updates the state of task placed or running on this host.
+	// If task state is terminal then remove from HostToTaskMap.
+	UpdateTasksOnHost(taskID string, taskState task.TaskState, taskInfo *task.TaskInfo)
+
 	// TryMatch atomically tries to match offers from the current host with
 	// given constraint.
 	TryMatch(
 		hostFilter *hostsvc.HostFilter,
-		evaluator constraints.Evaluator) Match
+		evaluator constraints.Evaluator,
+		labelValues constraints.LabelValues) Match
 
 	// AddMesosOffer adds a Mesos offers to the current HostSummary.
 	AddMesosOffers(ctx context.Context, offer []*mesos.Offer) HostStatus
@@ -132,7 +141,10 @@ type HostSummary interface {
 	// ClaimForLaunch releases unreserved offers for task launch.
 	// An optional list of task ids is provided if the host is held for
 	// the tasks
-	ClaimForLaunch(hostOfferID string, taskIDs ...*peloton.TaskID) (map[string]*mesos.Offer, error)
+	ClaimForLaunch(
+		hostOfferID string,
+		launchableTasks []*hostsvc.LaunchableTask,
+		taskIDs ...*peloton.TaskID) (map[string]*mesos.Offer, error)
 
 	// CasStatus atomically sets the status to new value if current value is old,
 	// otherwise returns error.
@@ -230,6 +242,11 @@ type hostSummary struct {
 	// key is the task id, value is the expiration time
 	// of the hold
 	heldTasks map[string]time.Time
+
+	// a map to present tasks assigned or running on this host
+	// key is the mesos tasks id and value is the current task state
+	tasks map[string]*task.TaskInfo
+
 	// watchProcessor
 	watchProcessor watchevent.WatchProcessor
 }
@@ -246,6 +263,7 @@ func New(
 		unreservedOffers:    make(map[string]*mesos.Offer),
 		reservedOffers:      make(map[string]*mesos.Offer),
 		heldTasks:           make(map[string]time.Time),
+		tasks:               make(map[string]*task.TaskInfo),
 		scarceResourceTypes: scarceResourceTypes,
 		slackResourceTypes:  slackResourceTypes,
 
@@ -276,6 +294,46 @@ func (a *hostSummary) HasAnyOffer() bool {
 	return len(a.unreservedOffers) > 0
 }
 
+// GetTasks returns tasks placed or running on this host.
+func (a *hostSummary) GetTasks() []*mesos.TaskID {
+	a.Lock()
+	defer a.Unlock()
+
+	var result []*mesos.TaskID
+	for taskID := range a.tasks {
+		t := taskID
+		result = append(result, &mesos.TaskID{Value: &t})
+	}
+
+	return result
+}
+
+// UpdateTasksOnHost updates the list of tasks on this host.
+// It can perform one of following actions
+// - Add/Update the status of task based on recovery or eventstream.
+// - Remove the task from the list if task state is terminal.
+func (a *hostSummary) UpdateTasksOnHost(
+	taskID string,
+	taskState task.TaskState,
+	taskInfo *task.TaskInfo) {
+	a.Lock()
+	defer a.Unlock()
+
+	switch {
+	case util.IsPelotonStateTerminal(taskState):
+		delete(a.tasks, taskID)
+	case taskInfo != nil:
+		a.tasks[taskID] = taskInfo
+	default:
+		taskInfo, ok := a.tasks[taskID]
+		if !ok {
+			return
+		}
+
+		taskInfo.Runtime.State = taskState
+	}
+}
+
 // Match represents the result of a match
 type Match struct {
 	// The result of the match
@@ -284,12 +342,52 @@ type Match struct {
 	Offer *Offer
 }
 
-// matchConstraint determines whether given HostFilter matches
+// isHostLimitConstraintSatisfy validates task to task affinity constraint.
+// It limits number of tasks for same service to run on same host.
+func (a *hostSummary) isHostLimitConstraintSatisfy(
+	labelConstraint *task.LabelConstraint,
+) bool {
+
+	// Aggregates label count for all tasks running on this host.
+	// label_key -> label_value -> count
+	labelsCount := make(map[string]map[string]uint32)
+	for _, task := range a.tasks {
+		labels := task.GetConfig().GetLabels()
+
+		for _, label := range labels {
+			key := label.GetKey()
+			value := label.GetValue()
+
+			if _, ok := labelsCount[key]; !ok {
+				labelsCount[key] = map[string]uint32{value: 1}
+				continue
+			}
+
+			labelsCount[key][value] = labelsCount[key][value] + 1
+		}
+	}
+
+	// Checks whether label constraint requirement is met or not.
+	// requirement = 1 && zero task running -> satisfies the requirement
+	// requirement = 1 && one task running -> does not satisfy requirement
+	// requirement = 2 && one task running -> satisfies the requirement
+	label := labelConstraint.GetLabel()
+	if labelCountValue, ok := labelsCount[label.GetKey()]; ok {
+		if labelCountValue[label.GetValue()] >= labelConstraint.GetRequirement() {
+			return false
+		}
+	}
+
+	return true
+}
+
+// matchHostFilter determines whether given HostFilter matches
 // the given map of offers.
 func matchHostFilter(
 	offerMap map[string]*mesos.Offer,
 	c *hostsvc.HostFilter,
 	evaluator constraints.Evaluator,
+	labelValues constraints.LabelValues,
 	scalarAgentRes scalar.Resources,
 	scarceResourceTypes []string) hostsvc.HostFilterResult {
 
@@ -345,49 +443,8 @@ func matchHostFilter(
 	hostname := firstOffer.GetHostname()
 	hc := c.GetSchedulingConstraint()
 
-	// If constraints don't specify an exclusive host, then reject
-	// hosts that are designated as exclusive
-	if constraints.IsNonExclusiveConstraint(hc) &&
-		hmutil.HasExclusiveAttribute(firstOffer.GetAttributes()) {
-		log.WithField("hostname", hostname).Debug("Skipped exclusive host")
-		return hostsvc.HostFilterResult_MISMATCH_CONSTRAINTS
-	}
-
-	if hc == nil {
-		// No scheduling constraint, we have a match
-		return hostsvc.HostFilterResult_MATCH
-	}
-
-	lv := constraints.GetHostLabelValues(
-		hostname,
-		firstOffer.GetAttributes(),
-	)
-	result, err := evaluator.Evaluate(hc, lv)
-	if err != nil {
-		log.WithError(err).
-			Error("Error when evaluating input constraint")
-		return hostsvc.HostFilterResult_MISMATCH_CONSTRAINTS
-	}
-
-	switch result {
-	case constraints.EvaluateResultMatch:
-		fallthrough
-	case constraints.EvaluateResultNotApplicable:
-		log.WithFields(log.Fields{
-			"values":     lv,
-			"hostname":   hostname,
-			"constraint": hc,
-		}).Debug("Attributes match constraint")
-	default:
-		log.WithFields(log.Fields{
-			"values":     lv,
-			"hostname":   hostname,
-			"constraint": hc,
-		}).Debug("Attributes do not match constraint")
-		return hostsvc.HostFilterResult_MISMATCH_CONSTRAINTS
-	}
-
-	return hostsvc.HostFilterResult_MATCH
+	return hmutil.MatchSchedulingConstraint(
+		hostname, labelValues, firstOffer.GetAttributes(), hc, evaluator)
 }
 
 // TryMatch atomically tries to match offers from the current host with given
@@ -399,7 +456,8 @@ func matchHostFilter(
 // (actual reason, empty-slice) and status will remain unchanged.
 func (a *hostSummary) TryMatch(
 	filter *hostsvc.HostFilter,
-	evaluator constraints.Evaluator) Match {
+	evaluator constraints.Evaluator,
+	labelValues constraints.LabelValues) Match {
 	a.Lock()
 	defer a.Unlock()
 
@@ -433,10 +491,19 @@ func (a *hostSummary) TryMatch(
 		}
 	}
 
+	// Validates task affinity constraint for stateless workload
+	constraint := filter.GetSchedulingConstraint()
+	if constraint.GetType() == task.Constraint_LABEL_CONSTRAINT {
+		if !a.isHostLimitConstraintSatisfy(constraint.GetLabelConstraint()) {
+			return Match{Result: hostsvc.HostFilterResult_MISMATCH_CONSTRAINTS}
+		}
+	}
+
 	result := matchHostFilter(
 		a.unreservedOffers,
 		filter,
 		evaluator,
+		labelValues,
 		scalar.FromMesosResources(host.GetAgentInfo(a.GetHostname()).GetResources()),
 		a.scarceResourceTypes)
 
@@ -461,6 +528,7 @@ func (a *hostSummary) TryMatch(
 		}
 		offers = append(offers, offer)
 	}
+
 	// Setting status to `PlacingHost`: this ensures proper state
 	// tracking of resources on the host and also ensures offers on
 	// this host will not be sent to another `AcquireHostOffers`
@@ -502,6 +570,8 @@ func (a *hostSummary) AddMesosOffers(
 	offers []*mesos.Offer) HostStatus {
 	a.Lock()
 	defer a.Unlock()
+
+	var offerIDs []string
 	for _, offer := range offers {
 		// filter out revocable resources whose type we don't recognize
 		offerID := offer.GetId().GetValue()
@@ -518,10 +588,20 @@ func (a *hostSummary) AddMesosOffers(
 		} else {
 			a.reservedOffers[offerID] = offer
 		}
+
+		offerIDs = append(offerIDs, offer.GetId().GetValue())
 	}
+
 	if a.status == ReadyHost || a.status == HeldHost {
 		a.readyCount.Store(int32(len(a.unreservedOffers)))
 	}
+
+	log.WithFields(log.Fields{
+		"offer_ids":               strings.Join(offerIDs, ","),
+		"outstanding_offer_count": len(a.unreservedOffers),
+		"hostname":                a.GetHostname(),
+		"host_state":              a.status,
+	}).Info("offers added to host summary")
 
 	return a.status
 }
@@ -529,7 +609,10 @@ func (a *hostSummary) AddMesosOffers(
 // ClaimForLaunch atomically check that current hostSummary is in Placing
 // status, release offers so caller can use them to launch tasks, and reset
 // status to ready.
-func (a *hostSummary) ClaimForLaunch(hostOfferID string, taskIDs ...*peloton.TaskID) (map[string]*mesos.Offer,
+func (a *hostSummary) ClaimForLaunch(
+	hostOfferID string,
+	launchableTasks []*hostsvc.LaunchableTask,
+	taskIDs ...*peloton.TaskID) (map[string]*mesos.Offer,
 	error) {
 	a.Lock()
 	defer a.Unlock()
@@ -542,23 +625,25 @@ func (a *hostSummary) ClaimForLaunch(hostOfferID string, taskIDs ...*peloton.Tas
 		return nil, errors.New("host offer id does not match")
 	}
 
-	log.WithField("offer_id", hostOfferID).Debug("host offer match")
-
 	result := make(map[string]*mesos.Offer)
 	result, a.unreservedOffers = a.unreservedOffers, result
+
+	for _, t := range launchableTasks {
+		taskID := t.GetTaskId().GetValue()
+		a.tasks[taskID] = &task.TaskInfo{
+			Config: t.GetConfig(),
+			Runtime: &task.RuntimeInfo{
+				State:     task.TaskState_LAUNCHED,
+				StartTime: time.Now().Format(time.RFC3339Nano),
+			},
+		}
+	}
 
 	for _, taskID := range taskIDs {
 		a.releaseHoldForTaskLockFree(taskID)
 	}
 
 	newState := a.getResetStatus()
-
-	log.WithFields(log.Fields{
-		"hostname":   a.hostname,
-		"tasks":      taskIDs,
-		"new_status": newState,
-	}).Debug("host status changes after task launch")
-
 	// Reset status to held/ready depending on if the host is held for
 	// other tasks.
 	if err := a.casStatusLockFree(PlacingHost, newState); err != nil {
@@ -593,9 +678,10 @@ func (a *hostSummary) RemoveMesosOffer(offerID, reason string) (HostStatus, *mes
 	switch a.status {
 	case ReadyHost:
 		log.WithFields(log.Fields{
-			"offer":  offerID,
-			"reason": reason,
-		}).Debug("Ready offer removed")
+			"offer":    offerID,
+			"hostname": a.GetHostname(),
+			"reason":   reason,
+		}).Info("Ready offer removed")
 	default:
 		// This could trigger INVALID_OFFER error later.
 		log.WithFields(log.Fields{
@@ -700,6 +786,7 @@ func (a *hostSummary) ResetExpiredPlacingOfferStatus(now time.Time) (bool, scala
 		a.casStatusLockFree(PlacingHost, newStatus)
 		return true, scalar.FromOfferMap(a.unreservedOffers), taskExpired
 	}
+
 	return false, scalar.Resources{}, taskExpired
 }
 
@@ -847,7 +934,7 @@ func (a *hostSummary) HoldForTask(id *peloton.TaskID) error {
 // GetHeldTask returns a slice of task that puts the host in held
 func (a *hostSummary) GetHeldTask() []*peloton.TaskID {
 	a.Lock()
-	a.Unlock()
+	defer a.Unlock()
 
 	var result []*peloton.TaskID
 	for taskID := range a.heldTasks {

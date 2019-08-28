@@ -35,6 +35,7 @@ import (
 
 // Tracker is the interface for resource manager to
 // track all the tasks
+// TODO: Get rid of peloton-task-id from tracker
 type Tracker interface {
 
 	// AddTask adds the task to state machine
@@ -55,11 +56,11 @@ type Tracker interface {
 
 	// MarkItDone marks the task done and add back those
 	// resources to respool
-	MarkItDone(taskID *peloton.TaskID, mesosTaskID string) error
+	MarkItDone(mesosTaskID string) error
 
 	// MarkItInvalid marks the task done and invalidate them
 	// in to respool by that they can be removed from the queue
-	MarkItInvalid(taskID *peloton.TaskID, mesosTaskID string) error
+	MarkItInvalid(mesosTaskID string) error
 
 	// TasksByHosts returns all tasks of the given type running on the given hosts.
 	TasksByHosts(hosts []string, taskType resmgr.TaskType) map[string][]*RMTask
@@ -76,8 +77,8 @@ type Tracker interface {
 	// GetActiveTasks returns task states map
 	GetActiveTasks(jobID string, respoolID string, states []string) map[string][]*RMTask
 
-	// UpdateCounters updates the counters for each state
-	UpdateCounters(from task.TaskState, to task.TaskState)
+	// UpdateMetrics updates the task metrics
+	UpdateMetrics(from task.TaskState, to task.TaskState, taskResources *scalar.Resources)
 
 	// GetOrphanTask gets the orphan RMTask for the given mesos-task-id
 	GetOrphanTask(mesosTaskID string) *RMTask
@@ -88,6 +89,7 @@ type Tracker interface {
 
 // tracker is the rmtask tracker
 // map[taskid]*rmtask
+// TODO: Get rid of peloton-task-id from tracker
 type tracker struct {
 	lock sync.RWMutex
 
@@ -109,10 +111,14 @@ type tracker struct {
 	scope   tally.Scope
 	metrics *Metrics
 
-	// mutex for the state counters
-	cMutex sync.Mutex
+	// mutex for the task state metrics
+	metricsLock sync.Mutex
+
 	// map of task state to the count of tasks in the tracker
 	counters map[task.TaskState]float64
+
+	// map of task state to the resources held
+	resourcesHeldByTaskState map[task.TaskState]*scalar.Resources
 
 	// host manager client
 	hostMgrClient hostsvc.InternalHostServiceYARPCClient
@@ -132,12 +138,22 @@ func InitTaskTracker(
 
 	scope := parent.SubScope("tracker")
 	rmtracker = &tracker{
-		tasks:       make(map[string]*RMTask),
-		placements:  map[string]map[resmgr.TaskType]map[string]*RMTask{},
-		orphanTasks: make(map[string]*RMTask),
-		metrics:     NewMetrics(scope),
-		scope:       scope,
-		counters:    make(map[task.TaskState]float64),
+		tasks:                    make(map[string]*RMTask),
+		placements:               map[string]map[resmgr.TaskType]map[string]*RMTask{},
+		orphanTasks:              make(map[string]*RMTask),
+		metrics:                  NewMetrics(scope),
+		scope:                    scope,
+		counters:                 make(map[task.TaskState]float64),
+		resourcesHeldByTaskState: make(map[task.TaskState]*scalar.Resources),
+	}
+
+	// Initialize resources held by each non-terminal task state to zero resource.
+	for s := range task.TaskState_name {
+		taskState := task.TaskState(s)
+		// skip terminal states
+		if !util.IsPelotonStateTerminal(taskState) {
+			rmtracker.resourcesHeldByTaskState[taskState] = scalar.ZeroResource
+		}
 	}
 
 	// Checking placement back off is enabled , if yes then initialize
@@ -288,13 +304,17 @@ func (tr *tracker) DeleteTask(t *peloton.TaskID) {
 // this method is not protected, we need to lock tracker
 // before we use this.
 func (tr *tracker) deleteTask(t *peloton.TaskID) {
-	if rmTask, exists := tr.tasks[t.Value]; exists {
-		tr.clearPlacement(
-			rmTask.task.GetHostname(),
-			rmTask.task.GetType(),
-			rmTask.task.GetTaskId().GetValue(),
-		)
+	rmTask, exists := tr.tasks[t.Value]
+	if !exists {
+		return
 	}
+
+	tr.clearPlacement(
+		rmTask.task.GetHostname(),
+		rmTask.task.GetType(),
+		rmTask.task.GetTaskId().GetValue(),
+	)
+
 	delete(tr.tasks, t.Value)
 	tr.metrics.TasksCountInTracker.Update(float64(tr.GetSize()))
 }
@@ -302,33 +322,34 @@ func (tr *tracker) deleteTask(t *peloton.TaskID) {
 // MarkItDone updates the resources in resmgr and removes the task
 // from the tracker
 func (tr *tracker) MarkItDone(
-	tID *peloton.TaskID,
 	mesosTaskID string) error {
 	tr.lock.Lock()
 	defer tr.lock.Unlock()
 
-	t := tr.getTask(tID)
-	if t == nil {
-		return errors.Errorf("task %s is not in tracker", tID)
-	}
-	return tr.markItDone(t, mesosTaskID)
+	return tr.markItDone(mesosTaskID)
 }
 
 // MarkItInvalid marks the task done and invalidate them
 // in to respool by that they can be removed from the queue
-func (tr *tracker) MarkItInvalid(tID *peloton.TaskID, mesosTaskID string) error {
+func (tr *tracker) MarkItInvalid(mesosTaskID string) error {
 	tr.lock.Lock()
 	defer tr.lock.Unlock()
 
-	t := tr.getTask(tID)
-	if t == nil {
-		return errors.Errorf("task %s is not in tracker", tID)
-	}
-
-	// remove from the tracker
-	err := tr.markItDone(t, mesosTaskID)
+	taskID, err := util.ParseTaskIDFromMesosTaskID(mesosTaskID)
 	if err != nil {
 		return err
+	}
+
+	tID := &peloton.TaskID{Value: taskID}
+	t := tr.getTask(tID)
+
+	// remove from the tracker
+	if err = tr.markItDone(mesosTaskID); err != nil {
+		return err
+	}
+
+	if t == nil {
+		return nil
 	}
 
 	switch t.GetCurrentState().State {
@@ -346,16 +367,24 @@ func (tr *tracker) MarkItInvalid(tID *peloton.TaskID, mesosTaskID string) error 
 }
 
 // tracker needs to be locked before calling this.
-func (tr *tracker) markItDone(t *RMTask, mesosTaskID string) error {
-	// Checking mesos ID again if thats not changed
-	tID := t.Task().GetId()
+func (tr *tracker) markItDone(mesosTaskID string) error {
+	taskID, err := util.ParseTaskIDFromMesosTaskID(mesosTaskID)
+	if err != nil {
+		return err
+	}
 
-	// Checking mesos ID again if that has not changed
-	if t.Task().GetTaskId().GetValue() != mesosTaskID {
-		// If the mesos ID has changed, clear the placement.
-		// This can happen when jobmgr processes the mesos event faster than resmgr
-		// causing EnqueueGangs to be called before the task termination event
-		// is processed by resmgr.
+	tID := &peloton.TaskID{Value: taskID}
+	t := tr.getTask(tID)
+
+	if t == nil || t.Task().GetTaskId().GetValue() != mesosTaskID {
+		// If task is not in tracker or if the mesos ID has changed, clear the
+		// placement and free up the held resources.
+		// 1. `task not in tracker` - This can happen if resource manager receives
+		//     the task event for an older run after the latest run of the task
+		//     has been cleaned up from tracker.
+		// 2. `mesos ID has changed` - This can happen when jobmgr processes the
+		//     mesos event faster than resmgr causing EnqueueGangs to be called
+		//     before the task termination event is processed by resmgr.
 		return tr.deleteOrphanTask(mesosTaskID)
 	}
 
@@ -365,7 +394,23 @@ func (tr *tracker) markItDone(t *RMTask, mesosTaskID string) error {
 		t.GetCurrentState().State == task.TaskState_INITIALIZED) {
 		err := t.respool.SubtractFromAllocation(scalar.GetTaskAllocation(t.Task()))
 		if err != nil {
-			return errors.Errorf("failed update task %s ", tID)
+			return errors.Errorf("failed update task %s ", taskID)
+		}
+
+		tr.metricsLock.Lock()
+		defer tr.metricsLock.Unlock()
+
+		// update metrics
+		taskState := t.GetCurrentState().State
+		if val, ok := tr.resourcesHeldByTaskState[taskState]; ok {
+			tr.resourcesHeldByTaskState[taskState] = val.Subtract(
+				scalar.ConvertToResmgrResource(t.task.GetResource()),
+			)
+		}
+
+		// publish metrics
+		if gauge, ok := tr.metrics.ResourcesHeldByTaskState[taskState]; ok {
+			gauge.Update(tr.resourcesHeldByTaskState[taskState])
 		}
 	}
 
@@ -415,6 +460,20 @@ func (tr *tracker) AddResources(
 		return errors.Errorf("Not able to add resources for "+
 			"rmTask %s for respool %s ", tID, rmTask.respool.Name())
 	}
+
+	tr.metricsLock.Lock()
+	defer tr.metricsLock.Unlock()
+
+	taskState := rmTask.GetCurrentState().State
+	if val, ok := tr.resourcesHeldByTaskState[taskState]; ok {
+		tr.resourcesHeldByTaskState[taskState] = val.Add(res)
+	}
+
+	// publish metrics
+	if gauge, ok := tr.metrics.ResourcesHeldByTaskState[taskState]; ok {
+		gauge.Update(tr.resourcesHeldByTaskState[taskState])
+	}
+
 	log.WithFields(log.Fields{
 		"respool_id": rmTask.respool.ID(),
 		"resources":  res,
@@ -473,29 +532,50 @@ func (tr *tracker) GetActiveTasks(
 	return taskStates
 }
 
-// UpdateCounters updates the counters for each state. This can be called from
+// UpdateMetrics updates the task metrics. This can be called from
 // multiple goroutines.
-func (tr *tracker) UpdateCounters(from task.TaskState, to task.TaskState) {
-	tr.cMutex.Lock()
-	defer tr.cMutex.Unlock()
+func (tr *tracker) UpdateMetrics(
+	from task.TaskState,
+	to task.TaskState,
+	taskResources *scalar.Resources,
+) {
+	tr.metricsLock.Lock()
+	defer tr.metricsLock.Unlock()
 
 	// Reducing the count from state
-	if val, ok := tr.counters[from]; ok {
-		if val > 0 {
-			tr.counters[from] = val - 1
-		}
+	tr.counters[from]--
+	if tr.counters[from] < 0 {
+		tr.counters[from] = 0
 	}
 
 	// Incrementing the state counter to +1
-	if val, ok := tr.counters[to]; ok {
-		tr.counters[to] = val + 1
-	} else {
-		tr.counters[to] = 1
+	tr.counters[to]++
+
+	// Subtract resources from 'from' state
+	if res, ok := tr.resourcesHeldByTaskState[from]; ok {
+		tr.resourcesHeldByTaskState[from] = res.Subtract(taskResources)
 	}
 
-	// publishing all the counters
-	for state, gauge := range tr.metrics.TaskStatesGauge {
-		gauge.Update(tr.counters[state])
+	// Add resources to 'to' state
+	if res, ok := tr.resourcesHeldByTaskState[to]; ok {
+		tr.resourcesHeldByTaskState[to] = res.Add(taskResources)
+	}
+
+	// publish metrics
+	if gauge, ok := tr.metrics.TaskStatesGauge[from]; ok {
+		gauge.Update(tr.counters[from])
+	}
+
+	if gauge, ok := tr.metrics.TaskStatesGauge[to]; ok {
+		gauge.Update(tr.counters[to])
+	}
+
+	if gauge, ok := tr.metrics.ResourcesHeldByTaskState[from]; ok {
+		gauge.Update(tr.resourcesHeldByTaskState[from])
+	}
+
+	if gauge, ok := tr.metrics.ResourcesHeldByTaskState[to]; ok {
+		gauge.Update(tr.resourcesHeldByTaskState[to])
 	}
 }
 
@@ -545,6 +625,22 @@ func (tr *tracker) deleteOrphanTask(mesosTaskID string) error {
 	}
 
 	delete(tr.orphanTasks, mesosTaskID)
+
+	// update metrics
+	tr.metricsLock.Lock()
+	defer tr.metricsLock.Unlock()
+
+	taskState := rmTask.GetCurrentState().State
+	if val, ok := tr.resourcesHeldByTaskState[taskState]; ok {
+		tr.resourcesHeldByTaskState[taskState] = val.Subtract(
+			scalar.ConvertToResmgrResource(rmTask.task.GetResource()),
+		)
+	}
+
+	// publish metrics
+	if gauge, ok := tr.metrics.ResourcesHeldByTaskState[taskState]; ok {
+		gauge.Update(tr.resourcesHeldByTaskState[taskState])
+	}
 
 	log.WithFields(log.Fields{
 		"orphan_task": mesosTaskID,

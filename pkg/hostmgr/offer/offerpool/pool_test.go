@@ -22,11 +22,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/golang/mock/gomock"
-	"github.com/stretchr/testify/suite"
-	"github.com/uber-go/tally"
-	"go.uber.org/goleak"
-
 	mesos "github.com/uber/peloton/.gen/mesos/v1"
 	sched "github.com/uber/peloton/.gen/mesos/v1/scheduler"
 	"github.com/uber/peloton/.gen/peloton/api/v0/peloton"
@@ -39,11 +34,17 @@ import (
 	"github.com/uber/peloton/pkg/hostmgr/binpacking"
 	hostmgr_mesos_mocks "github.com/uber/peloton/pkg/hostmgr/mesos/mocks"
 	mpb_mocks "github.com/uber/peloton/pkg/hostmgr/mesos/yarpc/encoding/mpb/mocks"
+	"github.com/uber/peloton/pkg/hostmgr/metrics"
 	"github.com/uber/peloton/pkg/hostmgr/scalar"
 	"github.com/uber/peloton/pkg/hostmgr/summary"
 	hostmgr_summary_mocks "github.com/uber/peloton/pkg/hostmgr/summary/mocks"
 	hmutil "github.com/uber/peloton/pkg/hostmgr/util"
 	watchmocks "github.com/uber/peloton/pkg/hostmgr/watchevent/mocks"
+
+	"github.com/golang/mock/gomock"
+	"github.com/stretchr/testify/suite"
+	"github.com/uber-go/tally"
+	"go.uber.org/goleak"
 )
 
 const (
@@ -57,6 +58,7 @@ const (
 	_streamID       = "streamID"
 	_dummyOfferID   = "dummyOfferID"
 	_dummyTestAgent = "dummyTestAgent"
+	_rpcTimeout     = 15 * time.Second
 )
 
 func getMesosOffer(hostName string, offerID string) *mesos.Offer {
@@ -112,6 +114,8 @@ type OfferPoolTestSuite struct {
 	agent3Offers         []*mesos.Offer
 	agent4Offers         []*mesos.Offer
 	watchProcessor       *watchmocks.MockWatchProcessor
+	cancelFunc           context.CancelFunc
+	metric               *metrics.Metrics
 }
 
 func (suite *OfferPoolTestSuite) SetupSuite() {
@@ -133,11 +137,13 @@ func (suite *OfferPoolTestSuite) SetupSuite() {
 			suite.agent4Offers = append(suite.agent4Offers, offers...)
 		}
 	}
-	binpacking.Init(nil)
+	binpacking.Init(nil, nil)
 }
 
 func (suite *OfferPoolTestSuite) SetupTest() {
-	suite.ctx = context.Background()
+	suite.ctx, suite.cancelFunc = context.WithTimeout(
+		context.Background(),
+		_rpcTimeout)
 	suite.ctrl = gomock.NewController(goroutineReporter{})
 	suite.mockedCQosClient = cqosmocks.
 		NewMockQoSAdvisorServiceYARPCClient(suite.ctrl)
@@ -145,6 +151,7 @@ func (suite *OfferPoolTestSuite) SetupTest() {
 	suite.masterOperatorClient = mpb_mocks.NewMockMasterOperatorClient(suite.ctrl)
 	suite.provider = hostmgr_mesos_mocks.NewMockFrameworkInfoProvider(suite.ctrl)
 	suite.watchProcessor = watchmocks.NewMockWatchProcessor(suite.ctrl)
+	suite.metric = metrics.NewMetrics(tally.NoopScope)
 
 	suite.pool = &offerPool{
 		hostOfferIndex:             make(map[string]summary.HostSummary),
@@ -179,6 +186,7 @@ func (suite *OfferPoolTestSuite) TestSlackResourceTypes() {
 		binpacking.GetRankerByName(binpacking.DeFrag),
 		time.Duration(30*time.Second),
 		suite.watchProcessor,
+		nil,
 	)
 	suite.True(hmutil.IsSlackResourceType(
 		common.MesosCPU,
@@ -192,7 +200,8 @@ func (suite *OfferPoolTestSuite) TestClaimForLaunch() {
 	// Launching tasks for host, which does not exist in the offer pool
 	_, err := suite.pool.ClaimForLaunch(
 		_dummyTestAgent,
-		"")
+		"",
+		nil)
 	suite.Error(err)
 	suite.EqualError(err, "cannot find input hostname dummyTestAgent")
 	suite.watchProcessor.EXPECT().NotifyEventChange(gomock.Any()).AnyTimes()
@@ -252,9 +261,21 @@ func (suite *OfferPoolTestSuite) TestClaimForLaunch() {
 	suite.Equal(len(resultCount), 1)
 
 	// Launch Tasks for successful case.
+	var launchableTasks []*hostsvc.LaunchableTask
+	taskID1 := "af2e2ff1-1b93-4884-abca-bd3ec3ced972-1-1"
+	launchableTasks = append(launchableTasks, &hostsvc.LaunchableTask{
+		TaskId: &mesos.TaskID{
+			Value: &taskID1,
+		},
+		Config: &task.TaskConfig{
+			Name: "task1",
+		},
+	})
 	offerMap, err := suite.pool.ClaimForLaunch(
 		_testAgent1,
-		takenHostOffers[_testAgent1].ID)
+		takenHostOffers[_testAgent1].ID,
+		launchableTasks,
+	)
 	suite.NoError(err)
 	suite.Equal(len(offerMap), 10)
 	suite.Equal(suite.GetTimedOfferLen(), 30)
@@ -264,7 +285,8 @@ func (suite *OfferPoolTestSuite) TestClaimForLaunch() {
 	suite.Equal(suite.GetTimedOfferLen(), 20)
 	offerMap, err = suite.pool.ClaimForLaunch(
 		_testAgent3,
-		takenHostOffers[_testAgent3].ID)
+		takenHostOffers[_testAgent3].ID,
+		launchableTasks)
 	suite.Nil(offerMap)
 	suite.Error(err)
 
@@ -273,7 +295,7 @@ func (suite *OfferPoolTestSuite) TestClaimForLaunch() {
 	offerMap, err = suite.pool.ClaimForLaunch(
 		_testAgent2,
 		takenHostOffers[_testAgent2].ID,
-	)
+		launchableTasks)
 	suite.Nil(offerMap)
 	suite.Error(err)
 
@@ -282,7 +304,7 @@ func (suite *OfferPoolTestSuite) TestClaimForLaunch() {
 	offerMap, err = suite.pool.ClaimForLaunch(
 		_testAgent4,
 		takenHostOffers[_testAgent4].ID,
-	)
+		launchableTasks)
 	suite.Equal(len(offerMap), 9)
 	suite.NoError(err)
 
@@ -294,10 +316,10 @@ func (suite *OfferPoolTestSuite) TestClaimForLaunch() {
 	suite.Equal(len(hostnames), 1)
 	offerMap, err = suite.pool.ClaimForLaunch(
 		_testAgent3,
-		takenHostOffers[_testAgent3].ID)
+		takenHostOffers[_testAgent3].ID,
+		launchableTasks)
 	suite.Nil(offerMap)
 	suite.Error(err)
-
 }
 
 // TestGetAllOffers tests the GetAllOffers API
@@ -804,7 +826,7 @@ func (suite *OfferPoolTestSuite) TestDeclineOffers() {
 
 func (suite *OfferPoolTestSuite) TestOfferSorting() {
 	binpacking.CleanUpRanker()
-	binpacking.Init(suite.mockedCQosClient)
+	binpacking.Init(suite.mockedCQosClient, suite.metric)
 	// Verify offer pool is empty
 	suite.Equal(suite.GetTimedOfferLen(), 0)
 
@@ -842,7 +864,7 @@ func (suite *OfferPoolTestSuite) TestOfferSorting() {
 		if rh == hostsvc.FilterHint_FILTER_HINT_RANKING_LOAD_AWARE {
 			suite.mockedCQosClient.EXPECT().
 				GetHostMetrics(
-					suite.ctx,
+					gomock.Any(),
 					gomock.Any()).Return(
 				&cqos.GetHostMetricsResponse{
 					Hosts: map[string]*cqos.Metrics{
@@ -945,6 +967,59 @@ func (suite *OfferPoolTestSuite) TestGetHostSummary() {
 	suite.pool.AddOffers(context.Background(), suite.agent1Offers)
 	_, err = suite.pool.GetHostSummary(_testAgent1)
 	suite.NoError(err)
+}
+
+func (suite *OfferPoolTestSuite) TestHostToTasksMap() {
+	taskID := "693ba665-9e79-4222-a87b-3a5c1d94945b-1-1"
+	taskID2 := "693ba665-9e79-4222-a87b-3a5c1d949452-1-1"
+	hostname1 := suite.agent1Offers[0].GetHostname()
+	suite.pool.AddOffers(context.Background(), suite.agent1Offers)
+	suite.pool.AddOffers(context.Background(), suite.agent2Offers)
+	suite.pool.AddOffers(context.Background(), suite.agent3Offers)
+	suite.pool.AddOffers(context.Background(), suite.agent4Offers)
+
+	// No tasks are running on this host
+	hs1, _ := suite.pool.GetHostSummary(hostname1)
+	suite.Equal(0, len(hs1.GetTasks()))
+
+	// Remove host to task map on terminal event at recovery
+	suite.pool.UpdateTasksOnHost(taskID, task.TaskState_SUCCEEDED, &task.TaskInfo{
+		Config: &task.TaskConfig{},
+		Runtime: &task.RuntimeInfo{
+			Host:  hostname1,
+			State: task.TaskState_SUCCEEDED,
+		},
+	})
+	suite.Equal(0, len(hs1.GetTasks()))
+
+	// Populate host to task map with non-terminal event on recovery
+	suite.pool.UpdateTasksOnHost(taskID, task.TaskState_RUNNING, &task.TaskInfo{
+		Config: &task.TaskConfig{},
+		Runtime: &task.RuntimeInfo{
+			Host:  hostname1,
+			State: task.TaskState_RUNNING,
+		},
+	})
+	suite.Equal(1, len(hs1.GetTasks()))
+
+	suite.pool.UpdateTasksOnHost(taskID2, task.TaskState_RUNNING, &task.TaskInfo{
+		Config: &task.TaskConfig{},
+		Runtime: &task.RuntimeInfo{
+			Host:  hostname1,
+			State: task.TaskState_RUNNING,
+		},
+	})
+	suite.Equal(2, len(hs1.GetTasks()))
+
+	// Populate host to task map with non-terminal event
+	// with host placement assigned
+	suite.pool.UpdateTasksOnHost(taskID, task.TaskState_RUNNING, nil)
+	suite.Equal(2, len(hs1.GetTasks()))
+
+	// Populate host to task map with terminal event
+	// which deletes from the map.
+	suite.pool.UpdateTasksOnHost(taskID, task.TaskState_SUCCEEDED, nil)
+	suite.Equal(1, len(hs1.GetTasks()))
 }
 
 func (suite *OfferPoolTestSuite) TestGetHostSummaries() {
@@ -1093,7 +1168,7 @@ func (suite *OfferPoolTestSuite) TestClaimForPlaceWithFilterHint() {
 // hostname1 will be picked
 func (suite *OfferPoolTestSuite) TestClaimForPlaceWithRankHintLoadAware() {
 	binpacking.CleanUpRanker()
-	binpacking.Init(suite.mockedCQosClient)
+	binpacking.Init(suite.mockedCQosClient, suite.metric)
 	// Verify offer pool is empty
 	suite.Equal(suite.GetTimedOfferLen(), 0)
 
@@ -1122,7 +1197,7 @@ func (suite *OfferPoolTestSuite) TestClaimForPlaceWithRankHintLoadAware() {
 
 	suite.mockedCQosClient.EXPECT().
 		GetHostMetrics(
-			suite.ctx,
+			gomock.Any(),
 			gomock.Any()).Return(
 		&cqos.GetHostMetricsResponse{
 			Hosts: map[string]*cqos.Metrics{

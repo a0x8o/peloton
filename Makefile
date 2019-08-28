@@ -1,7 +1,7 @@
-.PHONY: all placement install cli test unit_test cover lint clean \
+.PHONY: all apiproxy placement install cli test unit_test cover lint clean \
 	hostmgr jobmgr resmgr docker version debs docker-push \
 	test-containers archiver failure-test-minicluster \
-	failure-test-vcluster aurorabridge docs
+	failure-test-vcluster aurorabridge docs migratedb
 
 .DEFAULT_GOAL := all
 
@@ -39,7 +39,6 @@ PHAB_COMMENT = .phabricator-comment
 # See https://golang.org/doc/gdb for details of the flags
 GO_FLAGS = -gcflags '-N -l' -ldflags "-X main.version=$(PACKAGE_VERSION)"
 
-K8S ?= "--k8s"
 THIS_FILE := $(lastword $(MAKEFILE_LIST))
 
 ifeq ($(shell uname),Linux)
@@ -50,7 +49,7 @@ endif
 
 .PRECIOUS: $(GENS) $(LOCAL_MOCKS) $(VENDOR_MOCKS) mockgens
 
-all: gens placement cli hostmgr resmgr jobmgr archiver aurorabridge
+all: gens placement cli hostmgr resmgr jobmgr archiver aurorabridge apiproxy migratedb
 
 cli:
 	go build $(GO_FLAGS) -o ./$(BIN_DIR)/peloton cmd/cli/*.go
@@ -72,6 +71,12 @@ archiver:
 
 aurorabridge:
 	go build $(GO_FLAGS) -o ./$(BIN_DIR)/peloton-aurorabridge cmd/aurorabridge/*.go
+
+apiproxy:
+	go build $(GO_FLAGS) -o ./$(BIN_DIR)/peloton-apiproxy cmd/apiproxy/*.go
+
+migratedb:
+	go build $(GO_FLAGS) -o ./$(BIN_DIR)/migratedb cmd/migratedb/*.go
 
 # Use the same version of mockgen in unit tests as in mock generation
 build-mockgen:
@@ -195,6 +200,8 @@ mockgens: build-mockgen gens $(GOMOCK)
 	$(call local_mockgen,pkg/middleware/inbound,APILockInterface)
 	$(call local_mockgen,pkg/hostmgr,RecoveryHandler)
 	$(call local_mockgen,pkg/hostmgr/host,Drainer;MaintenanceHostInfoMap)
+	$(call local_mockgen,pkg/hostmgr/hostpool,HostPool)
+	$(call local_mockgen,pkg/hostmgr/hostpool/manager,HostPoolManager)
 	$(call local_mockgen,pkg/hostmgr/mesos,MasterDetector;FrameworkInfoProvider)
 	$(call local_mockgen,pkg/hostmgr/offer,EventHandler)
 	$(call local_mockgen,pkg/hostmgr/offer/offerpool,Pool)
@@ -223,6 +230,7 @@ mockgens: build-mockgen gens $(GOMOCK)
 	$(call local_mockgen,pkg/placement/models,Offer;Task)
 	$(call local_mockgen,pkg/resmgr/respool,ResPool;Tree)
 	$(call local_mockgen,pkg/resmgr/preemption,Queue)
+	$(call local_mockgen,pkg/resmgr/hostmover,Scorer)
 	$(call local_mockgen,pkg/resmgr/queue,Queue;MultiLevelList)
 	$(call local_mockgen,pkg/resmgr/task,Scheduler;Tracker)
 	$(call local_mockgen,pkg/storage,JobStore;TaskStore;UpdateStore;FrameworkInfoStore;PersistentVolumeStore)

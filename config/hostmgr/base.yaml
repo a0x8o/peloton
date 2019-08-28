@@ -1,7 +1,5 @@
 storage:
   cassandra:
-    # FIXME: need to increase batch size limit dynamically in cassandra (T968823)
-    max_batch_size_rows: 1
     max_parallel_batches: 1000
     max_updates_job: 10
     connection:
@@ -17,7 +15,7 @@ storage:
     store_name: peloton_test
     migrations: pkg/storage/cassandra/migrations/
   use_cassandra: true
-  auto_migrate: true
+  auto_migrate: false
 
 host_manager:
   http_port: 5291
@@ -58,6 +56,8 @@ host_manager:
   # bin packing refresh interval represents the time interval in which
   # we can refresh the list of hosts based on bin packing algorithm
   bin_packing_refresh_interval: 30s
+  enable_host_pool: false
+  host_pool_reconcile_interval: 10s
 
 mesos:
   encoding: "x-protobuf"

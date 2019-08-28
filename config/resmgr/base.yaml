@@ -1,7 +1,5 @@
 storage:
   cassandra:
-    # FIXME: need to increase batch size limit dynamically in cassandra (T968823)
-    max_batch_size_rows: 1
     max_parallel_batches: 1000
     max_updates_job: 10
     connection:
@@ -24,6 +22,7 @@ resmgr:
   task_scheduling_period: 100ms
   entitlement_calculation_period: 60s
   task_reconciliation_period: 1h
+  enable_host_scorer: false
   task:
     # Timeout for rm task in statemachine from placing to ready state
     placing_timeout: 10m

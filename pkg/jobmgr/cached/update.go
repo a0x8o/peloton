@@ -28,7 +28,6 @@ import (
 	"github.com/uber/peloton/pkg/common/taskconfig"
 	"github.com/uber/peloton/pkg/common/util"
 	jobmgrcommon "github.com/uber/peloton/pkg/jobmgr/common"
-	taskutil "github.com/uber/peloton/pkg/jobmgr/util/task"
 	"github.com/uber/peloton/pkg/storage"
 	"github.com/uber/peloton/pkg/storage/objects"
 
@@ -1030,30 +1029,22 @@ func GetInstancesToProcessForUpdate(
 		return
 	}
 
-	hasJobLabelsChanged := taskconfig.HasPelotonLabelsChanged(
-		prevJobConfig.GetLabels(),
-		newJobConfig.GetLabels(),
-	)
-
 	for instID := uint32(0); instID < newJobConfig.GetInstanceCount(); instID++ {
 		if runtime, ok := taskRuntimes[instID]; !ok {
 			// new instance added
 			instancesAdded = append(instancesAdded, instID)
 		} else {
-			changed := hasJobLabelsChanged
-
-			if !changed {
-				changed, err = hasInstanceConfigChanged(
-					ctx,
-					jobID,
-					instID,
-					runtime.GetConfigVersion(),
-					newJobConfig,
-					taskConfigV2Ops,
-				)
-				if err != nil {
-					return
-				}
+			var changed bool
+			changed, err = hasInstanceConfigChanged(
+				ctx,
+				jobID,
+				instID,
+				runtime.GetConfigVersion(),
+				newJobConfig,
+				taskConfigV2Ops,
+			)
+			if err != nil {
+				return
 			}
 
 			if changed || runtime.GetConfigVersion() != runtime.GetDesiredConfigVersion() {
@@ -1107,13 +1098,17 @@ func (u *update) writeWorkflowEvents(
 		return err
 	}
 
-	if err := u.jobFactory.jobUpdateEventsOps.Create(
-		ctx,
-		u.id,
-		workflowType,
-		state); err != nil {
-		return err
+	// only need to add job update events if new state is different from existing state
+	if state != u.state {
+		if err := u.jobFactory.jobUpdateEventsOps.Create(
+			ctx,
+			u.id,
+			workflowType,
+			state); err != nil {
+			return err
+		}
 	}
+
 	return nil
 }
 
@@ -1197,7 +1192,7 @@ func (u *update) addWorkflowEventForInstances(
 	}
 
 	// add workflow events for provided instances in parallel batches.
-	return taskutil.RunInParallel(u.id.GetValue(), instances, addWorkflowEvent)
+	return util.RunInParallel(u.id.GetValue(), instances, addWorkflowEvent)
 }
 
 // contains is a helper function to check if an element is present in the list

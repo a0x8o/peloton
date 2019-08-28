@@ -42,6 +42,9 @@ message HostInfo {
 
     // Goal state of the host
     HostState goal_state = 4;
+
+    // Host labels.
+    repeated peloton.Label labels = 5;
 }
 
 // Portrange describes a range of ports.
@@ -71,4 +74,13 @@ message HostSummary {
   // offers
   map<string,mesos.v1.Offer>  Offers = 5;
 
+}
+
+// HostPoolInfo describes a host-pool
+message HostPoolInfo {
+  // Name of the pool. Pool names are unique.
+  string name = 1;
+
+  // Hosts that belong to the pool
+  repeated string hosts = 2;
 }

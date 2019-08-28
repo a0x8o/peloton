@@ -19,7 +19,7 @@ import (
 
 	"github.com/uber/peloton/.gen/peloton/api/v0/respool"
 
-	"github.com/uber/peloton/pkg/aurorabridge/atop"
+	"github.com/uber/peloton/pkg/common/config"
 )
 
 // ServiceHandlerConfig defines ServiceHandler configuration.
@@ -41,6 +41,10 @@ type ServiceHandlerConfig struct {
 	// the number of pods returned.
 	PodRunsDepth int `yaml:"pod_runs_depth"`
 
+	// Maximum number of pods that will get returned, while meeting
+	// minPodRunsDepth requirement.
+	GetTasksPodMax int `yaml:"get_tasks_pod_max"`
+
 	// QueryJobsLimit specifies Limit parameter passed to QueryJobs request
 	QueryJobsLimit uint32 `yaml:"query_jobs_limit"`
 
@@ -50,7 +54,9 @@ type ServiceHandlerConfig struct {
 	// UpdatesLimit specifies the limit on number of updates to include per job
 	UpdatesLimit uint32 `yaml:"updates_limit"`
 
-	ThermosExecutor atop.ThermosExecutorConfig `yaml:"thermos_executor"`
+	// ThemrosExecutor is config used to generate mesos CommandInfo / ExecutorInfo
+	// for Thermos executor
+	ThermosExecutor config.ThermosExecutorConfig `yaml:"thermos_executor"`
 
 	// Enable Peloton inplace update
 	EnableInPlace bool `yaml:"enable-inplace-update"`
@@ -67,7 +73,7 @@ func (c *ServiceHandlerConfig) normalize() {
 		c.GetJobSummaryWorkers = 25
 	}
 	if c.GetTasksWithoutConfigsWorkers == 0 {
-		c.GetTasksWithoutConfigsWorkers = 25
+		c.GetTasksWithoutConfigsWorkers = 100
 	}
 	if c.StopPodWorkers == 0 {
 		c.StopPodWorkers = 25
@@ -77,6 +83,9 @@ func (c *ServiceHandlerConfig) normalize() {
 	}
 	if c.PodRunsDepth <= 0 {
 		c.PodRunsDepth = 1
+	}
+	if c.GetTasksPodMax == 0 {
+		c.GetTasksPodMax = 1000
 	}
 	if c.QueryJobsLimit == 0 {
 		c.QueryJobsLimit = 1000

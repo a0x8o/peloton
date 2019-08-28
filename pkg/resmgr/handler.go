@@ -27,6 +27,7 @@ import (
 	"github.com/uber/peloton/.gen/peloton/private/hostmgr/hostsvc"
 	"github.com/uber/peloton/.gen/peloton/private/resmgr"
 	"github.com/uber/peloton/.gen/peloton/private/resmgrsvc"
+	"github.com/uber/peloton/pkg/resmgr/hostmover"
 
 	"github.com/uber/peloton/pkg/common"
 	"github.com/uber/peloton/pkg/common/eventstream"
@@ -36,6 +37,7 @@ import (
 	"github.com/uber/peloton/pkg/resmgr/preemption"
 	r_queue "github.com/uber/peloton/pkg/resmgr/queue"
 	"github.com/uber/peloton/pkg/resmgr/respool"
+	"github.com/uber/peloton/pkg/resmgr/scalar"
 	rmtask "github.com/uber/peloton/pkg/resmgr/task"
 
 	multierror "github.com/hashicorp/go-multierror"
@@ -81,6 +83,10 @@ type ServiceHandler struct {
 
 	// rmtasks tracker
 	rmTracker rmtask.Tracker
+
+	// batch host scorer
+	batchScorer hostmover.Scorer
+
 	// in-memory resource pool tree
 	resPoolTree respool.Tree
 
@@ -92,6 +98,7 @@ func NewServiceHandler(
 	d *yarpc.Dispatcher,
 	parent tally.Scope,
 	rmTracker rmtask.Tracker,
+	batchScorer hostmover.Scorer,
 	tree respool.Tree,
 	preemptionQueue preemption.Queue,
 	hostmgrClient hostsvc.InternalHostServiceYARPCClient,
@@ -107,6 +114,7 @@ func NewServiceHandler(
 			maxPlacementQueueSize,
 		),
 		rmTracker:       rmTracker,
+		batchScorer:     batchScorer,
 		preemptionQueue: preemptionQueue,
 		maxOffset:       &maxOffset,
 		config:          conf,
@@ -724,6 +732,10 @@ func (h *ServiceHandler) NotifyTaskUpdates(
 func (h *ServiceHandler) handleEvent(event *pb_eventstream.Event) {
 	defer h.acknowledgeEvent(event.Offset)
 
+	if event.GetType() != pb_eventstream.Event_MESOS_TASK_STATUS {
+		return
+	}
+
 	taskState := util.MesosStateToPelotonState(
 		event.MesosTaskStatus.GetState())
 	if taskState != t.TaskState_RUNNING &&
@@ -769,7 +781,7 @@ func (h *ServiceHandler) handleEvent(event *pb_eventstream.Event) {
 	}
 
 	// TODO: We probably want to terminate all the tasks in gang
-	err = h.rmTracker.MarkItDone(taskID, *event.MesosTaskStatus.TaskId.Value)
+	err = h.rmTracker.MarkItDone(event.GetMesosTaskStatus().GetTaskId().GetValue())
 	if err != nil {
 		log.WithField("event", event).WithError(err).Error(
 			"Could not be updated")
@@ -783,8 +795,11 @@ func (h *ServiceHandler) handleEvent(event *pb_eventstream.Event) {
 	}).Info("Task is completed and removed from tracker")
 
 	// publish metrics
-	rmtask.GetTracker().UpdateCounters(
-		t.TaskState_RUNNING, taskState)
+	rmtask.GetTracker().UpdateMetrics(
+		t.TaskState_RUNNING,
+		taskState,
+		scalar.ConvertToResmgrResource(rmTask.Task().GetResource()),
+	)
 }
 
 func (h *ServiceHandler) acknowledgeEvent(offset uint64) {
@@ -978,20 +993,21 @@ func (h *ServiceHandler) KillTasks(
 			continue
 		}
 
-		err := h.rmTracker.MarkItInvalid(
-			taskTobeKilled,
-			*(rmTaskToKill.Task().TaskId.Value))
+		err := h.rmTracker.MarkItInvalid(rmTaskToKill.Task().GetTaskId().GetValue())
 		if err != nil {
 			tasksNotKilled = append(tasksNotKilled, taskTobeKilled)
 			continue
 		}
+
 		log.WithFields(log.Fields{
 			"task_id":       taskTobeKilled.Value,
 			"current_state": rmTaskToKill.GetCurrentState().State.String(),
 		}).Info("Task is Killed and removed from tracker")
-		h.rmTracker.UpdateCounters(
+
+		h.rmTracker.UpdateMetrics(
 			rmTaskToKill.GetCurrentState().State,
 			t.TaskState_KILLED,
+			scalar.ConvertToResmgrResource(rmTaskToKill.Task().GetResource()),
 		)
 	}
 
@@ -1125,7 +1141,7 @@ func (h *ServiceHandler) UpdateTasksState(
 
 		// Checking if the state for the task is in terminal state
 		if util.IsPelotonStateTerminal(updateEntry.GetState()) {
-			err := h.rmTracker.MarkItDone(id, *updateEntry.MesosTaskId.Value)
+			err := h.rmTracker.MarkItDone(updateEntry.GetMesosTaskId().GetValue())
 			if err != nil {
 				log.WithError(err).WithFields(log.Fields{
 					"task_id":      id,
@@ -1169,4 +1185,15 @@ func (h *ServiceHandler) GetOrphanTasks(
 	return &resmgrsvc.GetOrphanTasksResponse{
 		OrphanTasks: orphanTasks,
 	}, nil
+}
+
+// GetHostsByScores returns a list of batch hosts with lowest host scores
+func (h *ServiceHandler) GetHostsByScores(
+	ctx context.Context,
+	req *resmgrsvc.GetHostsByScoresRequest,
+) (*resmgrsvc.GetHostsByScoresResponse, error) {
+	return &resmgrsvc.GetHostsByScoresResponse{
+		Hosts: h.batchScorer.GetHostsByScores(req.Limit),
+	}, nil
+
 }

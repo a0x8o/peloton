@@ -16,17 +16,25 @@ package hostcache
 
 import (
 	"sync"
+	"time"
 
-	"go.uber.org/yarpc/yarpcerrors"
-
+	peloton "github.com/uber/peloton/.gen/peloton/api/v1alpha/peloton"
 	hostmgr "github.com/uber/peloton/.gen/peloton/private/hostmgr/v1alpha"
+	"github.com/uber/peloton/pkg/common/background"
 	"github.com/uber/peloton/pkg/common/lifecycle"
-
-	"github.com/uber/peloton/pkg/hostmgr/p2k/plugins"
 	"github.com/uber/peloton/pkg/hostmgr/p2k/scalar"
 	hmscalar "github.com/uber/peloton/pkg/hostmgr/scalar"
 
 	log "github.com/sirupsen/logrus"
+	uatomic "github.com/uber-go/atomic"
+	"github.com/uber-go/tally"
+	"go.uber.org/multierr"
+	"go.uber.org/yarpc/yarpcerrors"
+)
+
+const (
+	_hostCacheMetricsRefresh       = "hostCacheMetricsRefresh"
+	_hostCacheMetricsRefreshPeriod = 10 * time.Second
 )
 
 // HostCache manages cluster resources, and provides necessary abstractions to
@@ -55,6 +63,22 @@ type HostCache interface {
 	// GetSummaries returns a list of host summaries that the host cache is
 	// managing.
 	GetSummaries() (summaries []HostSummary)
+
+	// HandlePodEvent is called by pod events manager on receiving a pod event.
+	HandlePodEvent(event *scalar.PodEvent)
+
+	// ResetExpiredHeldHostSummaries resets the status of each hostSummary if
+	// the helds have expired and returns the hostnames which got reset.
+	ResetExpiredHeldHostSummaries(now time.Time) []string
+
+	// GetHostHeldForPod returns the host that is held for the pod.
+	GetHostHeldForPod(podID *peloton.PodID) string
+
+	// HoldForPods holds the host for the pods specified.
+	HoldForPods(hostname string, podIDs []*peloton.PodID) error
+
+	// ReleaseHoldForPods release the hold of host for the pods specified.
+	ReleaseHoldForPods(hostname string, podIDs []*peloton.PodID) error
 }
 
 // hostCache is an implementation of HostCache interface.
@@ -64,37 +88,42 @@ type hostCache struct {
 	// Map of hostname to HostSummary.
 	hostIndex map[string]HostSummary
 
+	// Map of podID to host held.
+	podHeldIndex map[string]string
+
 	// The event channel on which the underlying cluster manager plugin will send
 	// host events to host cache.
 	hostEventCh chan *scalar.HostEvent
 
-	// The event channel on which the underlying cluster manager plugin will send
-	// pod events to host cache.
-	podEventCh chan *scalar.PodEvent
-
-	// Cluster manager plugin.
-	plugin plugins.Plugin
-
 	// Lifecycle manager.
 	lifecycle lifecycle.LifeCycle
+
+	// background manager.
+	backgroundMgr background.Manager
+
+	// Metrics.
+	metrics *Metrics
 }
 
 // New returns a new instance of host cache.
 func New(
 	hostEventCh chan *scalar.HostEvent,
-	podEventCh chan *scalar.PodEvent,
-	plugin plugins.Plugin,
+	backgroundMgr background.Manager,
+	parent tally.Scope,
 ) HostCache {
 	return &hostCache{
-		hostIndex:   make(map[string]HostSummary),
-		hostEventCh: hostEventCh,
-		podEventCh:  podEventCh,
-		plugin:      plugin,
-		lifecycle:   lifecycle.NewLifeCycle(),
+		hostIndex:     make(map[string]HostSummary),
+		hostEventCh:   hostEventCh,
+		lifecycle:     lifecycle.NewLifeCycle(),
+		metrics:       NewMetrics(parent),
+		backgroundMgr: backgroundMgr,
 	}
 }
 
 func (c *hostCache) GetSummaries() []HostSummary {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
 	summaries := make([]HostSummary, 0, len(c.hostIndex))
 	for _, summary := range c.hostIndex {
 		summaries = append(summaries, summary)
@@ -167,10 +196,9 @@ func (c *hostCache) TerminateLease(
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
-	hs, ok := c.hostIndex[hostname]
-	if !ok {
-		// TODO: metrics
-		return yarpcerrors.NotFoundErrorf("cannot find host %s in cache", hostname)
+	hs, err := c.getSummary(hostname)
+	if err != nil {
+		return err
 	}
 	if err := hs.TerminateLease(leaseID); err != nil {
 		// TODO: metrics
@@ -198,12 +226,10 @@ func (c *hostCache) CompleteLease(
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
-	hs, ok := c.hostIndex[hostname]
-	if !ok {
-		// TODO: metrics
-		return yarpcerrors.NotFoundErrorf("cannot find host %s in cache", hostname)
+	hs, err := c.getSummary(hostname)
+	if err != nil {
+		return err
 	}
-
 	if err := hs.CompleteLease(leaseID, podToResMap); err != nil {
 		// TODO: metrics
 		return err
@@ -229,6 +255,135 @@ func (c *hostCache) GetClusterCapacity() (
 	return
 }
 
+// ResetExpiredHeldHostSummaries resets the status of each hostSummary if
+// the holds have expired and returns the hostnames which got reset.
+func (c *hostCache) ResetExpiredHeldHostSummaries(deadline time.Time) []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	var ret []string
+	for hostname, hs := range c.hostIndex {
+		isFreed, _, podIDExpired := hs.DeleteExpiredHolds(deadline)
+		if isFreed {
+			ret = append(ret, hostname)
+			// TODO: add metrics.
+		}
+		for _, id := range podIDExpired {
+			c.removePodHold(id)
+		}
+	}
+	return ret
+}
+
+func (c *hostCache) GetHostHeldForPod(podID *peloton.PodID) string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	hn, ok := c.podHeldIndex[podID.GetValue()]
+	if !ok {
+		// TODO: this should return an error. But keep it the same way as in
+		// offerpool for now.
+		return ""
+	}
+	return hn
+}
+
+func (c *hostCache) HoldForPods(hostname string, podIDs []*peloton.PodID) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	hs, err := c.getSummary(hostname)
+	if err != nil {
+		return err
+	}
+	var errs []error
+	for _, id := range podIDs {
+		if err := hs.HoldForPod(id); err != nil {
+			errs = append(errs, err)
+			continue
+		}
+		c.addPodHold(hostname, id)
+	}
+	if len(errs) > 0 {
+		return yarpcerrors.InternalErrorf("failed to hold pods: %s", multierr.Combine(errs...))
+	}
+	return nil
+}
+
+func (c *hostCache) ReleaseHoldForPods(hostname string, podIDs []*peloton.PodID) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	hs, err := c.getSummary(hostname)
+	if err != nil {
+		return err
+	}
+	for _, id := range podIDs {
+		hs.ReleaseHoldForPod(id)
+		c.removePodHold(id)
+	}
+	return nil
+}
+
+// RefreshMetrics refreshes the metrics for hosts in ready and placing state.
+func (c *hostCache) RefreshMetrics() {
+	totalAvailable := hmscalar.Resources{}
+	totalAllocated := hmscalar.Resources{}
+	readyHosts := float64(0)
+	placingHosts := float64(0)
+
+	hosts := c.GetSummaries()
+
+	for _, h := range hosts {
+		allocated, capacity := h.GetAllocated(), h.GetCapacity()
+		available, _ := capacity.TrySubtract(allocated)
+		totalAllocated = totalAllocated.Add(allocated)
+		totalAvailable = totalAvailable.Add(available)
+
+		switch h.GetHostStatus() {
+		case ReadyHost:
+			readyHosts++
+		case PlacingHost:
+			placingHosts++
+		}
+	}
+
+	c.metrics.Available.Update(totalAvailable)
+	c.metrics.Allocated.Update(totalAllocated)
+	c.metrics.ReadyHosts.Update(readyHosts)
+	c.metrics.PlacingHosts.Update(placingHosts)
+	c.metrics.AvailableHosts.Update(float64(len(hosts)))
+}
+
+// addPodHold add a pod to podHeldIndex. Replace the old host if exists.
+func (c *hostCache) addPodHold(hostname string, id *peloton.PodID) {
+	old, ok := c.podHeldIndex[id.GetValue()]
+	if ok && old != hostname {
+		log.WithFields(log.Fields{
+			"new_host": hostname,
+			"old_host": old,
+			"task_id":  id.GetValue(),
+		}).Warn("pod is held by multiple hosts")
+	}
+	c.podHeldIndex[id.GetValue()] = hostname
+}
+
+// removePodHold deletes id from podHeldIndex regardless of hostname.
+func (c *hostCache) removePodHold(id *peloton.PodID) {
+	delete(c.podHeldIndex, id.GetValue())
+}
+
+// getSummary returns host summary given name. If the host does not exist,
+// return error not found.
+func (c *hostCache) getSummary(hostname string) (HostSummary, error) {
+	hs, ok := c.hostIndex[hostname]
+	if !ok {
+		// TODO: metrics
+		return nil, yarpcerrors.NotFoundErrorf("cannot find host %s in cache", hostname)
+	}
+	return hs, nil
+}
+
 // waitForHostEvents will start a goroutine that waits on the host events
 // channel. The underlying plugin will send events to this channel when any
 // underlying host status changes. Example: allocated resources change,
@@ -240,10 +395,14 @@ func (c *hostCache) waitForHostEvents() {
 			switch event.GetEventType() {
 			case scalar.AddHost:
 				c.addHost(event)
-			case scalar.UpdateHost:
-				c.updateHost(event)
+			case scalar.UpdateHostSpec:
+				c.updateHostSpec(event)
 			case scalar.DeleteHost:
 				c.deleteHost(event)
+			case scalar.UpdateHostAvailableRes:
+				c.updateHostAvailable(event)
+			case scalar.UpdateAgent:
+				c.updateAgent(event)
 			}
 		case <-c.lifecycle.StopCh():
 			return
@@ -251,22 +410,11 @@ func (c *hostCache) waitForHostEvents() {
 	}
 }
 
-// waitForPodEvents will start a goroutine that waits on the pod events
-// channel. The underlying plugin manager will send events to this channel
-// when a pod status changes. Example: pod P1 on host H1 was deleted, or
-// evicted.
-func (c *hostCache) waitForPodEvents() {
-	for {
-		select {
-		case event := <-c.podEventCh:
-			c.handlePodEvent(event)
-		case <-c.lifecycle.StopCh():
-			return
-		}
-	}
-}
-
-func (c *hostCache) handlePodEvent(event *scalar.PodEvent) {
+// Handle pod event which is sent by the pod events manager. This is relevant
+// only in case of K8S where we do resource accounting based on pod events.
+// Example: a pod delete event will lead to giving back pod's resources to the
+// host.
+func (c *hostCache) HandlePodEvent(event *scalar.PodEvent) {
 	// TODO: evaluate locking strategy
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -284,13 +432,7 @@ func (c *hostCache) handlePodEvent(event *scalar.PodEvent) {
 		return
 	}
 
-	err := summary.HandlePodEvent(event)
-	if err != nil {
-		log.WithFields(log.Fields{
-			"hostname": hostname,
-			"pod_id":   event.Event.GetPodId().GetValue(),
-		}).WithError(err).Error("handle pod event")
-	}
+	summary.HandlePodEvent(event)
 }
 
 func (c *hostCache) addHost(event *scalar.HostEvent) {
@@ -320,7 +462,9 @@ func (c *hostCache) addHost(event *scalar.HostEvent) {
 		}
 	}
 
-	c.hostIndex[hostInfo.GetHostName()] = newHostSummary(
+	// TODO: figure out how to differemtiate mesos/k8s hosts,
+	// now addHost is only used by k8s hosts
+	c.hostIndex[hostInfo.GetHostName()] = newKubeletHostSummary(
 		hostInfo.GetHostName(),
 		capacity,
 		version,
@@ -332,7 +476,7 @@ func (c *hostCache) addHost(event *scalar.HostEvent) {
 	}).Debug("add host to cache")
 }
 
-func (c *hostCache) updateHost(event *scalar.HostEvent) {
+func (c *hostCache) updateHostSpec(event *scalar.HostEvent) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -357,7 +501,7 @@ func (c *hostCache) updateHost(event *scalar.HostEvent) {
 		return
 	}
 
-	// Check if event has older resource version, ignore if it does
+	// Check if event has older resource version, ignore if it does.
 	currentVersion := hs.GetVersion()
 	if scalar.IsOldVersion(currentVersion, evtVersion) {
 		log.WithFields(log.Fields{
@@ -391,7 +535,7 @@ func (c *hostCache) deleteHost(event *scalar.HostEvent) {
 	if existing, ok := c.hostIndex[hostInfo.GetHostName()]; ok {
 		evtVersion := hostInfo.GetResourceVersion()
 
-		// Check if event has older resource version, ignore if it does
+		// Check if event has older resource version, ignore if it does.
 		currentVersion := existing.GetVersion()
 		if scalar.IsOldVersion(currentVersion, evtVersion) {
 			log.WithFields(log.Fields{
@@ -411,29 +555,95 @@ func (c *hostCache) deleteHost(event *scalar.HostEvent) {
 	}).Debug("delete host from cache")
 }
 
-// Start will start the goroutine that listens for host events
-func (c *hostCache) Start() {
-	if !c.lifecycle.Start() {
-		log.Warn("hostCache is already started")
-		return
+// only applicable to mesos
+func (c *hostCache) updateAgent(event *scalar.HostEvent) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	var hs HostSummary
+	var ok bool
+
+	hostInfo := event.GetHostInfo()
+	evtVersion := hostInfo.GetResourceVersion()
+
+	hs, ok = c.hostIndex[hostInfo.GetHostName()]
+
+	if !ok {
+		hs = newMesosHostSummary(hostInfo.GetHostName(), evtVersion)
+		c.hostIndex[hostInfo.GetHostName()] = hs
 	}
 
-	go c.waitForHostEvents()
-	go c.waitForPodEvents()
+	r := hmscalar.FromPelotonResources(hostInfo.GetCapacity())
+	hs.SetCapacity(r)
+	hs.SetVersion(evtVersion)
+	log.WithFields(log.Fields{
+		"hostname":  hostInfo.GetHostName(),
+		"available": hostInfo.GetAvailable(),
+		"version":   evtVersion,
+	}).Debug("update agent info in host cache")
 }
 
-// Stop will stop the host cache go routine that listens for host events
-func (c *hostCache) Stop() {
-	if !c.lifecycle.Stop() {
-		log.Warn("hostCache already stopped")
+// only applicable to mesos
+func (c *hostCache) updateHostAvailable(event *scalar.HostEvent) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	var hs HostSummary
+	var ok bool
+
+	hostInfo := event.GetHostInfo()
+	evtVersion := hostInfo.GetResourceVersion()
+
+	hs, ok = c.hostIndex[hostInfo.GetHostName()]
+
+	if !ok {
+		hs = newMesosHostSummary(hostInfo.GetHostName(), evtVersion)
+		c.hostIndex[hostInfo.GetHostName()] = hs
+	}
+
+	r := hmscalar.FromPelotonResources(hostInfo.GetAvailable())
+	hs.SetAvailable(r)
+	hs.SetVersion(evtVersion)
+	log.WithFields(log.Fields{
+		"hostname":  hostInfo.GetHostName(),
+		"available": hostInfo.GetAvailable(),
+		"version":   evtVersion,
+	}).Debug("update host in cache")
+}
+
+// Start will start the goroutine that listens for host events.
+func (c *hostCache) Start() {
+	if !c.lifecycle.Start() {
 		return
 	}
+
+	c.backgroundMgr.RegisterWorks(
+		background.Work{
+			Name: _hostCacheMetricsRefresh,
+			Func: func(_ *uatomic.Bool) {
+				c.RefreshMetrics()
+			},
+			Period: _hostCacheMetricsRefreshPeriod,
+		},
+	)
+
+	go c.waitForHostEvents()
+
+	log.Warn("hostCache started")
+}
+
+// Stop will stop the host cache go routine that listens for host events.
+func (c *hostCache) Stop() {
+	if !c.lifecycle.Stop() {
+		return
+	}
+
 	// Wait for drainer to be stopped
 	c.lifecycle.Wait()
 	log.Info("hostCache stopped")
 }
 
-// Reconcile explicitly reconciles host cache
+// Reconcile explicitly reconciles host cache.
 func (c *hostCache) Reconcile() error {
 	// TODO: Implement
 	return nil

@@ -83,7 +83,6 @@ def test__auto_rollback_with_pinned_instances(client):
                 )
 
 
-@pytest.mark.skip(reason="Flaky test, disable for investigation")
 def test__abort_auto_rollback_with_pinned_instances_and_update(client):
     """
     1. Create a job.
@@ -170,6 +169,7 @@ def test__abort_auto_rollback_with_pinned_instances_and_update(client):
             assert run_id == "2"
 
 
+@pytest.mark.skip(reason="flaky test")
 def test__auto_rollback_with_pinned_instances__stopped_instances(client):
     """
     1. Create a job (v1).

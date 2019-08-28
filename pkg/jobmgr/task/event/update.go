@@ -115,7 +115,7 @@ func NewTaskStatusUpdate(
 		jobFactory:      jobFactory,
 		goalStateDriver: goalStateDriver,
 		listeners:       listeners,
-		lm:              lifecyclemgr.New(hmVersion, d),
+		lm:              lifecyclemgr.New(hmVersion, d, parentScope),
 	}
 	// TODO: add config for BucketEventProcessor
 	statusUpdater.applier = newBucketEventProcessor(statusUpdater, 100, 10000)
@@ -150,13 +150,15 @@ func NewTaskStatusUpdate(
 
 // OnV0Event is the callback function notifying an event
 func (p *statusUpdate) OnV0Event(event *pb_eventstream.Event) {
-	log.WithField("event_offset", event.Offset).Debug("JobMgr receiving v0 event")
-	p.applier.addV0Event(event)
+	log.WithField("event_offset", event.Offset).Debug("JobMgr received v0 event")
+	if event.GetType() != pbeventstream.Event_HOST_EVENT {
+		p.applier.addV0Event(event)
+	}
 }
 
 // OnV1Event is the callback function notifying an event
 func (p *statusUpdate) OnV1Event(event *v1pbevent.Event) {
-	log.WithField("event_offset", event.Offset).Debug("JobMgr receiving v1 event")
+	log.WithField("event_offset", event.Offset).Debug("JobMgr received v1 event")
 	p.applier.addV1Event(event)
 }
 
@@ -239,6 +241,10 @@ func (p *statusUpdate) ProcessStatusUpdate(
 				Info("ignoring duplicate task id failure")
 			return nil
 		}
+
+		// task failed, do not place the task on the same host for retry,
+		// in case it is a machine failure
+		newRuntime.DesiredHost = ""
 		newRuntime.Reason = reason
 		newRuntime.State = updateEvent.State()
 		newRuntime.Message = msg
@@ -300,6 +306,8 @@ func (p *statusUpdate) ProcessStatusUpdate(
 			"task_status_event": updateEvent.MesosTaskStatus(),
 		}).Info("reschedule lost task if needed")
 
+		// task failed due to lost, do not place the task on the same host for retry
+		newRuntime.DesiredHost = ""
 		newRuntime.State = pb_task.TaskState_LOST
 		newRuntime.Message = "Task LOST: " + updateEvent.StatusMsg()
 		newRuntime.Reason = updateEvent.Reason()

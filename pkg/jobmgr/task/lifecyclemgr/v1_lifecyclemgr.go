@@ -16,12 +16,18 @@ package lifecyclemgr
 
 import (
 	"context"
+	"time"
 
 	"github.com/uber/peloton/.gen/peloton/api/v1alpha/peloton"
+	pbhostmgr "github.com/uber/peloton/.gen/peloton/private/hostmgr/v1alpha"
 	v1_hostsvc "github.com/uber/peloton/.gen/peloton/private/hostmgr/v1alpha/svc"
 
 	"github.com/uber/peloton/pkg/common"
+	"github.com/uber/peloton/pkg/common/util"
 
+	"github.com/pkg/errors"
+	log "github.com/sirupsen/logrus"
+	"github.com/uber-go/tally"
 	"go.uber.org/yarpc"
 	"go.uber.org/yarpc/yarpcerrors"
 	"golang.org/x/time/rate"
@@ -31,11 +37,13 @@ type v1LifecycleMgr struct {
 	*lockState
 	// v1 client hostmgr pod operations.
 	hostManagerV1 v1_hostsvc.HostManagerServiceYARPCClient
+	metrics       *Metrics
 }
 
 // newV1LifecycleMgr returns an instance of the v1 lifecycle manager.
 func newV1LifecycleMgr(
 	dispatcher *yarpc.Dispatcher,
+	parent tally.Scope,
 ) *v1LifecycleMgr {
 	return &v1LifecycleMgr{
 		hostManagerV1: v1_hostsvc.NewHostManagerServiceYARPCClient(
@@ -44,7 +52,71 @@ func newV1LifecycleMgr(
 			),
 		),
 		lockState: &lockState{state: 0},
+		metrics:   NewMetrics(parent.SubScope("jobmgr").SubScope("pod")),
 	}
+}
+
+// Launch launches the task using taskConfig. pod spec is ignored in this impl.
+func (l *v1LifecycleMgr) Launch(
+	ctx context.Context,
+	leaseID string,
+	hostname string,
+	agentID string,
+	pods map[string]*LaunchableTaskInfo,
+	rateLimiter *rate.Limiter,
+) error {
+	if len(pods) == 0 {
+		return errEmptyPods
+	}
+	// enforce rate limit
+	if rateLimiter != nil && !rateLimiter.Allow() {
+		l.metrics.LaunchRateLimit.Inc(1)
+		return yarpcerrors.ResourceExhaustedErrorf(
+			"rate limit reached for kill")
+	}
+
+	log.WithField("pods", pods).Debug("Launching Pods")
+	callStart := time.Now()
+
+	// convert LaunchableTaskInfo to v1alpha Hostsvc LaunchablePod
+	var launchablePods []*pbhostmgr.LaunchablePod
+	for _, pod := range pods {
+		launchablePod := pbhostmgr.LaunchablePod{
+			PodId: util.CreatePodIDFromMesosTaskID(
+				pod.Runtime.GetMesosTaskId()),
+			Spec: pod.Spec,
+		}
+		launchablePods = append(launchablePods, &launchablePod)
+	}
+
+	// Launch pods on Hostmgr using v1alpha LaunchPods
+	ctx, cancel := context.WithTimeout(ctx, _defaultHostmgrAPITimeout)
+	defer cancel()
+	var request = &v1_hostsvc.LaunchPodsRequest{
+		// This is because we do not change resmgr code to talk in terms
+		// of HostLease yet. So OfferID here is the leaseID that resmgr
+		// gets via placement engine.
+		LeaseId:  &pbhostmgr.LeaseID{Value: leaseID},
+		Hostname: hostname,
+		Pods:     launchablePods,
+	}
+
+	_, err := l.hostManagerV1.LaunchPods(ctx, request)
+	callDuration := time.Since(callStart)
+
+	if err != nil {
+		l.metrics.LaunchFail.Inc(int64(len(pods)))
+		return err
+	}
+
+	l.metrics.Launch.Inc(int64(len(pods)))
+	log.WithFields(log.Fields{
+		"num_pods": len(pods),
+		"hostname": hostname,
+		"duration": callDuration.Seconds(),
+	}).Debug("Launched pods")
+	l.metrics.LaunchDuration.Record(callDuration)
+	return nil
 }
 
 // Kill tries to kill the pod using podID.
@@ -57,11 +129,13 @@ func (l *v1LifecycleMgr) Kill(
 ) error {
 	// check lock
 	if l.lockState.hasKillLock() {
+		l.metrics.KillRateLimit.Inc(1)
 		return yarpcerrors.InternalErrorf("kill op is locked")
 	}
 
 	// enforce rate limit
 	if rateLimiter != nil && !rateLimiter.Allow() {
+		l.metrics.KillFail.Inc(1)
 		return yarpcerrors.ResourceExhaustedErrorf(
 			"rate limit reached for kill")
 	}
@@ -72,7 +146,12 @@ func (l *v1LifecycleMgr) Kill(
 			PodIds: []*peloton.PodID{{Value: podID}},
 		},
 	)
-	return err
+	if err != nil {
+		l.metrics.KillFail.Inc(1)
+		return err
+	}
+	l.metrics.Kill.Inc(1)
+	return nil
 }
 
 // ShutdownExecutor is a no-op for v1 lifecyclemgr.
@@ -83,5 +162,32 @@ func (l *v1LifecycleMgr) ShutdownExecutor(
 	agentID string,
 	rateLimiter *rate.Limiter,
 ) error {
+	l.metrics.Shutdown.Inc(1)
+	return nil
+}
+
+// TerminateLease returns the unused lease back to the hostmgr.
+func (l *v1LifecycleMgr) TerminateLease(
+	ctx context.Context,
+	hostname string,
+	agentID string,
+	leaseID string,
+) error {
+	request := &v1_hostsvc.TerminateLeasesRequest{
+		Leases: []*v1_hostsvc.TerminateLeasesRequest_LeasePair{{
+			Hostname: hostname,
+			LeaseId:  &pbhostmgr.LeaseID{Value: leaseID},
+		}},
+	}
+	ctx, cancel := context.WithTimeout(ctx, _defaultHostmgrAPITimeout)
+	defer cancel()
+	_, err := l.hostManagerV1.TerminateLeases(ctx, request)
+	if err != nil {
+		l.metrics.TerminateLeaseFail.Inc(1)
+		return errors.Wrapf(err,
+			"failed to terminate lease: %v host %v", leaseID, hostname,
+		)
+	}
+	l.metrics.TerminateLease.Inc(1)
 	return nil
 }

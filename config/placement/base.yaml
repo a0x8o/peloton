@@ -25,7 +25,8 @@ placement:
     stateless: 60s
     daemon: 500s
     stateful: 60s
-  max_desired_host_placement_duration: 120s
+  max_desired_host_placement_duration: 100s
+  use_host_pool: false
 
 election:
   root: "/peloton"
@@ -35,8 +36,6 @@ health:
 
 storage:
   cassandra:
-    # FIXME: need to increase batch size limit dynamically in cassandra (T968823)
-    max_batch_size_rows: 1
     max_parallel_batches: 1000
     max_updates_job: 10
     connection:

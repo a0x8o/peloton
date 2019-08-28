@@ -85,4 +85,11 @@ type Config struct {
 
 	//Cqos advisor specific configuration
 	QoSAdvisorService CqosAdvisorConfig `yaml:"qos_advisor"`
+
+	// EnableHostPool is the config switch to enable host pool logic in Host Manager.
+	EnableHostPool bool `yaml:"enable_host_pool"`
+
+	// HostPoolReconcileInterval is the time interval
+	// between every host pool reconcile loop.
+	HostPoolReconcileInterval time.Duration `yaml:"host_pool_reconcile_interval"`
 }

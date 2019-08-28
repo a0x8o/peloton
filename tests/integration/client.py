@@ -8,6 +8,9 @@ from peloton_client.pbgen.peloton.private.resmgrsvc import (
 from peloton_client.pbgen.peloton.private.hostmgr.hostsvc import (
     hostsvc_pb2_grpc as hostmgr_grpc,
 )
+from peloton_client.pbgen.peloton.private.hostmgr.v1alpha.svc import (
+    hostmgr_svc_pb2_grpc as v1hostmgr_grpc,
+)
 
 from util import load_config
 
@@ -20,6 +23,9 @@ class Client(object):
         if not class_._client:
             config = load_config("config.yaml")["client"]
             cluster = os.getenv("CLUSTER")
+            use_apiserver = False
+            if os.getenv("USE_APISERVER") == 'True':
+                use_apiserver = True
             if cluster is not None and cluster != "local":
                 cluster = os.getenv("CLUSTER")
                 if os.getenv("ELECTION_ZK_SERVERS", ""):
@@ -29,12 +35,16 @@ class Client(object):
                 else:
                     raise Exception("Unsupported cluster %s" % cluster)
                 _client = PelotonClient(
-                    name=config["name"], zk_servers=zk_servers
+                    name=config["name"],
+                    enable_apiserver=use_apiserver,
+                    zk_servers=zk_servers,
                 )
             else:
                 # TODO: remove url overrides once T839783 is resolved
                 _client = PelotonClient(
                     name=config["name"],
+                    enable_apiserver=use_apiserver,
+                    api_url=config["apiserver_url"],
                     jm_url=config["jobmgr_url"],
                     rm_url=config["resmgr_url"],
                     hm_url=config["hostmgr_url"],
@@ -53,6 +63,8 @@ def with_private_stubs(client):
     hm_loc = urlparse(client.hm_url).netloc
     hm_channel = PelotonClient.hostmgr_channel_pool[hm_loc]
     client.hostmgr_svc = hostmgr_grpc.InternalHostServiceStub(
+        channel=hm_channel)
+    client.v1hostmgr_svc = v1hostmgr_grpc.HostManagerServiceStub(
         channel=hm_channel)
 
     return client

@@ -54,9 +54,11 @@ def teardown_mesos(config):
 
 # Start a kind cluster.
 def run_k8s():
+    print_utils.okgreen("starting k8s cluster")
     k8s = kind.Kind(PELOTON_K8S_NAME)
     k8s.teardown()
     k8s.create()
+    print_utils.okgreen("started k8s cluster")
 
 
 #
@@ -464,6 +466,19 @@ def run_peloton_placement(config, enable_k8s=False):
             extra_env=env,
         )
         i = i + 1
+
+
+#
+# Run peloton api proxy
+#
+def run_peloton_apiproxy(config, enable_k8s=False):
+    for i in range(0, config["peloton_apiproxy_instance_count"]):
+        ports = [
+            port + i * 10 for port in config["peloton_apiproxy_ports"]
+        ]
+        name = config["peloton_apiproxy_container"] + repr(i)
+        utils.remove_existing_container(name)
+        start_and_wait("apiproxy", name, ports, config)
 
 
 #

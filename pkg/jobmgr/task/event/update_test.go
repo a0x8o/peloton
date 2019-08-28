@@ -36,6 +36,7 @@ import (
 	"github.com/uber/peloton/.gen/peloton/api/v0/task"
 	"github.com/uber/peloton/.gen/peloton/api/v0/volume"
 	pb_eventstream "github.com/uber/peloton/.gen/peloton/private/eventstream"
+	pbeventstream "github.com/uber/peloton/.gen/peloton/private/eventstream"
 
 	"github.com/uber/peloton/pkg/common"
 	"github.com/uber/peloton/pkg/common/api"
@@ -718,6 +719,7 @@ func (suite *TaskUpdaterTestSuite) doTestProcessTaskFailedStatusUpdate(
 	suite.NoError(err)
 	event.MesosTaskStatus.Message = &failureMsg
 	taskInfo := createTestTaskInfo(task.TaskState_RUNNING)
+	taskInfo.Runtime.DesiredHost = "hostname1"
 
 	suite.mockTaskStore.EXPECT().
 		GetTaskByID(context.Background(), _pelotonTaskID).
@@ -738,6 +740,7 @@ func (suite *TaskUpdaterTestSuite) doTestProcessTaskFailedStatusUpdate(
 		suite.Equal(runtime.GetReason(), _mesosReason.String())
 		suite.Equal(runtime.GetMessage(), failureMsg)
 		suite.Equal(runtime.GetTerminationStatus(), expectedTermStatus)
+		suite.Empty(runtime.GetDesiredHost())
 	}).Return(nil, nil)
 	suite.goalStateDriver.EXPECT().EnqueueTask(_pelotonJobID, _instanceID, gomock.Any()).Return()
 	cachedJob.EXPECT().UpdateResourceUsage(gomock.Any()).Return()
@@ -763,6 +766,7 @@ func (suite *TaskUpdaterTestSuite) TestProcessTaskLostStatusUpdateWithRetry() {
 	updateEvent, err := statusupdate.NewV0(event)
 	suite.NoError(err)
 	taskInfo := createTestTaskInfo(task.TaskState_RUNNING)
+	taskInfo.Runtime.DesiredHost = "hostname1"
 
 	rescheduleMsg := "Task LOST: testFailure"
 	suite.mockTaskStore.EXPECT().
@@ -782,6 +786,7 @@ func (suite *TaskUpdaterTestSuite) TestProcessTaskLostStatusUpdateWithRetry() {
 		).Do(func(_ context.Context, _ uint32, runtime *task.RuntimeInfo, _ bool) {
 		suite.Equal(runtime.GetState(), task.TaskState_LOST)
 		suite.Equal(runtime.GetMessage(), rescheduleMsg)
+		suite.Empty(runtime.GetDesiredHost())
 	}).Return(nil, nil)
 	suite.goalStateDriver.EXPECT().EnqueueTask(_pelotonJobID, _instanceID, gomock.Any()).Return()
 	cachedJob.EXPECT().UpdateResourceUsage(gomock.Any()).Return()
@@ -1472,4 +1477,14 @@ func (suite *TaskUpdaterTestSuite) TestUpdaterStartStop() {
 	suite.mockListener2.EXPECT().Stop()
 
 	suite.updater.Stop()
+}
+
+// TestOnV0EventHostEvent tests that OnV0Event for a HostEvent is a no-op
+func (suite *TaskUpdaterTestSuite) TestOnV0EventHostEvent() {
+	defer suite.ctrl.Finish()
+
+	ev := &pbeventstream.Event{
+		Type: pb_eventstream.Event_HOST_EVENT,
+	}
+	suite.updater.OnV0Event(ev)
 }

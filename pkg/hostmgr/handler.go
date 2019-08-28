@@ -37,6 +37,7 @@ import (
 	"github.com/uber/peloton/pkg/hostmgr/config"
 	"github.com/uber/peloton/pkg/hostmgr/factory/task"
 	"github.com/uber/peloton/pkg/hostmgr/host"
+	"github.com/uber/peloton/pkg/hostmgr/hostpool/manager"
 	hostmgr_mesos "github.com/uber/peloton/pkg/hostmgr/mesos"
 	"github.com/uber/peloton/pkg/hostmgr/mesos/yarpc/encoding/mpb"
 	"github.com/uber/peloton/pkg/hostmgr/metrics"
@@ -94,6 +95,7 @@ type ServiceHandler struct {
 	maintenanceHostInfoMap host.MaintenanceHostInfoMap
 	watchProcessor         watchevent.WatchProcessor
 	disableKillTasks       atomic.Bool
+	hostPoolManager        manager.HostPoolManager
 }
 
 // NewServiceHandler creates a new ServiceHandler.
@@ -109,7 +111,9 @@ func NewServiceHandler(
 	maintenanceQueue mqueue.MaintenanceQueue,
 	slackResourceTypes []string,
 	maintenanceHostInfoMap host.MaintenanceHostInfoMap,
-	watchProcessor watchevent.WatchProcessor) *ServiceHandler {
+	watchProcessor watchevent.WatchProcessor,
+	hostPoolManager manager.HostPoolManager,
+) *ServiceHandler {
 
 	handler := &ServiceHandler{
 		schedulerClient:        schedulerClient,
@@ -123,6 +127,7 @@ func NewServiceHandler(
 		slackResourceTypes:     slackResourceTypes,
 		maintenanceHostInfoMap: maintenanceHostInfoMap,
 		watchProcessor:         watchProcessor,
+		hostPoolManager:        hostPoolManager,
 	}
 	// Creating Reserver object for handler
 	handler.reserver = reserver.NewReserver(
@@ -229,6 +234,7 @@ func (h *ServiceHandler) GetHostsByQuery(
 			Resources: nonRevocable,
 			Status:    toHostStatus(hostSummary.GetHostStatus()),
 			HeldTasks: hostSummary.GetHeldTask(),
+			Tasks:     hostSummary.GetTasks(),
 		})
 	}
 
@@ -537,9 +543,8 @@ func (h *ServiceHandler) AcquireHostOffers(
 		response.HostOffers = append(response.HostOffers, &pHostOffer)
 		log.WithFields(log.Fields{
 			"hostname":      hostname,
-			"agent_id":      offers[0].GetAgentId().GetValue(),
 			"host_offer_id": hostOffer.ID,
-		}).Info("Acquired Host")
+		}).Info("AcquireHostOffers")
 	}
 
 	return response, nil
@@ -572,9 +577,10 @@ func (h *ServiceHandler) GetHosts(
 		return response, errors.New("invalid host filter")
 	}
 
-	matcher := host.NewMatcher(
+	matcher := NewMatcher(
 		body.GetFilter(),
 		constraints.NewEvaluator(pb_task.LabelConstraint_HOST),
+		h.hostPoolManager,
 		func(resourceType string) bool {
 			return hmutil.IsSlackResourceType(resourceType, h.slackResourceTypes)
 		})
@@ -647,7 +653,7 @@ func (h *ServiceHandler) ReleaseHostOffers(
 			"hostname":      hostname,
 			"agent_id":      hostOffer.GetAgentId().GetValue(),
 			"host_offer_id": hostOffer.GetId().GetValue(),
-		}).Info("Released Host")
+		}).Info("ReleaseHostOffers")
 	}
 
 	return &hostsvc.ReleaseHostOffersResponse{}, nil
@@ -724,6 +730,7 @@ func (h *ServiceHandler) LaunchTasks(
 	offers, err := h.offerPool.ClaimForLaunch(
 		req.GetHostname(),
 		req.GetId().GetValue(),
+		req.GetTasks(),
 		hostToTaskIDs[req.GetHostname()]...,
 	)
 	if err != nil {
@@ -859,10 +866,11 @@ func (h *ServiceHandler) LaunchTasks(
 	}
 
 	log.WithFields(log.Fields{
-		"tasks":         taskIDs,
-		"offers":        offerIDs,
+		"task_ids":      taskIDs,
+		"offer_ids":     offerIDs,
+		"hostname":      req.GetHostname(),
 		"host_offer_id": req.GetId().GetValue(),
-	}).Info("Tasks launched.")
+	}).Info("LaunchTasks")
 
 	return &hostsvc.LaunchTasksResponse{}, nil
 }
@@ -1573,13 +1581,6 @@ func (h *ServiceHandler) releaseHostsHeldForTasks(taskIDs []*peloton.TaskID) err
 	}
 
 	return multierr.Combine(errs...)
-}
-
-func (h *ServiceHandler) ChangeHostPool(
-	ctx context.Context,
-	req *hostsvc.ChangeHostPoolRequest,
-) (*hostsvc.ChangeHostPoolResponse, error) {
-	return nil, yarpcerrors.UnimplementedErrorf("ChangeHostPool not implemented")
 }
 
 // Helper function to convert scalar.Resource into hostsvc format.

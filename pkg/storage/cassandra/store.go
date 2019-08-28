@@ -28,7 +28,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/uber/peloton/.gen/mesos/v1"
+	mesos_v1 "github.com/uber/peloton/.gen/mesos/v1"
 	"github.com/uber/peloton/.gen/peloton/api/v0/job"
 	"github.com/uber/peloton/.gen/peloton/api/v0/peloton"
 	"github.com/uber/peloton/.gen/peloton/api/v0/query"
@@ -106,22 +106,6 @@ const (
 	_jobUpdatesCleanupTimeout = 120 * time.Second
 )
 
-// Config is the config for cassandra Store
-type Config struct {
-	CassandraConn *impl.CassandraConn `yaml:"connection"`
-	StoreName     string              `yaml:"store_name"`
-	Migrations    string              `yaml:"migrations"`
-	// MaxBatchSize makes sure we avoid batching too many statements and avoid
-	// http://docs.datastax.com/en/archived/cassandra/3.x/cassandra/configuration/configCassandra_yaml.html#configCassandra_yaml__batch_size_fail_threshold_in_kb
-	// This value is the number of records that are included in a single transaction/commit RPC request
-	MaxBatchSize int `yaml:"max_batch_size_rows"`
-	// MaxParallelBatches controls the maximum number of go routines run to create tasks
-	MaxParallelBatches int `yaml:"max_parallel_batches"`
-	// MaxUpdatesPerJob controls the maximum number of
-	// updates per job kept in the database
-	MaxUpdatesPerJob int `yaml:"max_updates_job"`
-}
-
 // GenerateTestCassandraConfig generates a test config for local C* client
 // This is meant for sharing testing code only, not for production
 func GenerateTestCassandraConfig() *Config {
@@ -134,6 +118,15 @@ func GenerateTestCassandraConfig() *Config {
 		},
 		StoreName:  "peloton_test",
 		Migrations: "migrations",
+		Replication: &Replication{
+			Strategy: "SimpleStrategy",
+			Replicas: []*Replica{
+				{
+					Name:  "replication_factor",
+					Value: 1,
+				},
+			},
+		},
 	}
 }
 
@@ -873,10 +866,10 @@ func (s *Store) addPodEvent(
 	return nil
 }
 
-// getPodEvents returns pod events for a Job + Instance + PodID (optional)
+// GetPodEvents returns pod events for a Job + Instance + PodID (optional)
 // Pod events are sorted by PodID + Timestamp
 // only is called from this file
-func (s *Store) getPodEvents(
+func (s *Store) GetPodEvents(
 	ctx context.Context,
 	jobID string,
 	instanceID uint32,
@@ -1612,7 +1605,7 @@ func (s *Store) deletePodEventsOnDeleteJob(
 		// 2) read pod events if instance_id (shrunk instances) % 100 = 0
 		if instanceCount > jobConfig.InstanceCount &&
 			instanceCount%_defaultPodEventsLimit == 0 {
-			events, err := s.getPodEvents(
+			events, err := s.GetPodEvents(
 				ctx,
 				jobID,
 				instanceCount)
@@ -2289,20 +2282,16 @@ func (s *Store) convertToWorkflowEvents(
 			count = 0
 			isLogged = false
 			prevWorkflowEvent = workflowEvent
-			continue
-		}
-
-		if prevWorkflowEvent.GetState() == workflowEvent.GetState() {
+		} else {
 			count++
-		}
-
-		if count > _defaultWorkflowEventsDedupeWarnLimit && !isLogged {
-			log.WithFields(log.Fields{
-				"workflow_state": workflowEvent.GetState().String(),
-				"workflow_type":  workflowEvent.GetType().String(),
-				"update_id":      updateID.GetValue(),
-			}).Warn("too many job workflow events in the same state")
-			isLogged = true
+			if count > _defaultWorkflowEventsDedupeWarnLimit && !isLogged {
+				log.WithFields(log.Fields{
+					"workflow_state": workflowEvent.GetState().String(),
+					"workflow_type":  workflowEvent.GetType().String(),
+					"update_id":      updateID.GetValue(),
+				}).Warn("too many job workflow events in the same state")
+				isLogged = true
+			}
 		}
 	}
 
@@ -2788,7 +2777,7 @@ func (s *Store) GetUpdatesForJob(
 	var updateList []*SortUpdateInfoTS
 
 	queryBuilder := s.DataStore.NewQuery()
-	stmt := queryBuilder.Select("*").From(updatesByJobView).
+	stmt := queryBuilder.Select("update_id").From(updatesByJobView).
 		Where(qb.Eq{"job_id": jobID})
 	allResults, err := s.executeRead(ctx, stmt)
 	if err != nil {
@@ -2800,7 +2789,7 @@ func (s *Store) GetUpdatesForJob(
 	}
 
 	for _, value := range allResults {
-		var record UpdateRecord
+		var record UpdateViewRecord
 		err := FillObject(value, &record, reflect.TypeOf(record))
 		if err != nil {
 			log.WithError(err).

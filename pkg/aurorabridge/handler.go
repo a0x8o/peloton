@@ -17,6 +17,7 @@ package aurorabridge
 import (
 	"context"
 	"fmt"
+	"math"
 	"sort"
 	"strings"
 	"sync"
@@ -28,18 +29,17 @@ import (
 	"github.com/uber/peloton/.gen/peloton/api/v1alpha/peloton"
 	"github.com/uber/peloton/.gen/peloton/api/v1alpha/pod"
 	podsvc "github.com/uber/peloton/.gen/peloton/api/v1alpha/pod/svc"
-	pbquery "github.com/uber/peloton/.gen/peloton/api/v1alpha/query"
 	"github.com/uber/peloton/.gen/peloton/private/jobmgrsvc"
 	"github.com/uber/peloton/.gen/thrift/aurora/api"
-	"github.com/uber/peloton/pkg/aurorabridge/cache"
-	"github.com/uber/peloton/pkg/common/util"
 
 	"github.com/uber/peloton/pkg/aurorabridge/atop"
+	"github.com/uber/peloton/pkg/aurorabridge/cache"
 	"github.com/uber/peloton/pkg/aurorabridge/common"
 	"github.com/uber/peloton/pkg/aurorabridge/label"
 	"github.com/uber/peloton/pkg/aurorabridge/opaquedata"
 	"github.com/uber/peloton/pkg/aurorabridge/ptoa"
 	"github.com/uber/peloton/pkg/common/concurrency"
+	"github.com/uber/peloton/pkg/common/util"
 
 	"github.com/pkg/errors"
 	log "github.com/sirupsen/logrus"
@@ -49,6 +49,10 @@ import (
 )
 
 var errUnimplemented = errors.New("rpc is unimplemented")
+
+// Minimum task query depth when PodRunsDepth in the config is set to
+// larger than and equals to 2 and bounded by PodRunsMax.
+const minPodRunsDepth = 2
 
 // jobCache is an internal struct used to capture job id and name
 // of the a specific job. Mostly used as the job query return result.
@@ -175,6 +179,11 @@ func (h *ServiceHandler) getJobSummary(
 				jobID.GetValue(), err)
 		}
 
+		// If the job is stopped, skip it from the response
+		if jobInfo.GetSpec().GetInstanceCount() == 0 {
+			return nil, nil
+		}
+
 		// In Aurora, JobSummary.JobConfiguration.TaskConfig
 		// is generated using latest "active" task. Reference:
 		// https://github.com/apache/aurora/blob/master/src/main/java/org/apache/aurora/scheduler/base/Tasks.java#L133
@@ -286,40 +295,67 @@ func (h *ServiceHandler) getTasksWithoutConfigs(
 		return nil, auroraErrorf("get job ids from task query: %s", err)
 	}
 
-	tasks := []*api.ScheduledTask{}
+	// concurrency.Map in nested setup leaks goroutines, thus using
+	// a custom worker pool implementation.
+	mapOutputs := make([]struct {
+		ts  []*api.ScheduledTask
+		err error
+	}, len(jobIDs))
+	mapWait := sync.WaitGroup{}
+	for i, jobID := range jobIDs {
+		mapWait.Add(1)
+		go func(i int, j *peloton.JobID) {
+			defer mapWait.Done()
 
-	// TODO(kevinxu): Factor out to seperate function.
-	for _, jobID := range jobIDs {
-		jobSummary, err := h.getJobInfoSummary(ctx, jobID)
-		if err != nil {
-			if yarpcerrors.IsNotFound(err) {
-				continue
+			jobSummary, err := h.getJobInfoSummary(ctx, j)
+			if err != nil {
+				if yarpcerrors.IsNotFound(err) {
+					return
+				}
+				mapOutputs[i].err = fmt.Errorf(
+					"get job info for job id %q: %s",
+					j.GetValue(), err)
+				return
 			}
-			return nil, auroraErrorf("get job info for job id %q: %s",
-				jobID.GetValue(), err)
-		}
 
-		pods, err := h.queryPods(
-			ctx,
-			jobID,
-			jobSummary.GetInstanceCount(),
-		)
-		if err != nil {
-			return nil, auroraErrorf(
-				"query pods for job id %q: %s", jobID.GetValue(), err)
-		}
+			pods, err := h.queryPods(
+				ctx,
+				j,
+				jobSummary.GetInstanceCount(),
+			)
+			if err != nil {
+				mapOutputs[i].err = fmt.Errorf(
+					"query pods for job id %q: %s",
+					j.GetValue(), err)
+				return
+			}
 
-		ts, err := h.getScheduledTasks(
-			ctx,
-			jobSummary,
-			pods,
-			&taskFilter{statuses: query.GetStatuses()},
-		)
-		if err != nil {
-			return nil, auroraErrorf("get tasks without configs: %s", err)
-		}
+			ts, err := h.getScheduledTasks(
+				ctx,
+				jobSummary,
+				pods,
+				&taskFilter{statuses: query.GetStatuses()},
+			)
+			if err != nil {
+				mapOutputs[i].err = fmt.Errorf("get tasks without configs: %s", err)
+				return
+			}
 
-		tasks = append(tasks, ts...)
+			mapOutputs[i].ts = ts
+			return
+		}(i, jobID)
+	}
+	mapWait.Wait()
+
+	tasks := []*api.ScheduledTask{}
+	for _, o := range mapOutputs {
+		if o.err != nil {
+			return nil, auroraErrorf(o.err.Error())
+		}
+		if o.ts == nil {
+			continue
+		}
+		tasks = append(tasks, o.ts...)
 	}
 
 	return &api.Result{
@@ -353,6 +389,18 @@ type getScheduledTaskInput struct {
 	podSpec    *pod.PodSpec
 }
 
+// getPodRunsLimit calculates the number of pod runs getTasksWithoutConfigs
+// endpoint will return based on config.
+func getPodRunsLimit(
+	podsNum uint32,
+	podsMax uint32,
+	podRunsDepth uint32,
+) uint32 {
+	podsNumTotal := util.Min(podsNum*podRunsDepth, podsMax)
+	podRuns := uint32(math.Ceil(float64(podsNumTotal) / float64(podsNum)))
+	return util.Max(podRuns, util.Min(podRunsDepth, minPodRunsDepth))
+}
+
 // getScheduledTasks generates a list of Aurora ScheduledTask in a worker
 // pool.
 func (h *ServiceHandler) getScheduledTasks(
@@ -362,6 +410,12 @@ func (h *ServiceHandler) getScheduledTasks(
 	filter *taskFilter,
 ) ([]*api.ScheduledTask, error) {
 	jobID := jobSummary.GetJobId()
+
+	podRunsDepth := getPodRunsLimit(
+		uint32(len(podInfos)),
+		uint32(h.config.GetTasksPodMax),
+		uint32(h.config.PodRunsDepth),
+	)
 
 	var inputs []interface{}
 	for _, p := range podInfos {
@@ -381,7 +435,7 @@ func (h *ServiceHandler) getScheduledTasks(
 
 		// when PodRunsDepth set to 1, query only current run pods, when set
 		// to larger than 1, will query current plus previous run pods
-		for i := uint64(0); i < uint64(h.config.PodRunsDepth); i++ {
+		for i := uint64(0); i < uint64(podRunsDepth); i++ {
 			newRunID := runID - i
 			if newRunID == 0 {
 				// No more previous run pods
@@ -682,6 +736,11 @@ func (h *ServiceHandler) getJobs(
 			}
 			return nil, fmt.Errorf("get job info for job id %q: %s",
 				jobID.GetValue(), err)
+		}
+
+		// If the job is stopped, skip it from the response
+		if jobInfo.GetSpec().GetInstanceCount() == 0 {
+			return nil, nil
 		}
 
 		// In Aurora, JobConfiguration.TaskConfig
@@ -2167,24 +2226,59 @@ func (h *ServiceHandler) getJobAndWorkflow(
 func (h *ServiceHandler) queryPods(
 	ctx context.Context,
 	jobID *peloton.JobID,
-	limit uint32,
+	instanceCount uint32,
 ) ([]*pod.PodInfo, error) {
-	req := &statelesssvc.QueryPodsRequest{
-		JobId: jobID,
-		Spec: &pod.QuerySpec{
-			Pagination: &pbquery.PaginationSpec{
-				Limit: limit,
-			},
-		},
-		Pagination: &pbquery.PaginationSpec{
-			Limit: limit,
-		},
+
+	var inputs []interface{}
+	for i := uint32(0); i < instanceCount; i++ {
+		inputs = append(inputs, fmt.Sprintf("%s-%d", jobID.GetValue(), i))
 	}
-	resp, err := h.jobClient.QueryPods(ctx, req)
+
+	f := func(ctx context.Context, input interface{}) (interface{}, error) {
+		podName := input.(string)
+		req := &podsvc.GetPodRequest{
+			PodName: &peloton.PodName{
+				Value: podName,
+			},
+			StatusOnly: false,
+			Limit:      1,
+		}
+
+		resp, err := h.podClient.GetPod(ctx, req)
+		if err != nil {
+			// If TaskRuntime does not exist, return nil PodInfo
+			if yarpcerrors.IsNotFound(err) {
+				return nil, nil
+			}
+
+			return nil, err
+		}
+
+		return resp.GetCurrent(), nil
+	}
+
+	outputs, err := concurrency.Map(
+		ctx,
+		concurrency.MapperFunc(f),
+		inputs,
+		h.config.GetTasksWithoutConfigsWorkers)
 	if err != nil {
 		return nil, err
 	}
-	return resp.GetPods(), nil
+
+	podInfos := []*pod.PodInfo{}
+	for _, o := range outputs {
+		if o == nil {
+			continue
+		}
+		podInfo := o.(*pod.PodInfo)
+		if podInfo == nil {
+			continue
+		}
+		podInfos = append(podInfos, podInfo)
+	}
+
+	return podInfos, nil
 }
 
 // getPodEvents calls jobmgr to get a list of PodEvent based on PodName.
@@ -2212,6 +2306,7 @@ func (h *ServiceHandler) listWorkflows(
 	jobID *peloton.JobID,
 	includeInstanceEvents bool,
 ) ([]*stateless.WorkflowInfo, error) {
+
 	req := &statelesssvc.ListJobWorkflowsRequest{
 		JobId:               jobID,
 		InstanceEvents:      includeInstanceEvents,
@@ -2222,6 +2317,7 @@ func (h *ServiceHandler) listWorkflows(
 	if err != nil {
 		return nil, err
 	}
+
 	return resp.GetWorkflowInfos(), nil
 }
 

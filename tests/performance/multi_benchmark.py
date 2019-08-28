@@ -26,6 +26,18 @@ from performance_test_client import (
     ResPoolNotFoundException,
 )
 
+from aurora_bridge_client import api
+from aurora_bridge_util import (
+    assert_keys_equal,
+    get_job_update_request,
+    get_update_status,
+    start_job_update,
+    wait_for_rolled_forward,
+    wait_for_rolled_back,
+    wait_for_update_status,
+    verify_host_limit_1,
+)
+
 # Perf tests conducted. Serves as a single source of truth.
 # Within each tuple, first item explains the perf test purpose;
 # second item shows the corresponding csv file structure.
@@ -34,13 +46,14 @@ PERF_TEST_CONDUCTED = [
     ('JOB_GET', '_job_get.csv'),
     ('JOB_UPDATE', '_job_update.csv'),
     ('JOB_STATELESS_CREATE', '_job_stateless_create.csv'),
-    # ('JOB_STATELESS_UPDATE', '_job_stateless_update.csv'),
-    ('JOB_PARALLEL_STATELESS_UPDATE',
-     '_job_parallel_stateless_update.csv'),
+    ('JOB_STATELESS_UPDATE', '_job_stateless_update.csv'),
+    ('JOB_PARALLEL_STATELESS_UPDATE', '_job_parallel_stateless_update.csv'),
+    ('JOB_STATELESS_HOST_LIMIT_1_CREATE', '_job_stateless_host_limit_1_create.csv'),
+    ('JOB_STATELESS_HOST_LIMIT_1_UPDATE', '_job_stateless_host_limit_1_update.csv'),
 ]
 
-NUM_TASKS = [10000, 50000]
-SLEEP_TIME_SEC = [10, 60]
+NUM_TASKS = [50000]
+SLEEP_TIME_SEC = [10]
 USE_INSTANCE_CONFIG = [True, False]
 
 stats_keys = ["CREATE", "CREATEFAILS", "GET", "GETFAILS"]
@@ -216,17 +229,29 @@ def main():
     if create_df is not None:
         create_df.to_csv(output_csv_files_list[3], sep='\t')
 
-    # TODO fix test
-    # # update one large stateless job (uses 90% of capacity)
-    # update_df = t.perf_test_stateless_job_update()
-    # if update_df is not None:
-    #     update_df.to_csv(output_csv_files_list[4], sep='\t')
+    # update one large stateless job (uses 90% of capacity)
+    update_df = t.perf_test_stateless_job_update()
+    if update_df is not None:
+        update_df.to_csv(output_csv_files_list[4], sep='\t')
 
     # update multiple smaller stateless jobs in parallel
     # (total use 90% of capacity)
     pupdate_df = t.perf_test_stateless_parallel_updates()
     if pupdate_df is not None:
-        pupdate_df.to_csv(output_csv_files_list[4], sep='\t')
+        pupdate_df.to_csv(output_csv_files_list[5], sep='\t')
+
+    # create a stateless job with host-limit-1 constraint (use 60% of the cluster)
+    host_limit_1_create_df = t.perf_test_job_stateless_host_limit_1_create()
+    if host_limit_1_create_df is not None:
+        host_limit_1_create_df.to_csv(output_csv_files_list[6], sep='\t')
+
+    # update a stateless job with host-limit-1 constraint (use 60% of the cluster)
+    host_limit_1_update_df = t.perf_test_stateless_job_host_limit_1_update()
+    if host_limit_1_update_df is not None:
+        host_limit_1_update_df.to_csv(output_csv_files_list[7], sep='\t')
+
+    # Test AuroraBridge write path
+    t.perf_aurora_bridge_test_write_path()
 
 
 def run_one_test(pf_client, num_tasks, instance_config, sleep_time, agent_num):
@@ -357,7 +382,11 @@ class PerformanceTest:
         print(df)
         return df
 
-    def perf_test_stateless_job_create(self, num_tasks=9000, sleep_time=1000):
+    def perf_test_stateless_job_create(
+        self,
+        num_tasks=9000,
+        sleep_time=1000,
+    ):
         """
         perf_test_stateless_job_create is used to test creating a stateless
         job. The test creates one job with num_tasks and measures the time
@@ -398,13 +427,13 @@ class PerformanceTest:
 
         record = [
             {
-                "NumStartTasks": num_tasks,
+                "NumTasks": num_tasks,
                 "Sleep(s)": sleep_time,
                 "TotalTimeInSeconds": total_time_in_seconds,
             }
         ]
         df = pd.DataFrame(
-            record, columns=["NumStartTasks", "Sleep(s)", "TotalTimeInSeconds"],
+            record, columns=["NumTasks", "Sleep(s)", "TotalTimeInSeconds"],
             dtype=np.int64
         )
         print("Test StatelessCreate")
@@ -473,7 +502,7 @@ class PerformanceTest:
 
         record = [
             {
-                "NumStartTasks": num_tasks,
+                "NumTasks": num_tasks,
                 "Sleep(s)": sleep_time,
                 "BatchSize": batch_size,
                 "TotalTimeInSeconds": total_time_in_seconds,
@@ -482,7 +511,7 @@ class PerformanceTest:
         df = pd.DataFrame(
             record,
             columns=[
-                "NumStartTasks",
+                "NumTasks",
                 "Sleep(s)",
                 "BatchSize",
                 "TotalTimeInSeconds",
@@ -539,7 +568,7 @@ class PerformanceTest:
         record = [
             {
                 "NumJobs": num_jobs,
-                "NumStartTasks": num_tasks,
+                "NumTasks": num_tasks,
                 "Sleep(s)": sleep_time,
                 "BatchSize": batch_size,
                 "AverageTimeInSeconds": average_time_in_seconds,
@@ -549,7 +578,7 @@ class PerformanceTest:
             record,
             columns=[
                 "NumJobs",
-                "NumStartTasks",
+                "NumTasks",
                 "Sleep(s)",
                 "BatchSize",
                 "AverageTimeInSeconds",
@@ -660,6 +689,286 @@ class PerformanceTest:
         print("Test Create + Get")
         print(df)
         return df
+
+    def perf_test_job_stateless_host_limit_1_create(
+            self,
+            num_tasks=600,
+            sleep_time=1000,
+    ):
+        """
+        perf_test_job_stateless_host_limit_1_create is used to test creating a
+        stateless job with host-limit-1 constraint. The test creates one job
+        with num_tasks and measures the time it takes for all tasks to become
+        RUNNING.
+        """
+        total_time_in_seconds = 0
+        try:
+            job = self.client.get_stateless_job()
+            self.client.create_job(
+                job,
+                num_tasks,
+                False,
+                sleep_time,
+                host_limit_1=True,
+            )
+        except Exception as e:
+            msg = "Num_start_tasks %s && SleepTime %s" % (
+                num_tasks,
+                sleep_time,
+            )
+            print(
+                "test_job_stateless__host_limit_1_create: create job failed: %s (%s)"
+                % (e, msg)
+            )
+            return
+
+        succeed, _, completion = self.client.monitoring_job(job)
+        if succeed:
+            total_time_in_seconds = completion
+
+        try:
+            self.client.stop_job(job, wait_for_kill=True)
+        except Exception as e:
+            msg = "Num_start_tasks %s && SleepTime %s" % (
+                num_tasks,
+                sleep_time,
+            )
+            print(
+                "test_job_stateless_host_limit_1_create: stop job failed: %s (%s)"
+                % (e, msg)
+            )
+            return
+
+        record = [
+            {
+                "NumTasks": num_tasks,
+                "Sleep(s)": sleep_time,
+                "TotalTimeInSeconds": total_time_in_seconds,
+            }
+        ]
+        df = pd.DataFrame(
+            record, columns=["NumTasks", "Sleep(s)", "TotalTimeInSeconds"],
+            dtype=np.int64
+        )
+        print("Test StatelessHostLimit1Create")
+        print(df)
+        return df
+
+    def perf_test_stateless_job_host_limit_1_update(
+            self,
+            num_tasks=600,
+            batch_size=20,
+            sleep_time=1000,
+    ):
+        """
+        perf_test_stateless_job_host_limit_1_update is used to test updating a
+        stateless job with host_limit_1 constraint. The test creates one job
+        with num_tasks and measures the time it takes to update all tasks to a
+        new version.
+        """
+        total_time_in_seconds = 0
+        try:
+            job = self.client.get_stateless_job()
+            self.client.create_job(
+                job,
+                num_tasks,
+                False,
+                sleep_time - 100,
+                host_limit_1=True,
+            )
+        except Exception as e:
+            msg = "Num_start_tasks %s && SleepTime %s" % (
+                num_tasks,
+                sleep_time,
+            )
+            print(
+                "test_job_stateless_host_limit_1_update: create job failed: "
+                "%s (%s)" % (e, msg)
+            )
+            return
+
+        succeed, _, _ = self.client.monitoring_job(job)
+        if succeed is False:
+            print("test_job_stateless_host_limit_1_update: job failed to start")
+            return
+
+        try:
+            self.client.update_job(
+                job, 0, batch_size, False, sleep_time, host_limit_1=True)
+        except Exception as e:
+            msg = "Num_tasks %s && SleepTime %s && BatchSize %s" % (
+                num_tasks,
+                sleep_time,
+                batch_size,
+            )
+            print(
+                "test_job_stateless_host_limit_1_update: update job failed: %s (%s)"
+                % (e, msg)
+            )
+            return
+
+        succeed, _, completion = self.client.monitoring_job(job)
+        if succeed:
+            total_time_in_seconds = completion
+
+        try:
+            self.client.stop_job(job, wait_for_kill=True)
+        except Exception as e:
+            msg = "Num_start_tasks %s && SleepTime %s" % (
+                num_tasks,
+                sleep_time,
+            )
+            print(
+                "test_job_stateless_host_limit_1_create: stop job failed: "
+                "%s (%s)" % (e, msg)
+            )
+            return
+
+        record = [
+            {
+                "NumTasks": num_tasks,
+                "Sleep(s)": sleep_time,
+                "BatchSize": batch_size,
+                "TotalTimeInSeconds": total_time_in_seconds,
+            }
+        ]
+        df = pd.DataFrame(
+            record,
+            columns=[
+                "NumTasks",
+                "Sleep(s)",
+                "BatchSize",
+                "TotalTimeInSeconds",
+            ],
+        )
+        print("Test StatelessHostLimit1Update")
+        print(df)
+        return df
+
+    def perf_aurora_bridge_test_write_path(self):
+        """
+        - Create a stateless job via AuroraBridge, #tasks = 600 and batch_size = 50
+        - Create a healthy update for stateless job, with #tasks = 600 and batch_size = 50
+        - Create a unhealthy update with auto-rollback at 200 failed instances.
+        - Create pinned instances, where C1: 0-100, C2: 101-300, C3: 301-599
+        - Deploy C4 for all tasks, and trigger manual rollback.
+        - Once manual rollback completes, validate the correctness and calculate the time taken.
+        """
+        try:
+            start_time = time.time()
+
+            print 'Create Stateless Job of 600 instances and batch size 50'
+            step_start_time = time.time()
+            start_job_update(
+                self.client.aurora_bridge_client,
+                get_job_update_request("test_dc_labrat.yaml"),
+                "create job",
+            )
+            print('Time Taken:: %f' % (time.time() - step_start_time))
+
+            print '\nUpdate Stateless Job of 600 instances with healthy config and batch size 50'
+            step_start_time = time.time()
+            start_job_update(
+                self.client.aurora_bridge_client,
+                get_job_update_request("test_dc_labrat_update.yaml"),
+                "start job update",
+            )
+            print('Time Taken:: %f' % (time.time() - step_start_time))
+
+            print '\nRollout bad config which will trigger auto-rollback after 200 failed instances'
+            step_start_time = time.time()
+            resp = self.client.aurora_bridge_client.start_job_update(
+                get_job_update_request("test_dc_labrat_bad_config.yaml"),
+                "start job update bad config",
+            )
+            job_update_key = resp.key
+            wait_for_rolled_back(
+                self.client.aurora_bridge_client, job_update_key)
+            print('Time Taken:: %f' % (time.time() - step_start_time))
+
+            print '\nRollout Pinned Instance Config (C1) for Instance: 0-99'
+            step_start_time = time.time()
+            instances = []
+            for i in xrange(100):
+                instances.append(i)
+            pinned_req = get_job_update_request(
+                "test_dc_labrat.yaml"
+            )
+            pinned_req.settings.updateOnlyTheseInstances = set(
+                [api.Range(first=i, last=i) for i in instances]
+            )
+            job_key = start_job_update(
+                self.client.aurora_bridge_client,
+                pinned_req,
+                "update pinned instance req",
+            )
+            print('Time Taken:: %f' % (time.time() - step_start_time))
+
+            print '\nRollout Pinned Instance Config (C3) for Instance: 301-599'
+            step_start_time = time.time()
+            instances = []
+            for i in xrange(301, 600):
+                instances.append(i)
+            pinned_req = get_job_update_request(
+                "test_dc_labrat_update2.yaml"
+            )
+            pinned_req.settings.updateOnlyTheseInstances = set(
+                [api.Range(first=i, last=i) for i in instances]
+            )
+            start_job_update(
+                self.client.aurora_bridge_client,
+                pinned_req,
+                "update pinned instance req",
+            )
+            print('Time Taken:: %f' % (time.time() - step_start_time))
+
+            print '\nRollout update and trigger manual rollback'
+            step_start_time = time.time()
+            start_job_update(
+                self.client.aurora_bridge_client,
+                get_job_update_request("test_dc_labrat.yaml"),
+                "create job",
+            )
+            time.sleep(100)
+            self.client.aurora_bridge_client.rollback_job_update(job_update_key)
+            wait_for_rolled_back(
+                self.client.aurora_bridge_client, job_update_key)
+            print('Time Taken:: %f' % (time.time() - step_start_time))
+
+            print 'Validate pinned instance configs are set correctly'
+            step_start_time = time.time()
+            resp = self.client.aurora_bridge_client.get_tasks_without_configs(
+                api.TaskQuery(jobKeys={job_key}, statuses={
+                              api.ScheduleStatus.RUNNING})
+            )
+            assert len(resp.tasks) == 600
+
+            print('Time Taken:: %f' % (time.time() - step_start_time))
+
+            elapsed_time = time.time() - start_time
+            print('\n\nTotal Time Taken:: %f' % (elapsed_time))
+
+            for t in resp.tasks:
+                _, instance_id, _ = t.assignedTask.taskId.rsplit("-", 2)
+                if int(instance_id) < 100:
+                    for m in t.assignedTask.task.metadata:
+                        if m.key == "test_key_1":
+                            assert m.value == "test_value_1"
+                        elif m.key == "test_key_2":
+                            assert m.value == "test_value_2"
+                elif int(instance_id) >= 100 and int(instance_id) < 300:
+                    if m.key == "test_key_11":
+                        assert m.value == "test_value_11"
+                    elif m.key == "test_key_22":
+                        assert m.value == "test_value_22"
+                else:
+                    if m.key == "test_key_111":
+                        assert m.value == "test_value_111"
+                    elif m.key == "test_key_222":
+                        assert m.value == "test_value_222"
+
+        except Exception as e:
+            print e
 
 
 class statelessUpdateWorker(threading.Thread):

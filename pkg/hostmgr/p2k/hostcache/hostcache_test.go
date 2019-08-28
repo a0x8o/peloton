@@ -19,11 +19,17 @@ import (
 	"math"
 	"strings"
 	"sync"
+	"testing"
+	"time"
 
+	"github.com/uber/peloton/.gen/peloton/api/v1alpha/peloton"
 	"github.com/uber/peloton/.gen/peloton/api/v1alpha/pod"
 	hostmgr "github.com/uber/peloton/.gen/peloton/private/hostmgr/v1alpha"
-
 	"github.com/uber/peloton/pkg/hostmgr/scalar"
+
+	"github.com/pborman/uuid"
+	"github.com/stretchr/testify/require"
+	"github.com/uber-go/tally"
 )
 
 // TestAcquireLeases tests the host cache AcquireLeases API
@@ -113,14 +119,17 @@ func (suite *HostCacheTestSuite) TestAcquireLeases() {
 		hosts := generateHostSummaries(10)
 		hc := &hostCache{
 			hostIndex: make(map[string]HostSummary),
+			metrics:   NewMetrics(tally.NoopScope),
 		}
 		// initialize host cache with these 10 hosts
 		for _, s := range hosts {
-			s.(*hostSummary).allocated = tt.allocatedPerHost
+			s.(*baseHostSummary).allocated = tt.allocatedPerHost
+			s.(*baseHostSummary).available = s.(*baseHostSummary).capacity.Subtract(tt.allocatedPerHost)
 			hc.hostIndex[s.GetHostname()] = s
 		}
 
 		leases, filterResult := hc.AcquireLeases(tt.filter)
+		hc.RefreshMetrics()
 
 		suite.Equal(tt.matched, len(leases), "test case %s", ttName)
 		suite.Equal(tt.filterCounts, filterResult, "test case %s", ttName)
@@ -138,7 +147,7 @@ func (suite *HostCacheTestSuite) TestGetClusterCapacity() {
 	allocPerHost := createResource(1.0, 10.0)
 	// initialize host cache with these 10 hosts
 	for _, s := range hosts {
-		s.(*hostSummary).allocated = allocPerHost
+		s.(*baseHostSummary).allocated = allocPerHost
 		hc.hostIndex[s.GetHostname()] = s
 	}
 
@@ -163,12 +172,12 @@ func (suite *HostCacheTestSuite) TestGetSummaries() {
 	allocPerHost := createResource(1.0, 10.0)
 	// initialize host cache with these 10 hosts
 	for _, s := range hosts {
-		s.(*hostSummary).allocated = allocPerHost
+		s.(*baseHostSummary).allocated = allocPerHost
 		hc.hostIndex[s.GetHostname()] = s
 	}
 
 	for _, summary := range hc.GetSummaries() {
-		host := hc.hostIndex[summary.GetHostname()].(*hostSummary)
+		host := hc.hostIndex[summary.GetHostname()].(*baseHostSummary)
 		suite.Equal(summary, host)
 	}
 }
@@ -387,7 +396,7 @@ func (suite *HostCacheTestSuite) TestAcquireLeasesParallel() {
 		hc.hostIndex[s.GetHostname()] = s
 	}
 
-	aggrLeases := []*hostmgr.HostLease{}
+	var aggrLeases []*hostmgr.HostLease
 	nClients := 8
 	mutex := &sync.Mutex{}
 	wg := sync.WaitGroup{}
@@ -425,4 +434,74 @@ func (suite *HostCacheTestSuite) TestAcquireLeasesParallel() {
 	wg.Wait()
 	// number of leases acquired should be equal to numHosts
 	suite.Equal(numHosts, len(aggrLeases))
+}
+
+// TODO: move to use mock after host summary is moved to a different package.
+func TestHoldForPods(t *testing.T) {
+	require := require.New(t)
+	hs := generateHostSummaries(1)[0]
+	podID := &peloton.PodID{Value: uuid.New()}
+	hc := &hostCache{
+		hostIndex:    map[string]HostSummary{hs.GetHostname(): hs},
+		podHeldIndex: map[string]string{},
+	}
+	require.Empty(hc.podHeldIndex)
+	require.NoError(hc.HoldForPods(hs.GetHostname(), []*peloton.PodID{podID}))
+	require.Equal(1, len(hc.podHeldIndex))
+	require.Equal(hs.GetHostname(), hc.GetHostHeldForPod(podID))
+}
+
+// TODO: move to use mock after host summary is moved to a different package.
+func TestHoldForPodsDuplicated(t *testing.T) {
+	require := require.New(t)
+	hosts := generateHostSummaries(2)
+	podID := &peloton.PodID{Value: uuid.New()}
+	hc := &hostCache{
+		hostIndex: map[string]HostSummary{
+			hosts[0].GetHostname(): hosts[0],
+			hosts[1].GetHostname(): hosts[1],
+		},
+		podHeldIndex: map[string]string{},
+	}
+	require.Empty(hc.podHeldIndex)
+	require.NoError(hc.HoldForPods(hosts[0].GetHostname(), []*peloton.PodID{podID}))
+	require.Equal(1, len(hc.podHeldIndex))
+	require.Equal(hosts[0].GetHostname(), hc.GetHostHeldForPod(podID))
+
+	require.NoError(hc.HoldForPods(hosts[1].GetHostname(), []*peloton.PodID{podID}))
+	require.Equal(1, len(hc.podHeldIndex))
+	require.Equal(hosts[1].GetHostname(), hc.GetHostHeldForPod(podID))
+}
+
+// TODO: move to use mock after host summary is moved to a different package.
+func TestReleaseHoldForPods(t *testing.T) {
+	require := require.New(t)
+	hs := generateHostSummaries(1)[0]
+	podID := &peloton.PodID{Value: uuid.New()}
+	hc := &hostCache{
+		hostIndex:    map[string]HostSummary{hs.GetHostname(): hs},
+		podHeldIndex: map[string]string{podID.GetValue(): hs.GetHostname()},
+	}
+	require.Equal(1, len(hc.podHeldIndex))
+	require.NoError(hc.ReleaseHoldForPods(hs.GetHostname(), []*peloton.PodID{podID}))
+	require.Empty(hc.podHeldIndex)
+}
+
+// TODO: move to use mock after host summary is moved to a different package.
+func TestResetExpiredHeldHostSummaries(t *testing.T) {
+	require := require.New(t)
+	hs := generateHostSummaries(1)[0]
+	podID := &peloton.PodID{Value: uuid.New()}
+	hc := &hostCache{
+		hostIndex:    map[string]HostSummary{hs.GetHostname(): hs},
+		podHeldIndex: map[string]string{},
+	}
+	now := time.Now()
+	require.NoError(hc.HoldForPods(hs.GetHostname(), []*peloton.PodID{podID}))
+	require.Equal(1, len(hc.podHeldIndex))
+
+	ret := hc.ResetExpiredHeldHostSummaries(now.Add(time.Hour))
+	require.Equal(1, len(ret))
+	require.Equal(hs.GetHostname(), ret[0])
+	require.Empty(hc.podHeldIndex)
 }

@@ -18,19 +18,19 @@ import (
 	"context"
 	"fmt"
 
-	pbpod "github.com/uber/peloton/.gen/peloton/api/v1alpha/pod"
-
 	"github.com/uber/peloton/pkg/common"
 	"github.com/uber/peloton/pkg/common/lifecycle"
+	"github.com/uber/peloton/pkg/hostmgr/models"
 	"github.com/uber/peloton/pkg/hostmgr/p2k/scalar"
 
 	log "github.com/sirupsen/logrus"
+	"go.uber.org/yarpc/yarpcerrors"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/client-go/informers"
-	coreinformers "k8s.io/client-go/informers/core/v1"
 	"k8s.io/client-go/kubernetes"
+	corelisters "k8s.io/client-go/listers/core/v1"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/clientcmd"
@@ -46,8 +46,7 @@ type K8SManager struct {
 	// Internal K8S client structs that provide pod and node watch
 	// functionality.
 	informerFactory informers.SharedInformerFactory
-	nodeInformer    coreinformers.NodeInformer
-	podInformer     coreinformers.PodInformer
+	nodeLister      corelisters.NodeLister
 
 	// Pod events channel.
 	podEventCh chan<- *scalar.PodEvent
@@ -79,26 +78,31 @@ func NewK8sManager(
 		return nil, fmt.Errorf("error creating kube client: %v", err)
 	}
 
-	return NewK8sManagerWithClient(kubeClient, podEventCh, hostEventCh), nil
+	return newK8sManagerWithClient(
+		kubeClient,
+		podEventCh,
+		hostEventCh,
+	), nil
 }
 
-// NewK8sManagerWithClient returns a new instance of K8SManager with given k8s
+// newK8sManagerWithClient returns a new instance of K8SManager with given k8s
 // client.
-func NewK8sManagerWithClient(
+func newK8sManagerWithClient(
 	kubeClient kubernetes.Interface,
 	podEventCh chan<- *scalar.PodEvent,
 	hostEventCh chan<- *scalar.HostEvent,
 ) *K8SManager {
 	// Initialize informers.
-	informerFactory := informers.NewSharedInformerFactory(kubeClient, 0)
-	nodeInformer := informerFactory.Core().V1().Nodes()
-	podInformer := informerFactory.Core().V1().Pods()
+	informerFactory := informers.NewSharedInformerFactory(
+		kubeClient,
+		_defaultResyncInterval,
+	)
+	nodeLister := informerFactory.Core().V1().Nodes().Lister()
 
 	return &K8SManager{
 		kubeClient:      kubeClient,
 		informerFactory: informerFactory,
-		nodeInformer:    nodeInformer,
-		podInformer:     podInformer,
+		nodeLister:      nodeLister,
 		podEventCh:      podEventCh,
 		hostEventCh:     hostEventCh,
 		lifecycle:       lifecycle.NewLifeCycle(),
@@ -106,29 +110,41 @@ func NewK8sManagerWithClient(
 }
 
 // Start starts the k8s manager plugin
-func (k *K8SManager) Start() {
+func (k *K8SManager) Start() error {
 	if !k.lifecycle.Start() {
 		log.Warn("K8SManager is already started")
-		return
+		return nil
 	}
 
 	// Add event callbacks to nodeInformer and podInformer.
-	k.nodeInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
-		AddFunc:    k.addNode,
-		UpdateFunc: k.updateNode,
-		DeleteFunc: k.deleteNode,
-	})
-	k.podInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
-		AddFunc:    k.addPod,
-		UpdateFunc: k.updatePod,
-		DeleteFunc: k.deletePod,
-	})
+	nodeInformer := k.informerFactory.Core().V1().Nodes().Informer()
+	nodeInformer.AddEventHandler(
+		cache.ResourceEventHandlerFuncs{
+			AddFunc:    k.addNode,
+			UpdateFunc: k.updateNode,
+			DeleteFunc: k.deleteNode,
+		})
+	podInformer := k.informerFactory.Core().V1().Pods().Informer()
+	podInformer.AddEventHandler(
+		cache.ResourceEventHandlerFuncs{
+			AddFunc:    k.addPod,
+			UpdateFunc: k.updatePod,
+			DeleteFunc: k.deletePod,
+		})
 
 	// Start informers.
 	k.informerFactory.Start(k.lifecycle.StopCh())
 
 	// Wait for all started informers cache were synced before scheduling.
-	k.informerFactory.WaitForCacheSync(k.lifecycle.StopCh())
+	if !cache.WaitForCacheSync(
+		k.lifecycle.StopCh(),
+		nodeInformer.HasSynced,
+		podInformer.HasSynced,
+	) {
+		return yarpcerrors.InternalErrorf("timed out waiting for cache to sync")
+	}
+
+	return nil
 }
 
 // Stop stops the K8SManager.
@@ -171,7 +187,7 @@ func (k *K8SManager) AckPodEvent(ctx context.Context, event *scalar.PodEvent) {
 
 // use K8s node lister to get the current list of nodes from K8s API server.
 func (k *K8SManager) listNodes() ([]*corev1.Node, error) {
-	return k.nodeInformer.Lister().List(labels.Everything())
+	return k.nodeLister.List(labels.Everything())
 }
 
 // K8s NodeInformer callbacks.
@@ -199,7 +215,7 @@ func (k *K8SManager) addNode(obj interface{}) {
 // NodeInformer update function.
 func (k *K8SManager) updateNode(old interface{}, new interface{}) {
 	node := new.(*corev1.Node)
-	evt, err := scalar.BuildHostEventFromNode(node, scalar.UpdateHost)
+	evt, err := scalar.BuildHostEventFromNode(node, scalar.UpdateHostSpec)
 	if err != nil {
 		// Drop this error, reconcile will take care of this.
 		log.WithFields(log.Fields{
@@ -249,13 +265,13 @@ func (k *K8SManager) addPod(obj interface{}) {
 	evt := scalar.BuildPodEventFromPod(pod, scalar.AddPod)
 	log.WithFields(log.Fields{
 		"pod": pod,
-	}).Debug("add node event")
+	}).Debug("add pod event")
 	k.podEventCh <- evt
 }
 
 // PodInformer update function.
-func (k *K8SManager) updatePod(obj interface{}, obj2 interface{}) {
-	pod := obj.(*corev1.Pod)
+func (k *K8SManager) updatePod(oldObj interface{}, newObj interface{}) {
+	pod := newObj.(*corev1.Pod)
 	if pod.Spec.SchedulerName != common.PelotonRole {
 		// TODO: Generate an alert.
 		log.WithFields(log.Fields{
@@ -267,7 +283,7 @@ func (k *K8SManager) updatePod(obj interface{}, obj2 interface{}) {
 	evt := scalar.BuildPodEventFromPod(pod, scalar.UpdatePod)
 	log.WithFields(log.Fields{
 		"pod": pod,
-	}).Debug("update node event")
+	}).Debug("update pod event")
 	k.podEventCh <- evt
 }
 
@@ -285,40 +301,55 @@ func (k *K8SManager) deletePod(obj interface{}) {
 	evt := scalar.BuildPodEventFromPod(pod, scalar.DeletePod)
 	log.WithFields(log.Fields{
 		"pod": pod,
-	}).Debug("delete node event")
+	}).Debug("delete pod event")
 	k.podEventCh <- evt
 }
 
 // K8S API calls.
 
-// LaunchPod creates a pod object, binds it to the node specified by hostname.
-func (k *K8SManager) LaunchPod(
-	podSpec *pbpod.PodSpec,
-	podID, hostname string,
+// LaunchPods creates a slice of pod objects, binds them to the node specified by hostname.
+func (k *K8SManager) LaunchPods(
+	ctx context.Context,
+	pods []*models.LaunchablePod,
+	hostname string,
 ) error {
-	// Convert v1alpha podSpec to k8s podSpec.
-	pod := toK8SPodSpec(podSpec)
+	for _, lp := range pods {
+		// Convert v1alpha podSpec to k8s podSpec.
+		pod := toK8SPodSpec(lp.Spec)
 
-	pod.Spec.SchedulerName = common.PelotonRole
+		pod.Spec.SchedulerName = common.PelotonRole
 
-	// Bind the pod to the host.
-	pod.Spec.NodeName = hostname
+		// Bind the pod to the host.
+		pod.Spec.NodeName = hostname
 
-	// Overload pod.Name as pod ID. This needs to be done because jobmgr will
-	// create a podID for its tracking purposes and store it as the key for
-	// pod_runtime/task_runtime table. We need to associate that ID to the
-	// pod in etcd. The best place to do this seems pod.Name.
-	// Note that the UID in the object metadata associated with this pod is
-	// system generated and is read only, so we cannot set it here.
-	pod.Name = podID
+		// Overload pod.Name as pod ID. This needs to be done because jobmgr will
+		// create a podID for its tracking purposes and store it as the key for
+		// pod_runtime/task_runtime table. We need to associate that ID to the
+		// pod in etcd. The best place to do this seems pod.Name.
+		// Note that the UID in the object metadata associated with this pod is
+		// system generated and is read only, so we cannot set it here.
+		pod.Name = lp.PodId.GetValue()
 
-	// Create the pod
-	_, err := k.kubeClient.CoreV1().Pods("default").Create(pod)
-	return err
+		// Create the pod
+		_, err := k.kubeClient.CoreV1().Pods("default").Create(pod)
+		if err != nil {
+			// For now can we just fail this call and keep the earlier pods
+			// launched. They will generate events which will go to JM, JM can
+			// then decide to issue kills to these orphan pods because it does
+			// not recognize them. The kills will then take care of giving back
+			// resources for these pods. This is inline with how we schedule
+			// pods "at least" and not "exactly" once
+			// TODO: see if you can delete the pods actively here and get their
+			// allocation reduced on hosts upfront
+			return err
+		}
+	}
+
+	return nil
 }
 
 // KillPod stops and deletes the given pod
-func (k *K8SManager) KillPod(podID string) error {
+func (k *K8SManager) KillPod(ctx context.Context, podID string) error {
 	// There is no concept of "stopping" a pod in kubernetes (so nothing like
 	// mesos Task Kill exists). So we need to treat this pod like a REST object
 	// and just delete it from the API server. Special considerations need to be

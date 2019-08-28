@@ -16,19 +16,15 @@ package hostsvc
 
 import (
 	"context"
-	"fmt"
-	"time"
 
-	mesos "github.com/uber/peloton/.gen/mesos/v1"
-	mesos_maintenance "github.com/uber/peloton/.gen/mesos/v1/maintenance"
 	hpb "github.com/uber/peloton/.gen/peloton/api/v0/host"
 	host_svc "github.com/uber/peloton/.gen/peloton/api/v0/host/svc"
 
+	"github.com/uber/peloton/pkg/common"
 	"github.com/uber/peloton/pkg/common/stringset"
 	"github.com/uber/peloton/pkg/common/util"
 	"github.com/uber/peloton/pkg/hostmgr/host"
-	"github.com/uber/peloton/pkg/hostmgr/mesos/yarpc/encoding/mpb"
-	"github.com/uber/peloton/pkg/hostmgr/queue"
+	hostpool_mgr "github.com/uber/peloton/pkg/hostmgr/hostpool/manager"
 
 	log "github.com/sirupsen/logrus"
 	"github.com/uber-go/tally"
@@ -39,24 +35,21 @@ import (
 
 // serviceHandler implements peloton.api.host.svc.HostService
 type serviceHandler struct {
-	maintenanceQueue       queue.MaintenanceQueue
-	metrics                *Metrics
-	operatorMasterClient   mpb.MasterOperatorClient
-	maintenanceHostInfoMap host.MaintenanceHostInfoMap
+	metrics         *Metrics
+	drainer         host.Drainer
+	hostPoolManager hostpool_mgr.HostPoolManager
 }
 
 // InitServiceHandler initializes the HostService
 func InitServiceHandler(
 	d *yarpc.Dispatcher,
 	parent tally.Scope,
-	operatorMasterClient mpb.MasterOperatorClient,
-	maintenanceQueue queue.MaintenanceQueue,
-	hostInfoMap host.MaintenanceHostInfoMap) {
+	drainer host.Drainer,
+	hostPoolManager hostpool_mgr.HostPoolManager) {
 	handler := &serviceHandler{
-		maintenanceQueue:       maintenanceQueue,
-		metrics:                NewMetrics(parent.SubScope("hostsvc")),
-		operatorMasterClient:   operatorMasterClient,
-		maintenanceHostInfoMap: hostInfoMap,
+		metrics:         NewMetrics(parent.SubScope("hostsvc")),
+		drainer:         drainer,
+		hostPoolManager: hostPoolManager,
 	}
 	d.Register(host_svc.BuildHostServiceYARPCProcedures(handler))
 	log.Info("Hostsvc handler initialized")
@@ -87,8 +80,8 @@ func (m *serviceHandler) QueryHosts(
 	}
 
 	var hostInfos []*hpb.HostInfo
-	drainingHostsInfo := m.maintenanceHostInfoMap.GetDrainingHostInfos([]string{})
-	downHostsInfo := m.maintenanceHostInfoMap.GetDownHostInfos([]string{})
+	drainingHostsInfo := m.drainer.GetDrainingHostInfos([]string{})
+	downHostsInfo := m.drainer.GetDownHostInfos([]string{})
 	for _, hostState := range hostStateSet.ToSlice() {
 		switch hostState {
 		case hpb.HostState_HOST_STATE_UP.String():
@@ -153,7 +146,7 @@ func (m *serviceHandler) StartMaintenance(
 	}
 	// StartMaintenanceRequest using prefered field `hostname`
 	if err := m.startMaintenance(ctx, request.GetHostname()); err != nil {
-		if yarpcerrors.IsYARPCError(err) {
+		if yarpcerrors.IsStatus(err) {
 			// Allow YARPC NotFound error to be returned as such
 			return nil, err
 		}
@@ -169,64 +162,10 @@ func (m *serviceHandler) startMaintenance(
 	hostname string,
 ) error {
 	m.metrics.StartMaintenanceAPI.Inc(1)
-	// Validate requested host is registered in UP state
-	if !host.IsHostUp(hostname) {
-		m.metrics.StartMaintenanceFail.Inc(1)
-		return yarpcerrors.NotFoundErrorf("Host is not registered as an UP agent")
-	}
-
-	machineID, err := buildMachineIDForHost(hostname)
-	if err != nil {
+	if err := m.drainer.StartMaintenance(ctx, hostname); err != nil {
 		m.metrics.StartMaintenanceFail.Inc(1)
 		return err
 	}
-
-	// Get current maintenance schedule
-	response, err := m.operatorMasterClient.GetMaintenanceSchedule()
-	if err != nil {
-		m.metrics.StartMaintenanceFail.Inc(1)
-		return err
-	}
-	schedule := response.GetSchedule()
-	// Set current time as the `start` of maintenance window
-	nanos := time.Now().UnixNano()
-
-	// The maintenance duration has no real significance. A machine can be put into
-	// maintenance even after its maintenance window has passed. According to Mesos,
-	// omitting the duration means that the unavailability will last forever. Since
-	// we do not know the duration, we are omitting it.
-
-	// Construct updated maintenance window including new host
-	maintenanceWindow := &mesos_maintenance.Window{
-		MachineIds: []*mesos.MachineID{machineID},
-		Unavailability: &mesos.Unavailability{
-			Start: &mesos.TimeInfo{
-				Nanoseconds: &nanos,
-			},
-		},
-	}
-	schedule.Windows = append(schedule.Windows, maintenanceWindow)
-
-	// Post updated maintenance schedule
-	if err = m.operatorMasterClient.UpdateMaintenanceSchedule(schedule); err != nil {
-		m.metrics.StartMaintenanceFail.Inc(1)
-		return err
-	}
-	log.WithField("maintenance_schedule", schedule).
-		Info("Maintenance Schedule posted to Mesos Master")
-
-	hostInfo := &hpb.HostInfo{
-		Hostname: machineID.GetHostname(),
-		Ip:       machineID.GetIp(),
-		State:    hpb.HostState_HOST_STATE_DRAINING,
-	}
-	m.maintenanceHostInfoMap.AddHostInfo(hostInfo)
-	// Enqueue hostname into maintenance queue to initiate
-	// the rescheduling of tasks running on this host
-	if err = m.maintenanceQueue.Enqueue(hostInfo.Hostname); err != nil {
-		return err
-	}
-
 	m.metrics.StartMaintenanceSuccess.Inc(1)
 	return nil
 }
@@ -271,31 +210,104 @@ func (m *serviceHandler) completeMaintenance(
 	hostname string,
 ) error {
 	m.metrics.CompleteMaintenanceAPI.Inc(1)
-	// Get all DOWN hosts and validate requested host is in DOWN state
-	downHostInfoMap := make(map[string]*hpb.HostInfo)
-	for _, hostInfo := range m.maintenanceHostInfoMap.GetDownHostInfos([]string{}) {
-		downHostInfoMap[hostInfo.GetHostname()] = hostInfo
-	}
-	hostInfo, ok := downHostInfoMap[hostname]
-	if !ok {
-		m.metrics.CompleteMaintenanceFail.Inc(1)
-		return yarpcerrors.NotFoundErrorf("Host is not DOWN")
-	}
-
-	// Stop Maintenance for the host on Mesos Master
-	machineID := &mesos.MachineID{
-		Hostname: &hostInfo.Hostname,
-		Ip:       &hostInfo.Ip,
-	}
-	if err := m.operatorMasterClient.StopMaintenance([]*mesos.MachineID{machineID}); err != nil {
+	if err := m.drainer.CompleteMaintenance(ctx, hostname); err != nil {
 		m.metrics.CompleteMaintenanceFail.Inc(1)
 		return err
 	}
 
-	m.maintenanceHostInfoMap.RemoveHostInfo(hostInfo.Hostname)
-
 	m.metrics.CompleteMaintenanceSuccess.Inc(1)
 	return nil
+}
+
+// List all host pools
+func (m *serviceHandler) ListHostPools(
+	ctx context.Context,
+	request *host_svc.ListHostPoolsRequest,
+) (response *host_svc.ListHostPoolsResponse, err error) {
+	if m.hostPoolManager == nil {
+		err = yarpcerrors.UnimplementedErrorf("host pools not enabled")
+		return
+	}
+	allPools := m.hostPoolManager.Pools()
+	response = &host_svc.ListHostPoolsResponse{
+		Pools: make([]*hpb.HostPoolInfo, 0, len(allPools)),
+	}
+	for _, pool := range allPools {
+		poolHosts := pool.Hosts()
+		info := &hpb.HostPoolInfo{
+			Name:  pool.ID(),
+			Hosts: make([]string, 0, len(poolHosts)),
+		}
+		for h := range poolHosts {
+			info.Hosts = append(info.Hosts, h)
+		}
+		response.Pools = append(response.Pools, info)
+	}
+	return
+}
+
+// Create a host pool
+func (m *serviceHandler) CreateHostPool(
+	ctx context.Context,
+	request *host_svc.CreateHostPoolRequest,
+) (response *host_svc.CreateHostPoolResponse, err error) {
+	if m.hostPoolManager == nil {
+		err = yarpcerrors.UnimplementedErrorf("host pools not enabled")
+		return
+	}
+	name := request.GetName()
+	if name == "" {
+		err = yarpcerrors.InvalidArgumentErrorf("name")
+		return
+	}
+	if _, err1 := m.hostPoolManager.GetPool(name); err1 != nil {
+		m.hostPoolManager.RegisterPool(name)
+		response = &host_svc.CreateHostPoolResponse{}
+	} else {
+		err = yarpcerrors.AlreadyExistsErrorf("")
+	}
+	return
+}
+
+// Delete a host pool
+func (m *serviceHandler) DeleteHostPool(
+	ctx context.Context,
+	request *host_svc.DeleteHostPoolRequest,
+) (response *host_svc.DeleteHostPoolResponse, err error) {
+	if m.hostPoolManager == nil {
+		err = yarpcerrors.UnimplementedErrorf("host pools not enabled")
+		return
+	}
+	name := request.GetName()
+	if name == common.DefaultHostPoolID {
+		err = yarpcerrors.InvalidArgumentErrorf("default pool")
+	} else if _, err1 := m.hostPoolManager.GetPool(name); err1 != nil {
+		err = yarpcerrors.NotFoundErrorf("")
+	} else {
+		m.hostPoolManager.DeregisterPool(name)
+		response = &host_svc.DeleteHostPoolResponse{}
+	}
+	return
+}
+
+// Change the pool of a host
+func (m *serviceHandler) ChangeHostPool(
+	ctx context.Context,
+	request *host_svc.ChangeHostPoolRequest,
+) (response *host_svc.ChangeHostPoolResponse, err error) {
+	if m.hostPoolManager == nil {
+		err = yarpcerrors.UnimplementedErrorf("host pools not enabled")
+		return
+	}
+	err = m.hostPoolManager.ChangeHostPool(
+		request.GetHostname(),
+		request.GetSourcePool(),
+		request.GetDestinationPool(),
+	)
+	if err == nil {
+		response = &host_svc.ChangeHostPoolResponse{}
+	}
+	return
 }
 
 // Build host info for registered agents
@@ -322,23 +334,7 @@ func buildHostInfoForRegisteredAgents() (map[string]*hpb.HostInfo, error) {
 	return upHosts, nil
 }
 
-// Build machine ID for a specified host
-func buildMachineIDForHost(hostname string) (*mesos.MachineID, error) {
-	agentMap := host.GetAgentMap()
-	if agentMap == nil || len(agentMap.RegisteredAgents) == 0 {
-		return nil, fmt.Errorf("no registered agents")
-	}
-	if _, ok := agentMap.RegisteredAgents[hostname]; !ok {
-		return nil, fmt.Errorf("unknown host %s", hostname)
-	}
-	pid := agentMap.RegisteredAgents[hostname].GetPid()
-	ip, _, err := util.ExtractIPAndPortFromMesosAgentPID(pid)
-	if err != nil {
-		return nil, err
-	}
-	machineID := &mesos.MachineID{
-		Hostname: &hostname,
-		Ip:       &ip,
-	}
-	return machineID, nil
+// NewTestServiceHandler returns an empty new serviceHandler ptr for testing.
+func NewTestServiceHandler() *serviceHandler {
+	return &serviceHandler{}
 }

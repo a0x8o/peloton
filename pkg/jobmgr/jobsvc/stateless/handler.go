@@ -18,8 +18,10 @@ import (
 	"context"
 	"encoding/base64"
 	"fmt"
+	"sync"
 	"time"
 
+	"github.com/hashicorp/go-multierror"
 	mesos "github.com/uber/peloton/.gen/mesos/v1"
 	pbjob "github.com/uber/peloton/.gen/peloton/api/v0/job"
 	"github.com/uber/peloton/.gen/peloton/api/v0/peloton"
@@ -47,6 +49,7 @@ import (
 	"github.com/uber/peloton/pkg/jobmgr/jobsvc"
 	jobmgrtask "github.com/uber/peloton/pkg/jobmgr/task"
 	"github.com/uber/peloton/pkg/jobmgr/task/activermtask"
+	handlerutil "github.com/uber/peloton/pkg/jobmgr/util/handler"
 	jobutil "github.com/uber/peloton/pkg/jobmgr/util/job"
 	"github.com/uber/peloton/pkg/storage"
 	ormobjects "github.com/uber/peloton/pkg/storage/objects"
@@ -179,15 +182,18 @@ func (h *serviceHandler) CreateJob(
 		return nil, errors.Wrap(err, "failed to validate resource pool")
 	}
 
+	jobSpec, err = handlerutil.ConvertForThermosExecutor(
+		jobSpec,
+		h.jobSvcCfg.ThermosExecutor,
+	)
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to convert for thermos executor")
+	}
+
 	jobConfig, err := api.ConvertJobSpecToJobConfig(jobSpec)
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to convert job spec")
 	}
-
-	log.WithField("job_spec", jobSpec).
-		WithField("job_config", jobConfig).
-		WithField("job_id", pelotonJobID.GetValue()).
-		Info("compare job spec and configs in create")
 
 	// Validate job config with default task configs
 	err = jobconfig.ValidateConfig(
@@ -299,15 +305,18 @@ func (h *serviceHandler) ReplaceJob(
 			"JobID must be of UUID format")
 	}
 
-	jobConfig, err := api.ConvertJobSpecToJobConfig(req.GetSpec())
+	jobSpec, err := handlerutil.ConvertForThermosExecutor(
+		req.GetSpec(),
+		h.jobSvcCfg.ThermosExecutor,
+	)
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to convert for thermos executor")
+	}
+
+	jobConfig, err := api.ConvertJobSpecToJobConfig(jobSpec)
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to convert job spec")
 	}
-
-	log.WithField("job_spec", req.GetSpec()).
-		WithField("job_config", jobConfig).
-		WithField("job_id", jobUUID).
-		Info("compare job spec and configs in update")
 
 	err = jobconfig.ValidateConfig(
 		jobConfig,
@@ -984,38 +993,73 @@ func (h *serviceHandler) GetJob(
 		return nil, errors.Wrap(err, "failed to get job status")
 	}
 
-	jobConfig, _, err := h.jobConfigOps.Get(
-		ctx,
-		pelotonJobID,
-		jobRuntime.GetConfigurationVersion(),
-	)
-	if err != nil {
-		return nil, errors.Wrap(err, "failed to get job spec")
-	}
-
-	// Do not display the secret volumes in defaultconfig that were added by
-	// handleSecrets. They should remain internal to peloton logic.
-	// Secret ID and Path should be returned using the peloton.Secret
-	// proto message.
-	secretVolumes := util.RemoveSecretVolumesFromJobConfig(jobConfig)
-
+	var wg sync.WaitGroup
+	var secretVolumes []*mesos.Volume
+	var jobConfig *pbjob.JobConfig
 	var updateInfo *models.UpdateModel
 	var workflowEvents []*stateless.WorkflowEvent
-	if len(jobRuntime.GetUpdateID().GetValue()) > 0 {
-		updateInfo, err = h.updateStore.GetUpdate(
+	errs := make(chan error)
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+
+		var er error
+		if jobConfig, _, er = h.jobConfigOps.Get(
 			ctx,
-			jobRuntime.GetUpdateID(),
-		)
-		if err != nil {
-			return nil, errors.Wrap(err, "failed to get update information")
+			pelotonJobID,
+			jobRuntime.GetConfigurationVersion(),
+		); er != nil {
+			errs <- errors.Wrap(er, "failed to get job spec")
 		}
 
-		workflowEvents, err = h.jobUpdateEventsOps.GetAll(
-			ctx,
-			jobRuntime.GetUpdateID())
-		if err != nil {
-			return nil, errors.Wrap(err, "fail to get job update events")
+		// Do not display the secret volumes in defaultconfig that were added by
+		// handleSecrets. They should remain internal to peloton logic.
+		// Secret ID and Path should be returned using the peloton.Secret
+		// proto message.
+		secretVolumes = util.RemoveSecretVolumesFromJobConfig(jobConfig)
+	}()
+
+	if len(jobRuntime.GetUpdateID().GetValue()) > 0 {
+		wg.Add(2)
+
+		go func() {
+			defer wg.Done()
+
+			var er error
+			if updateInfo, er = h.updateStore.GetUpdate(
+				ctx,
+				jobRuntime.GetUpdateID(),
+			); er != nil {
+				errs <- errors.Wrap(er, "failed to get update information")
+			}
+		}()
+
+		go func() {
+			defer wg.Done()
+
+			var er error
+			if workflowEvents, er = h.jobUpdateEventsOps.GetAll(
+				ctx,
+				jobRuntime.GetUpdateID()); er != nil {
+				errs <- errors.Wrap(er, "fail to get job update events")
+			}
+		}()
+	}
+
+	go func() {
+		wg.Wait()
+		close(errs)
+	}()
+
+	for e := range errs {
+		if e != nil {
+			err = multierror.Append(err, e)
 		}
+	}
+
+	if err != nil {
+		return nil, err
 	}
 
 	return &svc.GetJobResponse{
@@ -1380,6 +1424,13 @@ func (h *serviceHandler) ListJobs(
 	return nil
 }
 
+// updateInfoChan represents channel object for updateInfo
+type updateInfoChan struct {
+	updateInfo *stateless.WorkflowInfo
+	sequence   int
+	err        error
+}
+
 func (h *serviceHandler) ListJobWorkflows(
 	ctx context.Context,
 	req *svc.ListJobWorkflowsRequest) (resp *svc.ListJobWorkflowsResponse, err error) {
@@ -1413,44 +1464,84 @@ func (h *serviceHandler) ListJobWorkflows(
 		updateIDs = updateIDs[:util.Min(uint32(len(updateIDs)), req.GetUpdatesLimit())]
 	}
 
-	var updateInfos []*stateless.WorkflowInfo
 	pelotonJobID := &peloton.JobID{Value: req.GetJobId().GetValue()}
 
 	jobRuntime, err := h.jobRuntimeOps.Get(ctx, pelotonJobID)
 	if err != nil {
 		return nil, errors.Wrap(err, "fail to get job runtime")
 	}
+
+	var sequence int
+	var wg sync.WaitGroup
+	ch := make(chan updateInfoChan)
+	updateInfos := make([]*stateless.WorkflowInfo, len(updateIDs))
 	for _, updateID := range updateIDs {
-		updateModel, err := h.updateStore.GetUpdate(ctx, updateID)
-		if err != nil {
-			return nil, err
-		}
+		wg.Add(1)
 
-		workflowEvents, err := h.jobUpdateEventsOps.GetAll(
-			ctx,
-			updateID)
-		if err != nil {
-			return nil, errors.Wrap(err, "fail to get job workflow events")
-		}
+		go func(updateID *peloton.UpdateID, sequence int) {
+			defer wg.Done()
 
-		var instanceWorkflowEvents []*stateless.WorkflowInfoInstanceWorkflowEvents
-		if req.GetInstanceEvents() {
-			instanceWorkflowEvents, err = h.getInstanceWorkflowEvents(
-				ctx,
-				updateModel,
-				req.GetInstanceEventsLimit(),
-			)
+			updateModel, err := h.updateStore.GetUpdate(ctx, updateID)
 			if err != nil {
-				return nil, errors.Wrap(err, "fail to get instance workflow events")
+				ch <- updateInfoChan{
+					err: err,
+				}
+				return
 			}
-		}
 
-		updateInfos = append(updateInfos,
-			api.ConvertUpdateModelToWorkflowInfo(
-				jobRuntime,
-				updateModel,
-				workflowEvents,
-				instanceWorkflowEvents))
+			workflowEvents, err := h.jobUpdateEventsOps.GetAll(
+				ctx,
+				updateID)
+			if err != nil {
+				ch <- updateInfoChan{
+					err: errors.Wrap(err, "fail to get job workflow events"),
+				}
+				return
+			}
+
+			var instanceWorkflowEvents []*stateless.WorkflowInfoInstanceWorkflowEvents
+			if req.GetInstanceEvents() {
+				instanceWorkflowEvents, err = h.getInstanceWorkflowEvents(
+					ctx,
+					updateModel,
+					req.GetInstanceEventsLimit(),
+				)
+				if err != nil {
+					ch <- updateInfoChan{
+						err: errors.Wrap(err, "fail to get instance workflow events"),
+					}
+					return
+				}
+			}
+
+			ch <- updateInfoChan{
+				updateInfo: api.ConvertUpdateModelToWorkflowInfo(
+					jobRuntime,
+					updateModel,
+					workflowEvents,
+					instanceWorkflowEvents),
+				err:      nil,
+				sequence: sequence,
+			}
+		}(updateID, sequence)
+		sequence++
+	}
+
+	go func() {
+		wg.Wait()
+		close(ch)
+	}()
+
+	for update := range ch {
+		if update.err != nil {
+			err = update.err
+			continue
+		}
+		updateInfos[update.sequence] = update.updateInfo
+	}
+
+	if err != nil {
+		return nil, err
 	}
 
 	return &svc.ListJobWorkflowsResponse{WorkflowInfos: updateInfos}, nil
@@ -1556,7 +1647,15 @@ func (h *serviceHandler) GetReplaceJobDiff(
 		return nil, err
 	}
 
-	jobConfig, err := api.ConvertJobSpecToJobConfig(req.GetSpec())
+	jobSpec, err := handlerutil.ConvertForThermosExecutor(
+		req.GetSpec(),
+		h.jobSvcCfg.ThermosExecutor,
+	)
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to convert for thermos executor")
+	}
+
+	jobConfig, err := api.ConvertJobSpecToJobConfig(jobSpec)
 	if err != nil {
 		return nil, err
 	}
