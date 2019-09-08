@@ -36,8 +36,6 @@ import (
 	"k8s.io/client-go/tools/clientcmd"
 )
 
-const EventChanSize = 1000
-
 // K8SManager implements the plugin for the Kubernetes cluster manager.
 type K8SManager struct {
 	// K8s client.
@@ -179,8 +177,8 @@ func (k *K8SManager) ReconcileHosts() ([]*scalar.HostInfo, error) {
 
 // AckPodEvent is relevant to Mesos. For K8s for now, this is a noop.
 // We could use some smarts here if we decide to write the resource version
-// to DB after the event has been acknowledged by both JM and RM
-func (k *K8SManager) AckPodEvent(ctx context.Context, event *scalar.PodEvent) {
+// to DB after the event has been acknowledged by both JM and RM.
+func (k *K8SManager) AckPodEvent(event *scalar.PodEvent) {
 }
 
 // K8s Reconcile logic.
@@ -312,7 +310,7 @@ func (k *K8SManager) LaunchPods(
 	ctx context.Context,
 	pods []*models.LaunchablePod,
 	hostname string,
-) error {
+) (launched []*models.LaunchablePod, err error) {
 	for _, lp := range pods {
 		// Convert v1alpha podSpec to k8s podSpec.
 		pod := toK8SPodSpec(lp.Spec)
@@ -331,7 +329,7 @@ func (k *K8SManager) LaunchPods(
 		pod.Name = lp.PodId.GetValue()
 
 		// Create the pod
-		_, err := k.kubeClient.CoreV1().Pods("default").Create(pod)
+		_, err = k.kubeClient.CoreV1().Pods("default").Create(pod)
 		if err != nil {
 			// For now can we just fail this call and keep the earlier pods
 			// launched. They will generate events which will go to JM, JM can
@@ -341,11 +339,11 @@ func (k *K8SManager) LaunchPods(
 			// pods "at least" and not "exactly" once
 			// TODO: see if you can delete the pods actively here and get their
 			// allocation reduced on hosts upfront
-			return err
+			return launched, err
 		}
+		launched = append(launched, lp)
 	}
-
-	return nil
+	return launched, nil
 }
 
 // KillPod stops and deletes the given pod

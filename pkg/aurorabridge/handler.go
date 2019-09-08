@@ -40,7 +40,9 @@ import (
 	"github.com/uber/peloton/pkg/aurorabridge/ptoa"
 	"github.com/uber/peloton/pkg/common/concurrency"
 	"github.com/uber/peloton/pkg/common/util"
+	versionutil "github.com/uber/peloton/pkg/common/util/entityversion"
 
+	"github.com/gogo/protobuf/proto"
 	"github.com/pkg/errors"
 	log "github.com/sirupsen/logrus"
 	"github.com/uber-go/tally"
@@ -111,7 +113,7 @@ func (h *ServiceHandler) GetJobSummary(
 
 	startTime := time.Now()
 	result, err := h.getJobSummary(ctx, role)
-	resp := newResponse(result, err)
+	resp := newResponse(result, err, "getJobSummary")
 
 	defer func() {
 		h.metrics.
@@ -241,7 +243,7 @@ func (h *ServiceHandler) GetTasksWithoutConfigs(
 
 	startTime := time.Now()
 	result, err := h.getTasksWithoutConfigs(ctx, query)
-	resp := newResponse(result, err)
+	resp := newResponse(result, err, "getTasksWithoutConfigs")
 
 	defer func() {
 		h.metrics.
@@ -589,7 +591,7 @@ func (h *ServiceHandler) GetConfigSummary(
 
 	startTime := time.Now()
 	result, err := h.getConfigSummary(ctx, job)
-	resp := newResponse(result, err)
+	resp := newResponse(result, err, "getConfigSummary")
 
 	defer func() {
 		h.metrics.
@@ -670,7 +672,7 @@ func (h *ServiceHandler) GetJobs(
 
 	startTime := time.Now()
 	result, err := h.getJobs(ctx, ownerRole)
-	resp := newResponse(result, err)
+	resp := newResponse(result, err, "getJobs")
 
 	defer func() {
 		h.metrics.
@@ -800,7 +802,7 @@ func (h *ServiceHandler) GetJobUpdateSummaries(
 
 	startTime := time.Now()
 	result, err := h.getJobUpdateSummaries(ctx, query)
-	resp := newResponse(result, err)
+	resp := newResponse(result, err, "getJobUpdateSummaries")
 
 	defer func() {
 		h.metrics.
@@ -866,7 +868,7 @@ func (h *ServiceHandler) GetJobUpdateDetails(
 
 	startTime := time.Now()
 	result, err := h.getJobUpdateDetails(ctx, key, query)
-	resp := newResponse(result, err)
+	resp := newResponse(result, err, "getJobUpdateDetails")
 
 	defer func() {
 		h.metrics.
@@ -935,7 +937,7 @@ func (h *ServiceHandler) GetJobUpdateDiff(
 
 	startTime := time.Now()
 	result, err := h.getJobUpdateDiff(ctx, request)
-	resp := newResponse(result, err)
+	resp := newResponse(result, err, "getJobUpdateDiff")
 
 	defer func() {
 		h.metrics.
@@ -1107,7 +1109,7 @@ func (h *ServiceHandler) KillTasks(
 
 	startTime := time.Now()
 	result, err := h.killTasks(ctx, job, instances, message)
-	resp := newResponse(result, err)
+	resp := newResponse(result, err, "killTasks")
 
 	defer func() {
 		h.metrics.
@@ -1260,7 +1262,7 @@ func (h *ServiceHandler) StartJobUpdate(
 
 	startTime := time.Now()
 	result, err := h.startJobUpdate(ctx, request, message)
-	resp := newResponse(result, err)
+	resp := newResponse(result, err, "startJobUpdate")
 
 	defer func() {
 		updateService := request.GetTaskConfig().GetJob().GetRole()
@@ -1333,7 +1335,7 @@ func (h *ServiceHandler) PauseJobUpdate(
 
 	startTime := time.Now()
 	result, err := h.pauseJobUpdate(ctx, key, message)
-	resp := newResponse(result, err)
+	resp := newResponse(result, err, "pauseJobUpdate")
 
 	defer func() {
 		h.metrics.
@@ -1403,7 +1405,7 @@ func (h *ServiceHandler) ResumeJobUpdate(
 
 	startTime := time.Now()
 	result, err := h.resumeJobUpdate(ctx, key, message)
-	resp := newResponse(result, err)
+	resp := newResponse(result, err, "resumeJobUpdate")
 
 	defer func() {
 		h.metrics.
@@ -1450,10 +1452,12 @@ func (h *ServiceHandler) resumeJobUpdate(
 	if err != nil {
 		return nil, auroraErrorf("get job id: %s", err)
 	}
+
 	v, aerr := h.matchJobUpdateID(ctx, id, key.GetID())
 	if aerr != nil {
 		return nil, aerr
 	}
+
 	req := &statelesssvc.ResumeJobWorkflowRequest{
 		JobId:   id,
 		Version: v,
@@ -1461,6 +1465,7 @@ func (h *ServiceHandler) resumeJobUpdate(
 	if _, err := h.jobClient.ResumeJobWorkflow(ctx, req); err != nil {
 		return nil, auroraErrorf("resume job workflow: %s", err)
 	}
+
 	return dummyResult(), nil
 }
 
@@ -1473,7 +1478,7 @@ func (h *ServiceHandler) AbortJobUpdate(
 
 	startTime := time.Now()
 	result, err := h.abortJobUpdate(ctx, key, message)
-	resp := newResponse(result, err)
+	resp := newResponse(result, err, "abortJobUpdate")
 
 	defer func() {
 		h.metrics.
@@ -1520,10 +1525,12 @@ func (h *ServiceHandler) abortJobUpdate(
 	if err != nil {
 		return nil, auroraErrorf("get job id: %s", err)
 	}
+
 	v, aerr := h.matchJobUpdateID(ctx, id, key.GetID())
 	if aerr != nil {
 		return nil, aerr
 	}
+
 	req := &statelesssvc.AbortJobWorkflowRequest{
 		JobId:   id,
 		Version: v,
@@ -1531,6 +1538,7 @@ func (h *ServiceHandler) abortJobUpdate(
 	if _, err := h.jobClient.AbortJobWorkflow(ctx, req); err != nil {
 		return nil, auroraErrorf("abort job workflow: %s", err)
 	}
+
 	return dummyResult(), nil
 }
 
@@ -1543,7 +1551,7 @@ func (h *ServiceHandler) RollbackJobUpdate(
 
 	startTime := time.Now()
 	result, err := h.rollbackJobUpdate(ctx, key, message)
-	resp := newResponse(result, err)
+	resp := newResponse(result, err, "rollbackJobUpdate")
 
 	defer func() {
 		h.metrics.
@@ -1599,7 +1607,7 @@ func (h *ServiceHandler) rollbackJobUpdate(
 		return nil, auroraErrorf("get job id: %s", err)
 	}
 
-	j, w, err := h.getJobAndWorkflow(ctx, id)
+	j, jobSpec, w, err := h.getJobAndWorkflow(ctx, id)
 	if err != nil {
 		return nil, auroraErrorf("get job: %s", err)
 	}
@@ -1631,9 +1639,27 @@ func (h *ServiceHandler) rollbackJobUpdate(
 		return nil, auroraErrorf("serialize opaque data: %s", err)
 	}
 
-	prevJob, err := h.getFullJobInfoByVersion(ctx, id, w.GetStatus().GetPrevVersion())
+	prevVersion := w.GetStatus().GetPrevVersion()
+	prevConfigVersion, _, _, err := versionutil.ParseJobEntityVersion(prevVersion)
 	if err != nil {
-		return nil, auroraErrorf("get previous job: %s", err)
+		return nil, auroraErrorf("parse previous job entity version: %s", err)
+	}
+
+	var prevSpec *stateless.JobSpec
+	if prevConfigVersion == 0 {
+		// First deployment, no previous version config, use current spec
+		// so that we can still get a valid spec on read path
+		prevSpec = proto.Clone(jobSpec).(*stateless.JobSpec)
+		// Set instance count to 0, so the rollback would bring existing
+		// instances down
+		prevSpec.InstanceCount = 0
+	} else {
+		prevJob, err := h.getFullJobInfoByVersion(ctx, id, prevVersion)
+		if err != nil {
+			return nil, auroraErrorf("get previous job: %s", err)
+		}
+
+		prevSpec = prevJob.GetSpec()
 	}
 
 	updateSpec := w.GetUpdateSpec()
@@ -1646,7 +1672,7 @@ func (h *ServiceHandler) rollbackJobUpdate(
 	req := &statelesssvc.ReplaceJobRequest{
 		JobId:   id,
 		Version: j.GetVersion(),
-		Spec:    prevJob.GetSpec(),
+		Spec:    prevSpec,
 		//Secrets: nil,
 		UpdateSpec: updateSpec,
 		OpaqueData: od,
@@ -1667,7 +1693,7 @@ func (h *ServiceHandler) PulseJobUpdate(
 
 	startTime := time.Now()
 	result, err := h.pulseJobUpdate(ctx, key)
-	resp := newResponse(result, err)
+	resp := newResponse(result, err, "pulseJobUpdate")
 
 	defer func() {
 		h.metrics.
@@ -1726,7 +1752,7 @@ func (h *ServiceHandler) pulseJobUpdate(
 		return nil, aerr
 	}
 
-	j, w, err := h.getJobAndWorkflow(ctx, id)
+	j, _, w, err := h.getJobAndWorkflow(ctx, id)
 	if err != nil {
 		return nil, auroraErrorf("get job status: %s", err)
 	}
@@ -2147,7 +2173,7 @@ func (h *ServiceHandler) matchJobUpdateID(
 	updateID string,
 ) (*peloton.EntityVersion, *auroraError) {
 
-	j, w, err := h.getJobAndWorkflow(ctx, jobID)
+	j, _, w, err := h.getJobAndWorkflow(ctx, jobID)
 	if err != nil {
 		return nil, auroraErrorf("get job status: %s", err)
 	}
@@ -2213,13 +2239,13 @@ func (h *ServiceHandler) getJobInfoSummary(
 func (h *ServiceHandler) getJobAndWorkflow(
 	ctx context.Context,
 	id *peloton.JobID,
-) (*stateless.JobStatus, *stateless.WorkflowInfo, error) {
+) (*stateless.JobStatus, *stateless.JobSpec, *stateless.WorkflowInfo, error) {
 
 	resp, err := h.jobClient.GetJob(ctx, &statelesssvc.GetJobRequest{JobId: id})
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
-	return resp.GetJobInfo().GetStatus(), resp.GetWorkflowInfo(), nil
+	return resp.GetJobInfo().GetStatus(), resp.GetJobInfo().GetSpec(), resp.GetWorkflowInfo(), nil
 }
 
 // queryPods calls jobmgr to query a list of PodInfo based on input JobID.

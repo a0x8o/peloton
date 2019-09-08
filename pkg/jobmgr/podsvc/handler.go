@@ -508,7 +508,7 @@ func (h *serviceHandler) GetPodEvents(
 		return nil, err
 	}
 
-	taskEvents, err := h.podStore.GetPodEvents(
+	taskEvents, err := h.podEventsOps.GetAll(
 		ctx,
 		jobID,
 		instanceID,
@@ -861,7 +861,7 @@ func (h *serviceHandler) getPodInfoForAllPodRuns(
 
 	pID := podID.GetValue()
 	for {
-		taskEvents, err := h.podStore.GetPodEvents(ctx, jobID, instanceID, pID)
+		taskEvents, err := h.podEventsOps.GetAll(ctx, jobID, instanceID, pID)
 		if err != nil {
 			return nil, err
 		}
@@ -950,4 +950,9 @@ func (h *serviceHandler) getPodInfoForAllPodRuns(
 	}
 
 	return podInfos, nil
+}
+
+// NewTestServiceHandler returns an empty new ServiceHandler ptr for testing.
+func NewTestServiceHandler() *serviceHandler {
+	return &serviceHandler{}
 }

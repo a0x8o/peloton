@@ -1,0 +1,14 @@
+metrics:
+  runtime_metrics:
+    enabled: true
+    interval: 10s
+
+api_server:
+  http_port: 5297
+  grpc_port: 5397
+
+rate_limit:
+  enabled: false
+
+election:
+  root: "/peloton"

@@ -13,13 +13,13 @@ log = logging.getLogger(__name__)
 draining_period_sec = 5
 
 
-def start_maintenance(hosts):
+def start_maintenance(hosts, client=None):
     """
     starts Peloton host maintenance on the specified hosts
     :param hosts: list of hostnames
     :return: host_svc_pb2.StartMaintenanceResponse
     """
-    client = Client()
+    client = client or Client()
     req = hostsvc.StartMaintenanceRequest(hostnames=hosts)
 
     resp = client.host_svc.StartMaintenance(
@@ -28,13 +28,13 @@ def start_maintenance(hosts):
     return resp
 
 
-def complete_maintenance(hosts):
+def complete_maintenance(hosts, client=None):
     """
     completes Peloton host maintenance on the specified hosts
     :param hosts: list of hostnames
     :return: host_svc_pb2.CompleteMaintenanceResponse
     """
-    client = Client()
+    client = client or Client()
     request = hostsvc.CompleteMaintenanceRequest(hostnames=hosts)
 
     resp = client.host_svc.CompleteMaintenance(
@@ -100,10 +100,11 @@ def wait_for_host_state(hostname, state):
 
 
 def is_host_in_state(hostname, state):
-    resp = query_hosts([state])
+    resp = query_hosts(None)
     for host_info in resp.host_infos:
         if host_info.hostname == hostname:
-            return True
+            log.info("host state: %s, expected: %s", host_info.state, state)
+            return host_info.state == state
     return False
 
 

@@ -1,4 +1,4 @@
-.PHONY: all apiproxy placement install cli test unit_test cover lint clean \
+.PHONY: all apiserver placement install cli test unit_test cover lint clean \
 	hostmgr jobmgr resmgr docker version debs docker-push \
 	test-containers archiver failure-test-minicluster \
 	failure-test-vcluster aurorabridge docs migratedb
@@ -27,6 +27,8 @@ STABLE_RELEASE=`git describe --abbrev=0 --tags`
 DOCKER_IMAGE ?= uber/peloton
 DC ?= all
 GEN_DIR = .gen
+#Python gen dir relative to site-packages of python
+PYTHON_GEN_DIR = peloton_client/pbgen
 UNAME = $(shell uname | tr '[:upper:]' '[:lower:]')
 
 GOKIND = bin/kind
@@ -49,7 +51,7 @@ endif
 
 .PRECIOUS: $(GENS) $(LOCAL_MOCKS) $(VENDOR_MOCKS) mockgens
 
-all: gens placement cli hostmgr resmgr jobmgr archiver aurorabridge apiproxy migratedb
+all: gens placement cli hostmgr resmgr jobmgr archiver aurorabridge apiserver migratedb
 
 cli:
 	go build $(GO_FLAGS) -o ./$(BIN_DIR)/peloton cmd/cli/*.go
@@ -72,8 +74,8 @@ archiver:
 aurorabridge:
 	go build $(GO_FLAGS) -o ./$(BIN_DIR)/peloton-aurorabridge cmd/aurorabridge/*.go
 
-apiproxy:
-	go build $(GO_FLAGS) -o ./$(BIN_DIR)/peloton-apiproxy cmd/apiproxy/*.go
+apiserver:
+	go build $(GO_FLAGS) -o ./$(BIN_DIR)/peloton-apiserver cmd/apiserver/*.go
 
 migratedb:
 	go build $(GO_FLAGS) -o ./$(BIN_DIR)/migratedb cmd/migratedb/*.go
@@ -120,7 +122,7 @@ cover:
 	./scripts/cover.sh $(shell go list $(PACKAGES))
 	go tool cover -html=cover.out -o cover.html
 
-gens: thriftgens pbgens
+gens: thriftgens pbgens pygens
 
 thriftgens: $(VENDOR)
 	@mkdir -p $(GEN_DIR)
@@ -137,6 +139,13 @@ pbgens: $(VENDOR)
 	./scripts/patch-v0-api-rpc.sh
 	# Temporarily rename Sla to SLA for lint
 	./scripts/rename-job-sla.sh
+
+pygens: $(VENDOR)
+	. env/bin/activate; \
+	pip install --upgrade pip; \
+	pip install grpcio grpcio-tools; \
+	./scripts/generate-protobuf.py --generator=python --out-dir=$(PYTHON_GEN_DIR) ;\
+    deactivate; \
 
 apidoc: $(VENDOR)
 	go get github.com/pseudomuto/protoc-gen-doc/cmd/protoc-gen-doc
@@ -219,7 +228,6 @@ mockgens: build-mockgen gens $(GOMOCK)
 	$(call local_mockgen,pkg/jobmgr/task/activermtask,ActiveRMTasks)
 	$(call local_mockgen,pkg/jobmgr/task/lifecyclemgr,Manager;Lockable)
 	$(call local_mockgen,pkg/jobmgr/task/event,Listener;StatusProcessor)
-	$(call local_mockgen,pkg/jobmgr/task/launcher,Launcher)
 	$(call local_mockgen,pkg/jobmgr/logmanager,LogManager)
 	$(call local_mockgen,pkg/jobmgr/watchsvc,WatchProcessor)
 	$(call local_mockgen,pkg/placement/offers,Service)

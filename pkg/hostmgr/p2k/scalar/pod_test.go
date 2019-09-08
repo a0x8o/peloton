@@ -89,8 +89,8 @@ func TestBuildPodEventFromPodPending(t *testing.T) {
 			InitContainerStatus: expectedPelotonContainerStatus[:2],
 			ContainerStatus:     expectedPelotonContainerStatus[2:],
 		},
-		EventType:       AddPod,
-		ResourceVersion: "version1",
+		EventType: AddPod,
+		EventID:   "version1",
 	}
 
 	output := BuildPodEventFromPod(k8sPodEvent, AddPod)
@@ -176,8 +176,8 @@ func TestBuildPodEventFromPodRunning(t *testing.T) {
 			InitContainerStatus: expectedPelotonContainerStatus[:2],
 			ContainerStatus:     expectedPelotonContainerStatus[2:],
 		},
-		EventType:       UpdatePod,
-		ResourceVersion: "version1",
+		EventType: UpdatePod,
+		EventID:   "version1",
 	}
 
 	output := BuildPodEventFromPod(k8sPodEvent, UpdatePod)
@@ -272,11 +272,82 @@ func TestBuildPodEventFromPodSucceeded(t *testing.T) {
 			InitContainerStatus: expectedPelotonContainerStatus[:2],
 			ContainerStatus:     expectedPelotonContainerStatus[2:],
 		},
-		EventType:       DeletePod,
-		ResourceVersion: "version1",
+		EventType: DeletePod,
+		EventID:   "version1",
 	}
 
 	output := BuildPodEventFromPod(k8sPodEvent, DeletePod)
 
 	require.True(reflect.DeepEqual(expectedPelotonEvent, output))
+}
+
+func TestBuildPodState(t *testing.T) {
+	testCases := []struct {
+		name  string
+		phase corev1.PodPhase
+		event PodEventType
+		state string
+	}{
+		{
+			"add pending",
+			corev1.PodPending,
+			AddPod,
+			pbpod.PodState_POD_STATE_LAUNCHED.String(),
+		},
+		{
+			"update running",
+			corev1.PodRunning,
+			UpdatePod,
+			pbpod.PodState_POD_STATE_RUNNING.String(),
+		},
+		{
+			"update succeeded",
+			corev1.PodSucceeded,
+			UpdatePod,
+			pbpod.PodState_POD_STATE_SUCCEEDED.String(),
+		},
+		{
+			"update failed",
+			corev1.PodFailed,
+			UpdatePod,
+			pbpod.PodState_POD_STATE_FAILED.String(),
+		},
+		{
+			"update known",
+			corev1.PodUnknown,
+			UpdatePod,
+			pbpod.PodState_POD_STATE_LOST.String(),
+		},
+		{
+			"invalid state",
+			corev1.PodPhase("invalid"),
+			UpdatePod,
+			pbpod.PodState_POD_STATE_INVALID.String(),
+		},
+		{
+			"delete pending",
+			corev1.PodPending,
+			DeletePod,
+			pbpod.PodState_POD_STATE_KILLED.String(),
+		},
+		{
+			"delete running",
+			corev1.PodRunning,
+			DeletePod,
+			pbpod.PodState_POD_STATE_KILLED.String(),
+		},
+		{
+			"delete succeeded",
+			corev1.PodSucceeded,
+			DeletePod,
+			pbpod.PodState_POD_STATE_SUCCEEDED.String(),
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			require := require.New(t)
+			require.Equal(tc.state, buildPodState(tc.phase, tc.event))
+		})
+	}
 }

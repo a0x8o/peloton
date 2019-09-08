@@ -18,13 +18,16 @@ import (
 	"sync"
 	"time"
 
-	peloton "github.com/uber/peloton/.gen/peloton/api/v1alpha/peloton"
+	"github.com/uber/peloton/.gen/peloton/api/v1alpha/peloton"
+	pbpod "github.com/uber/peloton/.gen/peloton/api/v1alpha/pod"
 	hostmgr "github.com/uber/peloton/.gen/peloton/private/hostmgr/v1alpha"
 	"github.com/uber/peloton/pkg/common/background"
 	"github.com/uber/peloton/pkg/common/lifecycle"
+	"github.com/uber/peloton/pkg/hostmgr/models"
 	"github.com/uber/peloton/pkg/hostmgr/p2k/scalar"
 	hmscalar "github.com/uber/peloton/pkg/hostmgr/scalar"
 
+	"github.com/pkg/errors"
 	log "github.com/sirupsen/logrus"
 	uatomic "github.com/uber-go/atomic"
 	"github.com/uber-go/tally"
@@ -35,6 +38,8 @@ import (
 const (
 	_hostCacheMetricsRefresh       = "hostCacheMetricsRefresh"
 	_hostCacheMetricsRefreshPeriod = 10 * time.Second
+	_hostCachePruneHeldHosts       = "hostCachePruneHeldHosts"
+	_hostCachePruneHeldHostsPeriod = 180 * time.Second
 )
 
 // HostCache manages cluster resources, and provides necessary abstractions to
@@ -49,7 +54,7 @@ type HostCache interface {
 
 	// CompleteLease is called when launching pods on a host that has been
 	// previously leased to the Placement engine.
-	CompleteLease(hostname string, leaseID string, podToResMap map[string]hmscalar.Resources) error
+	CompleteLease(hostname string, leaseID string, podToSpecMap map[string]*pbpod.PodSpec) error
 
 	// GetClusterCapacity gets the total capacity and allocation of the cluster.
 	GetClusterCapacity() (capacity, allocation hmscalar.Resources)
@@ -79,6 +84,14 @@ type HostCache interface {
 
 	// ReleaseHoldForPods release the hold of host for the pods specified.
 	ReleaseHoldForPods(hostname string, podIDs []*peloton.PodID) error
+
+	// CompleteLaunchPod is called when a pod is successfully launched.
+	// This is for things like removing pods allocated to the pod
+	// from available ports. This is called after successful launch
+	// of individual pod. We cannot do this in CompleteLease.
+	// For example, ports should not be removed after a failed launch,
+	// otherwise the ports are leaked.
+	CompleteLaunchPod(hostname string, pod *models.LaunchablePod) error
 }
 
 // hostCache is an implementation of HostCache interface.
@@ -113,6 +126,7 @@ func New(
 ) HostCache {
 	return &hostCache{
 		hostIndex:     make(map[string]HostSummary),
+		podHeldIndex:  make(map[string]string),
 		hostEventCh:   hostEventCh,
 		lifecycle:     lifecycle.NewLifeCycle(),
 		metrics:       NewMetrics(parent),
@@ -211,7 +225,7 @@ func (c *hostCache) TerminateLease(
 // previously leased to the Placement engine. The leaseID of the acquired host
 // should be supplied in this call so that the hostcache can match the leaseID,
 // verify that sufficient resources are present on the host to launch all the
-// pods in podToResMap, and then allow the pods to be launched on this host.
+// pods in podToSpecMap, and then allow the pods to be launched on this host.
 // At this point, the existing lease is Completed and the host can be used for
 // further placement.
 // Error cases:
@@ -221,7 +235,7 @@ func (c *hostCache) TerminateLease(
 func (c *hostCache) CompleteLease(
 	hostname string,
 	leaseID string,
-	podToResMap map[string]hmscalar.Resources,
+	podToSpecMap map[string]*pbpod.PodSpec,
 ) error {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -230,7 +244,7 @@ func (c *hostCache) CompleteLease(
 	if err != nil {
 		return err
 	}
-	if err := hs.CompleteLease(leaseID, podToResMap); err != nil {
+	if err := hs.CompleteLease(leaseID, podToSpecMap); err != nil {
 		// TODO: metrics
 		return err
 	}
@@ -261,18 +275,18 @@ func (c *hostCache) ResetExpiredHeldHostSummaries(deadline time.Time) []string {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	var ret []string
+	var pruned []string
 	for hostname, hs := range c.hostIndex {
 		isFreed, _, podIDExpired := hs.DeleteExpiredHolds(deadline)
 		if isFreed {
-			ret = append(ret, hostname)
-			// TODO: add metrics.
+			pruned = append(pruned, hostname)
 		}
 		for _, id := range podIDExpired {
 			c.removePodHold(id)
 		}
 	}
-	return ret
+	log.WithField("hosts", pruned).Debug("Hosts pruned")
+	return pruned
 }
 
 func (c *hostCache) GetHostHeldForPod(podID *peloton.PodID) string {
@@ -331,6 +345,7 @@ func (c *hostCache) RefreshMetrics() {
 	totalAllocated := hmscalar.Resources{}
 	readyHosts := float64(0)
 	placingHosts := float64(0)
+	heldHosts := float64(0)
 
 	hosts := c.GetSummaries()
 
@@ -346,12 +361,16 @@ func (c *hostCache) RefreshMetrics() {
 		case PlacingHost:
 			placingHosts++
 		}
+		if len(h.GetHeldPods()) > 0 {
+			heldHosts++
+		}
 	}
 
 	c.metrics.Available.Update(totalAvailable)
 	c.metrics.Allocated.Update(totalAllocated)
 	c.metrics.ReadyHosts.Update(readyHosts)
 	c.metrics.PlacingHosts.Update(placingHosts)
+	c.metrics.HeldHosts.Update(heldHosts)
 	c.metrics.AvailableHosts.Update(float64(len(hosts)))
 }
 
@@ -371,6 +390,18 @@ func (c *hostCache) addPodHold(hostname string, id *peloton.PodID) {
 // removePodHold deletes id from podHeldIndex regardless of hostname.
 func (c *hostCache) removePodHold(id *peloton.PodID) {
 	delete(c.podHeldIndex, id.GetValue())
+}
+
+func (c *hostCache) CompleteLaunchPod(hostname string, pod *models.LaunchablePod) error {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	hs, err := c.getSummary(hostname)
+	if err != nil {
+		return errors.Wrapf(err, "cannot find host %q", hostname)
+	}
+	hs.CompleteLaunchPod(pod)
+	return nil
 }
 
 // getSummary returns host summary given name. If the host does not exist,
@@ -624,6 +655,16 @@ func (c *hostCache) Start() {
 				c.RefreshMetrics()
 			},
 			Period: _hostCacheMetricsRefreshPeriod,
+		},
+	)
+
+	c.backgroundMgr.RegisterWorks(
+		background.Work{
+			Name: _hostCachePruneHeldHosts,
+			Func: func(_ *uatomic.Bool) {
+				c.ResetExpiredHeldHostSummaries(time.Now())
+			},
+			Period: _hostCachePruneHeldHostsPeriod,
 		},
 	)
 

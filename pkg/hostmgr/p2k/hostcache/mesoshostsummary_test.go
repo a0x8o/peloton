@@ -14,7 +14,9 @@
 
 package hostcache
 
-import "github.com/uber/peloton/pkg/hostmgr/scalar"
+import (
+	"github.com/uber/peloton/pkg/hostmgr/scalar"
+)
 
 // TestMesosHostSummarySetCapacity tests for mesos change capacity
 // only affects capacity
@@ -47,13 +49,6 @@ func (suite *HostCacheTestSuite) TestMesosHostSummarySetCapacity() {
 	suite.Equal(ms.GetAllocated(), allocated)
 	suite.Equal(ms.GetCapacity(), newCapacity)
 
-}
-
-// TestMesosHostSummaryHandlePodEvent tests that handle pod
-// event does nothing for mesos
-func (suite *HostCacheTestSuite) TestMesosHostSummaryHandlePodEvent() {
-	ms := newMesosHostSummary(_hostname, _version).(*mesosHostSummary)
-	ms.HandlePodEvent(nil)
 }
 
 // TestMesosHostSummarySetAvailable

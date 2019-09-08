@@ -17,6 +17,7 @@ package taskconfig
 import (
 	"github.com/gogo/protobuf/proto"
 
+	mesosv1 "github.com/uber/peloton/.gen/mesos/v1"
 	"github.com/uber/peloton/.gen/peloton/api/v0/peloton"
 	"github.com/uber/peloton/.gen/peloton/api/v0/task"
 	v1peloton "github.com/uber/peloton/.gen/peloton/api/v1alpha/peloton"
@@ -165,6 +166,100 @@ func HasPortSpecsChanged(
 	return hasPortsChanged(pport, nport)
 }
 
+// hasMesosCommandChanged checks whether two mesos CommandInfo URIs have
+// difference, with special handling for some of the fields.
+func hasMesosCommandUriChanged(
+	prevUri, newUri *mesosv1.CommandInfo_URI,
+) bool {
+	if prevUri.GetValue() != newUri.GetValue() {
+		return true
+	}
+
+	if prevUri.GetExecutable() != newUri.GetExecutable() {
+		return true
+	}
+
+	if prevUri.GetExtract() != newUri.GetExtract() {
+		return true
+	}
+
+	if prevUri.GetCache() != newUri.GetCache() {
+		return true
+	}
+
+	if prevUri.GetOutputFile() != newUri.GetOutputFile() {
+		return true
+	}
+
+	return false
+}
+
+// hasMesosCommandChanged checks whether two mesos CommandInfo have
+// difference, with special handling for some of the fields.
+func hasMesosCommandChanged(
+	prevCommand, newCommand *mesosv1.CommandInfo,
+) bool {
+	if prevCommand == nil && newCommand == nil {
+		return false
+	}
+
+	if prevCommand == nil || newCommand == nil {
+		return true
+	}
+
+	if len(prevCommand.GetUris()) != len(newCommand.GetUris()) {
+		return true
+	}
+
+	prevC := proto.Clone(prevCommand).(*mesosv1.CommandInfo)
+	newC := proto.Clone(newCommand).(*mesosv1.CommandInfo)
+
+	for i := range prevCommand.GetUris() {
+		if hasMesosCommandUriChanged(
+			prevC.GetUris()[i],
+			newC.GetUris()[i],
+		) {
+			return true
+		}
+	}
+
+	prevC.Uris = nil
+	newC.Uris = nil
+
+	return !proto.Equal(prevC, newC)
+}
+
+// hasMesosContainerChanged checks whether two mesos ContainerInfo have
+// difference, with special handling for some of the fields.
+func hasMesosContainerChanged(
+	prevContainer, newContainer *mesosv1.ContainerInfo,
+) bool {
+	if prevContainer == nil && newContainer == nil {
+		return false
+	}
+
+	if prevContainer == nil || newContainer == nil {
+		return true
+	}
+
+	prevC := proto.Clone(prevContainer).(*mesosv1.ContainerInfo)
+	newC := proto.Clone(newContainer).(*mesosv1.ContainerInfo)
+
+	if prevC.Docker != nil && newC.Docker != nil {
+		// network field has default value if not set, use getter to retrieve
+		// value and compare.
+		if prevC.GetDocker().GetNetwork() !=
+			newC.GetDocker().GetNetwork() {
+			return true
+		}
+
+		prevC.Docker.Network = nil
+		newC.Docker.Network = nil
+	}
+
+	return !proto.Equal(prevC, newC)
+}
+
 // HasTaskConfigChanged returns true if the task config (other than the name)
 // has changed.
 func HasTaskConfigChanged(
@@ -174,7 +269,9 @@ func HasTaskConfigChanged(
 	if prevTaskConfig == nil ||
 		newTaskConfig == nil ||
 		HasPelotonLabelsChanged(prevTaskConfig.GetLabels(), newTaskConfig.GetLabels()) ||
-		HasPortConfigsChanged(prevTaskConfig.GetPorts(), newTaskConfig.GetPorts()) {
+		HasPortConfigsChanged(prevTaskConfig.GetPorts(), newTaskConfig.GetPorts()) ||
+		hasMesosContainerChanged(prevTaskConfig.GetContainer(), newTaskConfig.GetContainer()) ||
+		hasMesosCommandChanged(prevTaskConfig.GetCommand(), newTaskConfig.GetCommand()) {
 		return true
 	}
 
@@ -187,6 +284,10 @@ func HasTaskConfigChanged(
 	newLabels := newTask.GetLabels()
 	oldPorts := prevTask.GetPorts()
 	newPorts := newTask.GetPorts()
+	oldContainer := prevTask.GetContainer()
+	newContainer := newTask.GetContainer()
+	oldCommand := prevTask.GetCommand()
+	newCommand := newTask.GetCommand()
 
 	defer func() {
 		prevTask.Name = oldName
@@ -195,6 +296,10 @@ func HasTaskConfigChanged(
 		newTask.Labels = newLabels
 		prevTask.Ports = oldPorts
 		newTask.Ports = newPorts
+		prevTask.Container = oldContainer
+		newTask.Container = newContainer
+		prevTask.Command = oldCommand
+		newTask.Command = newCommand
 	}()
 
 	prevTask.Name = ""
@@ -203,6 +308,10 @@ func HasTaskConfigChanged(
 	newTask.Labels = nil
 	prevTask.Ports = nil
 	newTask.Ports = nil
+	prevTask.Container = nil
+	newTask.Container = nil
+	prevTask.Command = nil
+	newTask.Command = nil
 
 	return !proto.Equal(prevTask, newTask)
 }

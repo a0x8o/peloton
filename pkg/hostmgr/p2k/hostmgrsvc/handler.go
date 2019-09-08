@@ -18,6 +18,8 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/uber/peloton/.gen/peloton/api/v1alpha/peloton"
+	pbpod "github.com/uber/peloton/.gen/peloton/api/v1alpha/pod"
 	hostmgr "github.com/uber/peloton/.gen/peloton/private/hostmgr/v1alpha"
 	v1alpha "github.com/uber/peloton/.gen/peloton/private/hostmgr/v1alpha"
 	"github.com/uber/peloton/.gen/peloton/private/hostmgr/v1alpha/svc"
@@ -121,22 +123,46 @@ func (h *ServiceHandler) LaunchPods(
 		return nil, err
 	}
 
-	// TODO: handle held pods for in-place updates.
-
-	// Convert LaunchablePods to a map of podID to scalar resources before
-	// completing the lease.
-	podToResMap := make(map[string]scalar.Resources)
+	// Check if pods to be launched is held by the correct host.
+	// If host held is the same as requested or is empty, it is a noop.
+	// If host held is different from host in the launch request, releasing
+	// held host.
+	holdsToRelease := make(map[string][]*peloton.PodID)
 	for _, pod := range req.GetPods() {
-		// TODO: Should we check for repeat podID here?
-		podToResMap[pod.GetPodId().GetValue()] = scalar.FromPodSpec(
-			pod.GetSpec(),
-		)
+		hostHeld := h.hostCache.GetHostHeldForPod(pod.GetPodId())
+		if len(hostHeld) != 0 && hostHeld != req.GetHostname() {
+			log.WithFields(log.Fields{
+				"pod_id":         pod.GetPodId().GetValue(),
+				"host_held":      hostHeld,
+				"host_requested": req.GetHostname(),
+			}).Debug("Pod not launching on the host held")
+			holdsToRelease[hostHeld] = append(holdsToRelease[hostHeld], pod.GetPodId())
+		}
+	}
+	for hostHeld, pods := range holdsToRelease {
+		if err := h.hostCache.ReleaseHoldForPods(hostHeld, pods); err != nil {
+			// Only log warning so we get a sense of how often this is
+			// happening. It is okay to leave the hold as is because pruner
+			// will remove it eventually.
+			log.WithFields(log.Fields{
+				"pod_ids":   pods,
+				"host_held": hostHeld,
+				"error":     err,
+			}).Warn("Cannot release held host, relying on pruner for cleanup.")
+		}
+	}
+
+	podToSpecMap := make(map[string]*pbpod.PodSpec)
+	for _, pod := range req.GetPods() {
+		// podToSpecMap: Should we check for repeat podID here?
+		podToSpecMap[pod.GetPodId().GetValue()] =
+			pod.GetSpec()
 	}
 
 	if err = h.hostCache.CompleteLease(
 		req.GetHostname(),
 		req.GetLeaseId().GetValue(),
-		podToResMap,
+		podToSpecMap,
 	); err != nil {
 		return nil, err
 	}
@@ -144,7 +170,7 @@ func (h *ServiceHandler) LaunchPods(
 	log.WithFields(log.Fields{
 		"lease_id": req.GetLeaseId().GetValue(),
 		"hostname": req.GetHostname(),
-		"pods":     podToResMap,
+		"pods":     podToSpecMap,
 	}).Debug("LaunchPods success")
 
 	var launchablePods []*models.LaunchablePod
@@ -157,11 +183,15 @@ func (h *ServiceHandler) LaunchPods(
 	}
 
 	// Should we check for repeat podID here?
-	if err := h.plugin.LaunchPods(
+	launched, err := h.plugin.LaunchPods(
 		ctx,
 		launchablePods,
 		req.GetHostname(),
-	); err != nil {
+	)
+	for _, pod := range launched {
+		h.hostCache.CompleteLaunchPod(req.GetHostname(), pod)
+	}
+	if err != nil {
 		return nil, err
 	}
 
@@ -192,6 +222,68 @@ func (h *ServiceHandler) KillPods(
 		}
 	}
 	return &svc.KillPodsResponse{}, nil
+}
+
+// KillAndHoldPods implements HostManagerService.KillAndHoldPods.
+func (h *ServiceHandler) KillAndHoldPods(
+	ctx context.Context,
+	req *svc.KillAndHoldPodsRequest,
+) (resp *svc.KillAndHoldPodsResponse, err error) {
+	defer func() {
+		if err != nil {
+			log.WithField("pod_entries", req.GetEntries()).
+				WithError(err).
+				Warn("HostMgr.KillAndHoldPods failed")
+		}
+	}()
+
+	// Hold hosts for pods and log failures if any.
+	podsToHold := make(map[string][]*peloton.PodID)
+	for _, entry := range req.GetEntries() {
+		podsToHold[entry.GetHostToHold()] = append(
+			podsToHold[entry.GetHostToHold()], entry.GetPodId())
+	}
+	for host, pods := range podsToHold {
+		if err := h.hostCache.HoldForPods(host, pods); err != nil {
+			log.WithFields(log.Fields{
+				"host":    host,
+				"pod_ids": pods,
+			}).WithError(err).
+				Warn("Failed to hold the host")
+		}
+	}
+
+	log.WithFields(log.Fields{
+		"pod_entries": req.GetEntries(),
+	}).Debug("KillPods success")
+
+	// Kill pods. Release host if task kill on host fails.
+	var errs []error
+	var failed []*peloton.PodID
+	holdToRelease := make(map[string][]*peloton.PodID)
+	for _, entry := range req.GetEntries() {
+		// TODO: kill pods in parallel.
+		err := h.plugin.KillPod(ctx, entry.GetPodId().GetValue())
+		if err != nil {
+			errs = append(errs, err)
+			failed = append(failed, entry.GetPodId())
+			holdToRelease[entry.GetHostToHold()] = append(
+				holdToRelease[entry.GetHostToHold()], entry.GetPodId())
+		}
+	}
+	for host, pods := range holdToRelease {
+		if err := h.hostCache.ReleaseHoldForPods(host, pods); err != nil {
+			log.WithFields(log.Fields{
+				"host":  host,
+				"error": err,
+			}).Warn("Failed to release host")
+		}
+	}
+	if len(errs) != 0 {
+		return &svc.KillAndHoldPodsResponse{},
+			yarpcerrors.InternalErrorf(multierr.Combine(errs...).Error())
+	}
+	return &svc.KillAndHoldPodsResponse{}, nil
 }
 
 // ClusterCapacity implements HostManagerService.ClusterCapacity.
@@ -298,4 +390,9 @@ func toHostMgrSvcResources(r scalar.Resources) []*hostmgr.Resource {
 			Capacity: r.Mem,
 		},
 	}
+}
+
+// NewTestServiceHandler returns an empty new ServiceHandler ptr for testing.
+func NewTestServiceHandler() *ServiceHandler {
+	return &ServiceHandler{}
 }

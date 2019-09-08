@@ -110,6 +110,26 @@ func (suite *v1LifecycleTestSuite) TestKill() {
 	suite.Nil(err)
 }
 
+func (suite *v1LifecycleTestSuite) TestKillAndHold() {
+	hostToHold := "hostname"
+	suite.mockHostMgr.EXPECT().
+		KillAndHoldPods(gomock.Any(), &v1_hostsvc.KillAndHoldPodsRequest{
+			Entries: []*v1_hostsvc.KillAndHoldPodsRequest_Entry{
+				{
+					PodId:      &peloton.PodID{Value: suite.podID},
+					HostToHold: hostToHold,
+				},
+			},
+		})
+	err := suite.lm.Kill(
+		suite.ctx,
+		suite.podID,
+		hostToHold,
+		nil,
+	)
+	suite.Nil(err)
+}
+
 // TestKillLock tests Kill pods is blocked when kill is locked
 func (suite *v1LifecycleTestSuite) TestKillLock() {
 	suite.lm.LockKill()
@@ -239,23 +259,41 @@ func (suite *v1LifecycleTestSuite) TestLaunchErrors() {
 	tmp := createTestTask(1)
 	taskID := tmp.JobId.Value + "-" + fmt.Sprint(tmp.InstanceId)
 	taskInfos[taskID] = tmp
+	hostname := "host"
+	leaseID := uuid.New()
+
+	suite.mockHostMgr.EXPECT().
+		TerminateLeases(gomock.Any(), &v1_hostsvc.TerminateLeasesRequest{
+			Leases: []*v1_hostsvc.TerminateLeasesRequest_LeasePair{{
+				Hostname: hostname,
+				LeaseId:  &pbhostmgr.LeaseID{Value: leaseID},
+			}},
+		}).Return(&v1_hostsvc.TerminateLeasesResponse{}, nil)
 
 	err := suite.lm.Launch(
 		context.Background(),
-		"",
-		"host",
-		"host",
+		leaseID,
+		hostname,
+		hostname,
 		nil,
 		nil,
 	)
 	suite.Error(err)
 	suite.True(yarpcerrors.IsInvalidArgument(err))
 
+	suite.mockHostMgr.EXPECT().
+		TerminateLeases(gomock.Any(), &v1_hostsvc.TerminateLeasesRequest{
+			Leases: []*v1_hostsvc.TerminateLeasesRequest_LeasePair{{
+				Hostname: hostname,
+				LeaseId:  &pbhostmgr.LeaseID{Value: leaseID},
+			}},
+		}).Return(&v1_hostsvc.TerminateLeasesResponse{}, nil)
+
 	err = suite.lm.Launch(
 		context.Background(),
-		"",
-		"host",
-		"host",
+		leaseID,
+		hostname,
+		hostname,
 		taskInfos,
 		rate.NewLimiter(0, 0),
 	)

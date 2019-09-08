@@ -17,6 +17,7 @@ package objects
 import (
 	"context"
 	"encoding/json"
+	"go.uber.org/yarpc/yarpcerrors"
 	"time"
 
 	hostpb "github.com/uber/peloton/.gen/peloton/api/v0/host"
@@ -43,8 +44,27 @@ type HostInfoObject struct {
 	GoalState string `column:"name=goal_state"`
 	// Labels of the host
 	Labels string `column:"name=labels"`
+	// Current host Pool for the host
+	// This will indicate which host pool this host belongs to
+	CurrentPool string `column:"name=current_pool"`
+	// Desired host pool for the host
+	// This will indicate which host pool this host should be.
+	DesiredPool string `column:"name=desired_pool"`
 	// Last update time of the host maintenance
 	UpdateTime time.Time `column:"name=update_time"`
+}
+
+// transform will convert all the value from DB into the corresponding type
+// in ORM object to be interpreted by base store client
+func (o *HostInfoObject) transform(row map[string]interface{}) {
+	o.Hostname = base.NewOptionalString(row["hostname"])
+	o.IP = row["ip"].(string)
+	o.State = row["state"].(string)
+	o.GoalState = row["goal_state"].(string)
+	o.Labels = row["labels"].(string)
+	o.CurrentPool = row["current_pool"].(string)
+	o.DesiredPool = row["desired_pool"].(string)
+	o.UpdateTime = row["update_time"].(time.Time)
 }
 
 // HostInfoOps provides methods for manipulating host_maintenance table.
@@ -57,6 +77,8 @@ type HostInfoOps interface {
 		state hostpb.HostState,
 		goalState hostpb.HostState,
 		labels map[string]string,
+		currentPool string,
+		desiredPool string,
 	) error
 
 	// Get retrieves the row based on the primary key from the table.
@@ -75,6 +97,8 @@ type HostInfoOps interface {
 		state hostpb.HostState,
 		goalState hostpb.HostState,
 		labels map[string]string,
+		currentPool string,
+		desiredPool string,
 	) error
 
 	// Delete removes an object from the table based on primary key.
@@ -102,18 +126,22 @@ func (d *hostInfoOps) Create(
 	state hostpb.HostState,
 	goalState hostpb.HostState,
 	labels map[string]string,
+	currentPool string,
+	desiredPool string,
 ) error {
 	bytes, err := json.Marshal(&labels)
 	if err != nil {
 		return err
 	}
 	hostInfoObject := &HostInfoObject{
-		Hostname:   base.NewOptionalString(hostname),
-		IP:         ip,
-		State:      state.String(),
-		GoalState:  goalState.String(),
-		Labels:     string(bytes),
-		UpdateTime: time.Now(),
+		Hostname:    base.NewOptionalString(hostname),
+		IP:          ip,
+		State:       state.String(),
+		GoalState:   goalState.String(),
+		Labels:      string(bytes),
+		CurrentPool: currentPool,
+		DesiredPool: desiredPool,
+		UpdateTime:  time.Now(),
 	}
 	if err := d.store.oClient.Create(ctx, hostInfoObject); err != nil {
 		d.store.metrics.OrmHostInfoMetrics.HostInfoAddFail.Inc(1)
@@ -128,13 +156,20 @@ func (d *hostInfoOps) Get(
 	ctx context.Context,
 	hostname string,
 ) (*hostpb.HostInfo, error) {
+	var row map[string]interface{}
 	hostInfoObject := &HostInfoObject{
 		Hostname: base.NewOptionalString(hostname),
 	}
-	if err := d.store.oClient.Get(ctx, hostInfoObject); err != nil {
+	row, err := d.store.oClient.Get(ctx, hostInfoObject)
+	if err != nil {
 		d.store.metrics.OrmHostInfoMetrics.HostInfoGetFail.Inc(1)
 		return nil, err
 	}
+	if len(row) == 0 {
+		return nil, yarpcerrors.NotFoundErrorf(
+			"host info not found %s", hostname)
+	}
+	hostInfoObject.transform(row)
 	info, err := newHostInfoFromHostInfoObject(hostInfoObject)
 	if err != nil {
 		d.store.metrics.OrmHostInfoMetrics.HostInfoGetFail.Inc(1)
@@ -146,7 +181,7 @@ func (d *hostInfoOps) Get(
 
 // GetAll gets all host infos from db without any pk specified
 func (d *hostInfoOps) GetAll(ctx context.Context) ([]*hostpb.HostInfo, error) {
-	results, err := d.store.oClient.GetAll(ctx, &HostInfoObject{})
+	rows, err := d.store.oClient.GetAll(ctx, &HostInfoObject{})
 	if err != nil {
 		d.store.metrics.OrmHostInfoMetrics.HostInfoGetAllFail.Inc(1)
 		return nil, err
@@ -154,8 +189,10 @@ func (d *hostInfoOps) GetAll(ctx context.Context) ([]*hostpb.HostInfo, error) {
 	d.store.metrics.OrmHostInfoMetrics.HostInfoGetAll.Inc(1)
 
 	var hostInfos []*hostpb.HostInfo
-	for _, value := range results {
-		info, err := newHostInfoFromHostInfoObject(value.(*HostInfoObject))
+	for _, row := range rows {
+		obj := &HostInfoObject{}
+		obj.transform(row)
+		info, err := newHostInfoFromHostInfoObject(obj)
 		if err != nil {
 			d.store.metrics.OrmHostInfoMetrics.HostInfoGetAllFail.Inc(1)
 			return nil, err
@@ -172,19 +209,24 @@ func (d *hostInfoOps) Update(
 	state hostpb.HostState,
 	goalState hostpb.HostState,
 	labels map[string]string,
+	currentPool string,
+	desiredPool string,
 ) error {
 	bytes, err := json.Marshal(&labels)
 	if err != nil {
 		return err
 	}
 	hostInfoObject := &HostInfoObject{
-		Hostname:   base.NewOptionalString(hostname),
-		State:      state.String(),
-		GoalState:  goalState.String(),
-		Labels:     string(bytes),
-		UpdateTime: time.Now(),
+		Hostname:    base.NewOptionalString(hostname),
+		State:       state.String(),
+		GoalState:   goalState.String(),
+		Labels:      string(bytes),
+		CurrentPool: currentPool,
+		DesiredPool: desiredPool,
+		UpdateTime:  time.Now(),
 	}
-	fieldsToUpdate := []string{"State", "GoalState", "Labels", "UpdateTime"}
+	fieldsToUpdate := []string{"State", "GoalState", "Labels", "CurrentPool",
+		"DesiredPool", "UpdateTime"}
 	if err := d.store.oClient.Update(
 		ctx,
 		hostInfoObject,
@@ -234,5 +276,8 @@ func newHostInfoFromHostInfoObject(
 			)
 		}
 	}
+	hostInfo.CurrentPool = hostInfoObject.CurrentPool
+	hostInfo.DesiredPool = hostInfoObject.DesiredPool
+
 	return hostInfo, nil
 }

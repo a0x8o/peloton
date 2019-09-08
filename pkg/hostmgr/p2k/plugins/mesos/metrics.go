@@ -17,11 +17,18 @@ package mesos
 import "github.com/uber-go/tally"
 
 type metrics struct {
+	scope tally.Scope
+
 	KillPod     tally.Counter
 	KillPodFail tally.Counter
 
 	LaunchPod     tally.Counter
 	LaunchPodFail tally.Counter
+
+	// Task Status update metrics.
+	TaskUpdateCounter   tally.Counter
+	TaskUpdateAck       tally.Counter
+	TaskUpdateAckDeDupe tally.Counter
 }
 
 func newMetrics(scope tally.Scope) *metrics {
@@ -29,9 +36,14 @@ func newMetrics(scope tally.Scope) *metrics {
 	failScope := scope.Tagged(map[string]string{"result": "fail"})
 
 	return &metrics{
-		KillPod:       successScope.Counter("kill_pod"),
-		KillPodFail:   failScope.Counter("kill_pod"),
-		LaunchPod:     successScope.Counter("launch_pod"),
-		LaunchPodFail: failScope.Counter("launch_pod"),
+		scope: scope,
+
+		KillPod:             successScope.Counter("kill_pod"),
+		KillPodFail:         failScope.Counter("kill_pod"),
+		LaunchPod:           successScope.Counter("launch_pod"),
+		LaunchPodFail:       failScope.Counter("launch_pod"),
+		TaskUpdateAck:       successScope.Counter("task_update_ack"),
+		TaskUpdateAckDeDupe: successScope.Counter("task_update_ack_dedupe"),
+		TaskUpdateCounter:   scope.Counter("task_update"),
 	}
 }
