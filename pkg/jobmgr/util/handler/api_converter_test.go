@@ -1671,14 +1671,15 @@ func (suite *apiConverterTestSuite) TestConvertTaskInfosToPodInfos() {
 // reason enums are converted correctly from v0 to v1alpha.
 func (suite *apiConverterTestSuite) TestConvertTerminationStatusReason() {
 	expmap := map[task.TerminationStatus_Reason]pod.TerminationStatus_Reason{
-		task.TerminationStatus_TERMINATION_STATUS_REASON_INVALID:                   pod.TerminationStatus_TERMINATION_STATUS_REASON_INVALID,
-		task.TerminationStatus_TERMINATION_STATUS_REASON_KILLED_ON_REQUEST:         pod.TerminationStatus_TERMINATION_STATUS_REASON_KILLED_ON_REQUEST,
-		task.TerminationStatus_TERMINATION_STATUS_REASON_FAILED:                    pod.TerminationStatus_TERMINATION_STATUS_REASON_FAILED,
-		task.TerminationStatus_TERMINATION_STATUS_REASON_KILLED_HOST_MAINTENANCE:   pod.TerminationStatus_TERMINATION_STATUS_REASON_KILLED_HOST_MAINTENANCE,
-		task.TerminationStatus_TERMINATION_STATUS_REASON_PREEMPTED_RESOURCES:       pod.TerminationStatus_TERMINATION_STATUS_REASON_PREEMPTED_RESOURCES,
-		task.TerminationStatus_TERMINATION_STATUS_REASON_DEADLINE_TIMEOUT_EXCEEDED: pod.TerminationStatus_TERMINATION_STATUS_REASON_DEADLINE_TIMEOUT_EXCEEDED,
-		task.TerminationStatus_TERMINATION_STATUS_REASON_KILLED_FOR_RESTART:        pod.TerminationStatus_TERMINATION_STATUS_REASON_KILLED_FOR_RESTART,
-		task.TerminationStatus_TERMINATION_STATUS_REASON_KILLED_FOR_UPDATE:         pod.TerminationStatus_TERMINATION_STATUS_REASON_KILLED_FOR_UPDATE,
+		task.TerminationStatus_TERMINATION_STATUS_REASON_INVALID:                      pod.TerminationStatus_TERMINATION_STATUS_REASON_INVALID,
+		task.TerminationStatus_TERMINATION_STATUS_REASON_KILLED_ON_REQUEST:            pod.TerminationStatus_TERMINATION_STATUS_REASON_KILLED_ON_REQUEST,
+		task.TerminationStatus_TERMINATION_STATUS_REASON_FAILED:                       pod.TerminationStatus_TERMINATION_STATUS_REASON_FAILED,
+		task.TerminationStatus_TERMINATION_STATUS_REASON_KILLED_HOST_MAINTENANCE:      pod.TerminationStatus_TERMINATION_STATUS_REASON_KILLED_HOST_MAINTENANCE,
+		task.TerminationStatus_TERMINATION_STATUS_REASON_PREEMPTED_RESOURCES:          pod.TerminationStatus_TERMINATION_STATUS_REASON_PREEMPTED_RESOURCES,
+		task.TerminationStatus_TERMINATION_STATUS_REASON_DEADLINE_TIMEOUT_EXCEEDED:    pod.TerminationStatus_TERMINATION_STATUS_REASON_DEADLINE_TIMEOUT_EXCEEDED,
+		task.TerminationStatus_TERMINATION_STATUS_REASON_KILLED_FOR_RESTART:           pod.TerminationStatus_TERMINATION_STATUS_REASON_KILLED_FOR_RESTART,
+		task.TerminationStatus_TERMINATION_STATUS_REASON_KILLED_FOR_UPDATE:            pod.TerminationStatus_TERMINATION_STATUS_REASON_KILLED_FOR_UPDATE,
+		task.TerminationStatus_TERMINATION_STATUS_REASON_KILLED_FOR_SLA_AWARE_RESTART: pod.TerminationStatus_TERMINATION_STATUS_REASON_KILLED_FOR_SLA_AWARE_RESTART,
 	}
 	// ensure that we have a test-case for every legal value of v0 reason
 	suite.Equal(len(task.TerminationStatus_Reason_name), len(expmap))
@@ -1707,68 +1708,6 @@ func (suite *apiConverterTestSuite) TestConvertV1InstanceRangeToV0() {
 	suite.Equal(len(v0Range), 1)
 	suite.Equal(v0Range[0].From, from)
 	suite.Equal(v0Range[0].To, to)
-}
-
-func (suite *apiConverterTestSuite) TestConvertTaskEventsToPodEvents() {
-	taskState := "RUNNING"
-	desiredTaskState := "SUCCEEDED"
-	podState := "POD_STATE_RUNNING"
-	desiredPodState := "POD_STATE_SUCCEEDED"
-
-	taskEvents := []*task.PodEvent{
-		{
-			TaskId: &mesos.TaskID{
-				Value: &testMesosTaskID,
-			},
-			DesriedTaskId: &mesos.TaskID{
-				Value: &testMesosTaskID,
-			},
-			ConfigVersion:        1,
-			DesiredConfigVersion: 1,
-			AgentID:              testAgentID,
-			Hostname:             "test-host",
-			Message:              "test-message",
-			Reason:               "test-reason",
-			Healthy:              "HEALTHY",
-			PrevTaskId: &mesos.TaskID{
-				Value: &testPrevMesosTaskID,
-			},
-			ActualState: taskState,
-			GoalState:   desiredTaskState,
-			Timestamp:   "now",
-		},
-	}
-
-	expectedPodEvents := []*pod.PodEvent{
-		{
-			PodId: &v1alphapeloton.PodID{
-				Value: testMesosTaskID,
-			},
-			DesiredPodId: &v1alphapeloton.PodID{
-				Value: testMesosTaskID,
-			},
-			Version: &v1alphapeloton.EntityVersion{
-				Value: "1-0-0",
-			},
-			DesiredVersion: &v1alphapeloton.EntityVersion{
-				Value: "1-0-0",
-			},
-			AgentId:  testAgentID,
-			Hostname: "test-host",
-			Message:  "test-message",
-			Reason:   "test-reason",
-			Healthy:  "HEALTH_STATE_HEALTHY",
-			PrevPodId: &v1alphapeloton.PodID{
-				Value: testPrevMesosTaskID,
-			},
-			ActualState:  podState,
-			DesiredState: desiredPodState,
-			Timestamp:    "now",
-		},
-	}
-
-	podEvents := ConvertTaskEventsToPodEvents(taskEvents)
-	suite.Equal(expectedPodEvents, podEvents)
 }
 
 // TestConvertTaskStatsToPodStats tests conversion

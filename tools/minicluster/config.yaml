@@ -10,7 +10,7 @@ zk_container: peloton-zk
 
 # Mesos configs
 mesos_master_image: mesosphere/mesos-master:1.7.1
-mesos_slave_image: mesosphere/mesos-slave:1.7.1
+mesos_slave_image: varun4792/varung-peloton:peloton-mesos-agent
 mesos_master_container: peloton-mesos-master
 mesos_agent_container: peloton-mesos-agent
 num_agents: 3
@@ -20,13 +20,14 @@ num_agents: 3
 
 # Mesos master configs
 master_port: 5050
+local_master_port: 5050
 quorum: 1
 registry: replicated_log
 
 # Mesos slave configs
 # Values for oversubscription are recommend at below documentation.
 # https://github.com/apache/mesos/blob/004fb5fa27c2992b11a2fa51a8ec5a3f3de404db/docs/oversubscription.md
-default_agent_port: 5051
+agent_port: 5051
 local_agent_port: 5051
 switch_user: 0
 containers: docker,mesos
@@ -49,7 +50,9 @@ oversubscribed_resources_interval: 15secs
 cassandra_image: cassandra:3.0.14
 cassandra_container: peloton-cassandra
 cassandra_cql_port: 9042
+local_cassandra_cql_port: 9042
 cassandra_thrift_port: 9160
+local_cassandra_thrift_port: 9160
 cassandra_test_db: peloton_test
 
 
@@ -104,13 +107,26 @@ peloton_apiserver_ports:
   - 5297
   - 5397
 
+peloton_mock_cqos_container: peloton-mock-cqos
+peloton_mock_cqos_instance_count: 1
+peloton_mock_cqos_ports:
+  - 5090
+  - 5190
+
 peloton_archiver_container: peloton-archiver
 peloton_archiver_ports:
   - 5295
   - 5395
 peloton_archiver_instance_count: 0
 
+use_host_pool: false
+
 # auto migrates the database schema on host manager startup
 auto_migrate: "true"
 # log verbose level, set to true for debug
 debug: "false"
+
+use_host_pool: false
+
+# K8S Configuration
+k8s_cluster_name: peloton-k8s

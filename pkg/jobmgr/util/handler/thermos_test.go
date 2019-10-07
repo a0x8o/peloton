@@ -27,12 +27,30 @@ import (
 	aurora "github.com/uber/peloton/.gen/thrift/aurora/api"
 
 	"github.com/uber/peloton/pkg/common/config"
+	"github.com/uber/peloton/pkg/common/thermos"
 
 	"github.com/gogo/protobuf/proto"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/thriftrw/ptr"
 )
+
+func TestPortSpecByName(t *testing.T) {
+	ports := []*pod.PortSpec{
+		{Name: "b"},
+		{Name: "c"},
+		{Name: "b"},
+		{Name: "a"},
+	}
+
+	sort.Stable(portSpecByName(ports))
+	assert.Equal(t, []*pod.PortSpec{
+		{Name: "a"},
+		{Name: "b"},
+		{Name: "b"},
+		{Name: "c"},
+	}, ports)
+}
 
 func TestRequiresThermosConvert(t *testing.T) {
 	testCases := []struct {
@@ -450,6 +468,10 @@ func TestRequiresThermosConvert(t *testing.T) {
 							{
 								Name:  "test-env",
 								Value: "test-value",
+							},
+							{
+								Name:  "empty-env",
+								Value: "",
 							},
 						},
 					},
@@ -1724,7 +1746,7 @@ func TestConvertTaskConfigToBinary(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			data, err := convertTaskConfigToBinary(tc.config)
+			data, err := thermos.EncodeTaskConfig(tc.config)
 			if len(tc.wantErr) > 0 {
 				assert.Contains(t, err.Error(), tc.wantErr)
 			} else {

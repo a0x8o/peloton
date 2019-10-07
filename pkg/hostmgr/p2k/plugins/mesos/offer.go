@@ -19,12 +19,14 @@ import (
 	"time"
 
 	mesos "github.com/uber/peloton/.gen/mesos/v1"
-	"github.com/uber/peloton/.gen/peloton/api/v1alpha/peloton"
+
 	hostmgrscalar "github.com/uber/peloton/pkg/hostmgr/scalar"
 	hmutil "github.com/uber/peloton/pkg/hostmgr/util"
 
 	log "github.com/sirupsen/logrus"
 )
+
+var _slackResources = []string{"cpus"}
 
 type offerManager struct {
 	sync.RWMutex
@@ -83,7 +85,7 @@ func (m *offerManager) AddOffers(offers []*mesos.Offer) map[string]struct{} {
 				if r.GetRevocable() == nil {
 					return true
 				}
-				return hmutil.IsSlackResourceType(r.GetName(), nil)
+				return hmutil.IsSlackResourceType(r.GetName(), _slackResources)
 			})
 
 		mesosOffers.unreservedOffers[offerID] = offer
@@ -167,22 +169,17 @@ func (m *offerManager) RemoveOfferForHost(hostname string) {
 	}
 }
 
-func (m *offerManager) GetResources(hostname string) *peloton.Resources {
+func (m *offerManager) GetResources(hostname string) hostmgrscalar.Resources {
 	m.RLock()
 	defer m.RUnlock()
 
 	mesosOffers, ok := m.hostToOffers[hostname]
 	if !ok {
-		return &peloton.Resources{}
+		return hostmgrscalar.Resources{}
 	}
 
-	resources := hmutil.GetResourcesFromOffers(mesosOffers.unreservedOffers)
-	return &peloton.Resources{
-		Cpu:    resources.GetCPU(),
-		MemMb:  resources.GetMem(),
-		DiskMb: resources.GetDisk(),
-		Gpu:    resources.GetGPU(),
-	}
+	// TODO: separate slack and non slack available resources.
+	return hmutil.GetResourcesFromOffers(mesosOffers.unreservedOffers)
 }
 
 func (m *offerManager) Clear() {

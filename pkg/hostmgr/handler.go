@@ -30,25 +30,28 @@ import (
 	pb_eventstream "github.com/uber/peloton/.gen/peloton/private/eventstream"
 	"github.com/uber/peloton/.gen/peloton/private/hostmgr/hostsvc"
 	"github.com/uber/peloton/pkg/common"
+	"github.com/uber/peloton/pkg/common/api"
 	"github.com/uber/peloton/pkg/common/constraints"
-	"github.com/uber/peloton/pkg/common/queue"
 	"github.com/uber/peloton/pkg/common/util"
 	yarpcutil "github.com/uber/peloton/pkg/common/util/yarpc"
 	"github.com/uber/peloton/pkg/hostmgr/config"
-	"github.com/uber/peloton/pkg/hostmgr/factory/task"
+	"github.com/uber/peloton/pkg/hostmgr/goalstate"
 	"github.com/uber/peloton/pkg/hostmgr/host"
 	"github.com/uber/peloton/pkg/hostmgr/hostpool/manager"
 	hostmgr_mesos "github.com/uber/peloton/pkg/hostmgr/mesos"
 	"github.com/uber/peloton/pkg/hostmgr/mesos/yarpc/encoding/mpb"
 	"github.com/uber/peloton/pkg/hostmgr/metrics"
+	"github.com/uber/peloton/pkg/hostmgr/models"
 	"github.com/uber/peloton/pkg/hostmgr/offer"
 	"github.com/uber/peloton/pkg/hostmgr/offer/offerpool"
-	mqueue "github.com/uber/peloton/pkg/hostmgr/queue"
+	"github.com/uber/peloton/pkg/hostmgr/p2k/hostcache"
+	"github.com/uber/peloton/pkg/hostmgr/p2k/plugins"
 	"github.com/uber/peloton/pkg/hostmgr/reserver"
 	"github.com/uber/peloton/pkg/hostmgr/scalar"
 	"github.com/uber/peloton/pkg/hostmgr/summary"
 	hmutil "github.com/uber/peloton/pkg/hostmgr/util"
 	"github.com/uber/peloton/pkg/hostmgr/watchevent"
+	ormobjects "github.com/uber/peloton/pkg/storage/objects"
 
 	"github.com/pkg/errors"
 	log "github.com/sirupsen/logrus"
@@ -81,21 +84,23 @@ var (
 
 // ServiceHandler implements peloton.private.hostmgr.InternalHostService.
 type ServiceHandler struct {
-	schedulerClient        mpb.SchedulerClient
-	operatorMasterClient   mpb.MasterOperatorClient
-	metrics                *metrics.Metrics
-	offerPool              offerpool.Pool
-	frameworkInfoProvider  hostmgr_mesos.FrameworkInfoProvider
-	roleName               string
-	mesosDetector          hostmgr_mesos.MasterDetector
-	reserver               reserver.Reserver
-	hmConfig               config.Config
-	maintenanceQueue       mqueue.MaintenanceQueue // queue containing machineIDs of the machines to be put into maintenance
-	slackResourceTypes     []string
-	maintenanceHostInfoMap host.MaintenanceHostInfoMap
-	watchProcessor         watchevent.WatchProcessor
-	disableKillTasks       atomic.Bool
-	hostPoolManager        manager.HostPoolManager
+	schedulerClient       mpb.SchedulerClient
+	operatorMasterClient  mpb.MasterOperatorClient
+	metrics               *metrics.Metrics
+	offerPool             offerpool.Pool
+	frameworkInfoProvider hostmgr_mesos.FrameworkInfoProvider
+	roleName              string
+	mesosDetector         hostmgr_mesos.MasterDetector
+	reserver              reserver.Reserver
+	hmConfig              config.Config
+	slackResourceTypes    []string
+	watchProcessor        watchevent.WatchProcessor
+	disableKillTasks      atomic.Bool
+	hostPoolManager       manager.HostPoolManager
+	goalStateDriver       goalstate.Driver
+	hostInfoOps           ormobjects.HostInfoOps // DB ops for host_info table
+	hostCache             hostcache.HostCache
+	plugin                plugins.Plugin
 }
 
 // NewServiceHandler creates a new ServiceHandler.
@@ -108,26 +113,30 @@ func NewServiceHandler(
 	mesosConfig hostmgr_mesos.Config,
 	mesosDetector hostmgr_mesos.MasterDetector,
 	hmConfig *config.Config,
-	maintenanceQueue mqueue.MaintenanceQueue,
 	slackResourceTypes []string,
-	maintenanceHostInfoMap host.MaintenanceHostInfoMap,
 	watchProcessor watchevent.WatchProcessor,
 	hostPoolManager manager.HostPoolManager,
+	goalStateDriver goalstate.Driver,
+	hostInfoOps ormobjects.HostInfoOps,
+	hostCache hostcache.HostCache,
+	plugin plugins.Plugin,
 ) *ServiceHandler {
 
 	handler := &ServiceHandler{
-		schedulerClient:        schedulerClient,
-		operatorMasterClient:   masterOperatorClient,
-		metrics:                metrics,
-		offerPool:              offer.GetEventHandler().GetOfferPool(),
-		frameworkInfoProvider:  frameworkInfoProvider,
-		roleName:               mesosConfig.Framework.Role,
-		mesosDetector:          mesosDetector,
-		maintenanceQueue:       maintenanceQueue,
-		slackResourceTypes:     slackResourceTypes,
-		maintenanceHostInfoMap: maintenanceHostInfoMap,
-		watchProcessor:         watchProcessor,
-		hostPoolManager:        hostPoolManager,
+		schedulerClient:       schedulerClient,
+		operatorMasterClient:  masterOperatorClient,
+		metrics:               metrics,
+		offerPool:             offer.GetEventHandler().GetOfferPool(),
+		frameworkInfoProvider: frameworkInfoProvider,
+		roleName:              mesosConfig.Framework.Role,
+		mesosDetector:         mesosDetector,
+		slackResourceTypes:    slackResourceTypes,
+		watchProcessor:        watchProcessor,
+		hostPoolManager:       hostPoolManager,
+		goalStateDriver:       goalStateDriver,
+		hostInfoOps:           hostInfoOps,
+		hostCache:             hostCache,
+		plugin:                plugin,
 	}
 	// Creating Reserver object for handler
 	handler.reserver = reserver.NewReserver(
@@ -222,20 +231,42 @@ func (h *ServiceHandler) GetHostsByQuery(
 	hosts := make([]*hostsvc.GetHostsByQueryResponse_Host, 0, hostSummariesCount)
 	for hostname, hostSummary := range hostSummaries {
 		resources := scalar.FromOffersMapToMesosResources(hostSummary.GetOffers(summary.All))
-		_, nonRevocable := scalar.FilterRevocableMesosResources(resources)
-		nonRevocableResources := scalar.FromMesosResources(nonRevocable)
 
-		if !nonRevocableResources.Compare(resourcesLimit, cmpLess) {
-			continue
+		if !body.GetIncludeRevocable() {
+			_, nonRevocable := scalar.FilterRevocableMesosResources(resources)
+			nonRevocableResources := scalar.FromMesosResources(nonRevocable)
+			if !nonRevocableResources.Compare(resourcesLimit, cmpLess) {
+				continue
+			}
+			hosts = append(hosts, &hostsvc.GetHostsByQueryResponse_Host{
+				Hostname:  hostname,
+				Resources: nonRevocable,
+				Status:    toHostStatus(hostSummary.GetHostStatus()),
+				HeldTasks: hostSummary.GetHeldTask(),
+				Tasks:     hostSummary.GetTasks(),
+			})
+		} else {
+			combined, _ := scalar.FilterMesosResources(
+				resources,
+				func(r *mesos.Resource) bool {
+					if r.GetRevocable() != nil {
+						return true
+					}
+					return !hmutil.IsSlackResourceType(r.GetName(), h.slackResourceTypes)
+				})
+
+			combinedResources := scalar.FromMesosResources(combined)
+			if !combinedResources.Compare(resourcesLimit, cmpLess) {
+				continue
+			}
+			hosts = append(hosts, &hostsvc.GetHostsByQueryResponse_Host{
+				Hostname:  hostname,
+				Resources: combined,
+				Status:    toHostStatus(hostSummary.GetHostStatus()),
+				HeldTasks: hostSummary.GetHeldTask(),
+				Tasks:     hostSummary.GetTasks(),
+			})
 		}
-
-		hosts = append(hosts, &hostsvc.GetHostsByQueryResponse_Host{
-			Hostname:  hostname,
-			Resources: nonRevocable,
-			Status:    toHostStatus(hostSummary.GetHostStatus()),
-			HeldTasks: hostSummary.GetHeldTask(),
-			Tasks:     hostSummary.GetTasks(),
-		})
 	}
 
 	return &hostsvc.GetHostsByQueryResponse{
@@ -727,7 +758,7 @@ func (h *ServiceHandler) LaunchTasks(
 		}
 	}
 
-	offers, err := h.offerPool.ClaimForLaunch(
+	_, err = h.offerPool.ClaimForLaunch(
 		req.GetHostname(),
 		req.GetId().GetValue(),
 		req.GetTasks(),
@@ -735,10 +766,9 @@ func (h *ServiceHandler) LaunchTasks(
 	)
 	if err != nil {
 		log.WithFields(log.Fields{
-			"hostname":        req.GetHostname(),
-			"host_offer_id":   req.GetId(),
-			"mesos_agent_id":  req.GetAgentId(),
-			"offer_resources": scalar.FromOfferMap(offers),
+			"hostname":       req.GetHostname(),
+			"host_offer_id":  req.GetId(),
+			"mesos_agent_id": req.GetAgentId(),
 		}).WithError(err).Error("claim for launch failed")
 		h.metrics.LaunchTasksInvalidOffers.Inc(1)
 
@@ -751,95 +781,33 @@ func (h *ServiceHandler) LaunchTasks(
 		}, errors.Wrap(err, "claim for launch failed")
 	}
 
-	var offerIds []*mesos.OfferID
-	var mesosResources []*mesos.Resource
-	for _, o := range offers {
-		offerIds = append(offerIds, o.GetId())
-		mesosResources = append(mesosResources, o.GetResources()...)
-	}
+	// temporary workaround to add hosts into cache. This step
+	// was part of ClaimForLaunch
+	h.hostCache.AddPodsToHost(req.GetTasks(), req.GetHostname())
 
-	// TODO: Use `offers` so we can support reservation, port picking, etc.
-	log.WithField("offers", offers).Debug("Offers found for launch")
-
-	var mesosTasks []*mesos.TaskInfo
-	var mesosTaskIds []string
-
-	builder := task.NewBuilder(mesosResources)
-	for _, t := range req.GetTasks() {
-		mesosTask, err := builder.Build(t)
+	var launchablePods []*models.LaunchablePod
+	for _, task := range req.GetTasks() {
+		jobID, instanceID, err := util.ParseJobAndInstanceID(task.GetTaskId().GetValue())
 		if err != nil {
-			log.WithFields(log.Fields{
-				"tasks_total":    len(req.GetTasks()),
-				"task":           t.String(),
-				"host_resources": scalar.FromOfferMap(offers),
-				"hostname":       req.GetHostname(),
-				"host_offer_id":  req.GetId().GetValue(),
-			}).WithError(err).Warn("fail to get correct mesos taskinfo")
-			h.metrics.LaunchTasksInvalid.Inc(1)
-
-			// For now, decline all offers to Mesos in the hope that next
-			// call to pool will select some different host.
-			// An alternative is to mark offers on the host as ready.
-			if derr := h.offerPool.DeclineOffers(ctx, offerIds); derr != nil {
-				log.WithError(err).WithFields(log.Fields{
-					"offers":   offerIds,
-					"hostname": req.GetHostname(),
-				}).Warn("cannot decline offers task building error")
-			}
-
-			if err == task.ErrNotEnoughResource {
-				return &hostsvc.LaunchTasksResponse{
-					Error: &hostsvc.LaunchTasksResponse_Error{
-						InvalidOffers: &hostsvc.InvalidOffers{
-							Message: "not enough resource to run task: " + err.Error(),
-						},
-					},
-				}, errors.Wrap(err, "not enough resource to run task")
-			}
-
-			return &hostsvc.LaunchTasksResponse{
-				Error: &hostsvc.LaunchTasksResponse_Error{
-					InvalidArgument: &hostsvc.InvalidArgument{
-						Message: "cannot get Mesos task info: " + err.Error(),
-						InvalidTasks: []*hostsvc.LaunchableTask{
-							t,
-						},
-					},
-				},
-			}, errors.New("cannot get mesos task info")
+			log.WithFields(
+				log.Fields{
+					"mesos_id": task.GetTaskId().GetValue(),
+				}).WithError(err).
+				Error("fail to parse ID when constructing launchable pods in LaunchTask")
+			continue
 		}
 
-		mesosTask.AgentId = req.GetAgentId()
-		mesosTasks = append(mesosTasks, mesosTask)
-		mesosTaskIds = append(mesosTaskIds, mesosTask.GetTaskId().GetValue())
+		launchablePods = append(launchablePods, &models.LaunchablePod{
+			PodId: util.CreatePodIDFromMesosTaskID(task.GetTaskId()),
+			Spec:  api.ConvertTaskConfigToPodSpec(task.GetConfig(), jobID, instanceID),
+			Ports: task.Ports,
+		})
 	}
 
-	callType := sched.Call_ACCEPT
-	opType := mesos.Offer_Operation_LAUNCH
-	msg := &sched.Call{
-		FrameworkId: h.frameworkInfoProvider.GetFrameworkID(ctx),
-		Type:        &callType,
-		Accept: &sched.Call_Accept{
-			OfferIds: offerIds,
-			Operations: []*mesos.Offer_Operation{
-				{
-					Type: &opType,
-					Launch: &mesos.Offer_Operation_Launch{
-						TaskInfos: mesosTasks,
-					},
-				},
-			},
-		},
-	}
-
-	// TODO: add retry / put back offer and tasks in failure scenarios
-	msid := h.frameworkInfoProvider.GetMesosStreamID(ctx)
-	err = h.schedulerClient.Call(msid, msg)
+	launchedPods, err := h.plugin.LaunchPods(ctx, launchablePods, req.GetHostname())
 	if err != nil {
-		h.metrics.LaunchTasksFail.Inc(int64(len(mesosTasks)))
+		h.metrics.LaunchTasksFail.Inc(int64(len(req.GetTasks())))
 		log.WithFields(log.Fields{
-			"tasks":         mesosTasks,
-			"offers":        offerIds,
 			"error":         err,
 			"host_offer_id": req.GetId().GetValue(),
 		}).Warn("Tasks launch failure")
@@ -853,21 +821,15 @@ func (h *ServiceHandler) LaunchTasks(
 		}, errors.Wrap(err, "task launch failed")
 	}
 
-	h.metrics.LaunchTasks.Inc(int64(len(mesosTasks)))
+	h.metrics.LaunchTasks.Inc(int64(len(launchedPods)))
 
 	var taskIDs []string
-	for _, task := range mesosTasks {
-		taskIDs = append(taskIDs, task.GetTaskId().GetValue())
-	}
-
-	var offerIDs []string
-	for _, offer := range offerIds {
-		offerIDs = append(offerIDs, offer.GetValue())
+	for _, pod := range launchedPods {
+		taskIDs = append(taskIDs, pod.PodId.GetValue())
 	}
 
 	log.WithFields(log.Fields{
 		"task_ids":      taskIDs,
-		"offer_ids":     offerIDs,
 		"hostname":      req.GetHostname(),
 		"host_offer_id": req.GetId().GetValue(),
 	}).Info("LaunchTasks")
@@ -1124,47 +1086,17 @@ func (h *ServiceHandler) killTasks(
 		return nil, &hostsvc.KillFailure{Message: "Kill tasks request is disabled"}
 	}
 
-	var wg sync.WaitGroup
-	failedMutex := &sync.Mutex{}
 	var failedTaskIds []*mesos.TaskID
 	var errs []string
 	for _, taskID := range taskIds {
-		wg.Add(1)
-
-		go func(taskID *mesos.TaskID) {
-			defer wg.Done()
-
-			callType := sched.Call_KILL
-			msg := &sched.Call{
-				FrameworkId: h.frameworkInfoProvider.GetFrameworkID(ctx),
-				Type:        &callType,
-				Kill: &sched.Call_Kill{
-					TaskId: taskID,
-				},
-			}
-
-			msid := h.frameworkInfoProvider.GetMesosStreamID(ctx)
-			err := h.schedulerClient.Call(msid, msg)
-			if err != nil {
-				h.metrics.KillTasksFail.Inc(1)
-				log.WithFields(log.Fields{
-					"task_id": taskID,
-					"error":   err,
-				}).Error("Kill task failure")
-
-				failedMutex.Lock()
-				defer failedMutex.Unlock()
-				failedTaskIds = append(failedTaskIds, taskID)
-				errs = append(errs, err.Error())
-				return
-			}
-
+		if err := h.plugin.KillPod(ctx, taskID.GetValue()); err != nil {
+			errs = append(errs, err.Error())
+			failedTaskIds = append(failedTaskIds, taskID)
+			h.metrics.KillTasksFail.Inc(1)
+		} else {
 			h.metrics.KillTasks.Inc(1)
-			log.WithField("task", taskID).Info("Task kill request sent")
-		}(taskID)
+		}
 	}
-
-	wg.Wait()
 
 	if len(failedTaskIds) > 0 {
 		return nil, &hostsvc.KillFailure{
@@ -1427,31 +1359,29 @@ func (h *ServiceHandler) GetDrainingHosts(
 	ctx context.Context,
 	request *hostsvc.GetDrainingHostsRequest,
 ) (*hostsvc.GetDrainingHostsResponse, error) {
-	timeout := time.Duration(request.GetTimeout())
-	var hostnames []string
+	h.metrics.GetDrainingHosts.Inc(1)
 	limit := request.GetLimit()
-	// If limit is not specified, set limit to length of maintenance queue
-	if limit == 0 {
-		limit = uint32(h.maintenanceQueue.Length())
-	}
 
-	for i := uint32(0); i < limit; i++ {
-		hostname, err := h.maintenanceQueue.Dequeue(timeout * time.Millisecond)
-		if err != nil {
-			if _, isTimeout := err.(queue.DequeueTimeOutError); !isTimeout {
-				// error is not due to timeout so we log the error
-				log.WithError(err).
-					Error("unable to dequeue task from maintenance queue")
-				h.metrics.GetDrainingHostsFail.Inc(1)
-				return nil, yarpcerrors.InternalErrorf(err.Error())
-			}
+	// Get all hosts in maintenance from DB
+	hostInfos, err := h.hostInfoOps.GetAll(ctx)
+	if err != nil {
+		h.metrics.GetDrainingHostsFail.Inc(1)
+		return nil, err
+	}
+	// Filter in only hosts in DRAINING state
+	var hostnames []string
+	for _, h := range hostInfos {
+		if limit > 0 && uint32(len(hostnames)) == limit {
 			break
 		}
-		hostnames = append(hostnames, hostname)
-		h.metrics.GetDrainingHosts.Inc(1)
+		if h.GetState() == hpb.HostState_HOST_STATE_DRAINING {
+			hostnames = append(hostnames, h.GetHostname())
+		}
 	}
-	log.WithField("hosts", hostnames).
-		Debug("Maintenance Queue - Dequeued hosts")
+
+	log.WithField("hostnames", hostnames).
+		Debug("draining hosts returned by GetDrainingHosts")
+
 	return &hostsvc.GetDrainingHostsResponse{
 		Hostnames: hostnames,
 	}, nil
@@ -1464,49 +1394,30 @@ func (h *ServiceHandler) MarkHostDrained(
 	ctx context.Context,
 	request *hostsvc.MarkHostDrainedRequest,
 ) (*hostsvc.MarkHostDrainedResponse, error) {
-
-	// Verify the host requested is in DRAINING state
-	var hostInfo *hpb.HostInfo
-	for _, hostInfoDraining := range h.maintenanceHostInfoMap.GetDrainingHostInfos([]string{}) {
-		if hostInfoDraining.GetHostname() == request.GetHostname() {
-			hostInfo = hostInfoDraining
-		}
+	// Get host from DB
+	hostInfo, err := h.hostInfoOps.Get(ctx, request.GetHostname())
+	if err != nil {
+		return nil, err
 	}
-	if hostInfo == nil {
-		// NOOP if host is not in DRAINING state
+	// Validate host current state is DRAINING
+	if hostInfo.GetState() != hpb.HostState_HOST_STATE_DRAINING {
+		log.WithField("hostname", request.GetHostname()).
+			Error("host cannot be marked as drained since it is not in draining state")
 		return nil, yarpcerrors.NotFoundErrorf("Host not in DRAINING state")
 	}
 
-	machineID := &mesos.MachineID{
-		Hostname: &hostInfo.Hostname,
-		Ip:       &hostInfo.Ip,
+	// Update host state to DRAINED in DB
+	if err := h.hostInfoOps.UpdateState(
+		ctx,
+		request.GetHostname(),
+		hpb.HostState_HOST_STATE_DRAINED); err != nil {
+		return nil, err
 	}
 
-	// Start maintenance on the host by posting to
-	// /machine/down endpoint of the Mesos Master
-	if err := h.operatorMasterClient.StartMaintenance([]*mesos.MachineID{machineID}); err != nil {
-		log.WithError(err).
-			WithField("machine", machineID).
-			Error(fmt.Sprintf("failed to down host"))
-		h.metrics.MarkHostDrainedFail.Inc(1)
-		return nil, yarpcerrors.InternalErrorf(err.Error())
-	}
+	log.WithField("hostname", request.GetHostname()).Info("host marked as drained")
 
-	if err := h.maintenanceHostInfoMap.UpdateHostState(
-		machineID.GetHostname(),
-		hpb.HostState_HOST_STATE_DRAINING,
-		hpb.HostState_HOST_STATE_DOWN); err != nil {
-		// log error and add this host to the list of downedHosts since
-		// the Mesos StartMaintenance call was successful. The maintenance
-		// map will converge on reconciliation with Mesos master.
-		log.WithFields(
-			log.Fields{
-				"hostname": machineID.GetHostname(),
-				"from":     hpb.HostState_HOST_STATE_DRAINING.String(),
-				"to":       hpb.HostState_HOST_STATE_DOWN.String(),
-			}).WithError(err).
-			Error("failed to update host state in host map")
-	}
+	// Enqueue into the Goal State Engine
+	h.goalStateDriver.EnqueueHost(request.GetHostname(), time.Now())
 
 	h.metrics.MarkHostDrained.Inc(1)
 	return &hostsvc.MarkHostDrainedResponse{
@@ -1560,6 +1471,14 @@ func (h *ServiceHandler) ReleaseHostsHeldForTasks(
 	return &hostsvc.ReleaseHostsHeldForTasksResponse{}, nil
 }
 
+// GetTasksByHostState gets tasks on hosts in the specified host state.
+func (h *ServiceHandler) GetTasksByHostState(
+	ctx context.Context,
+	req *hostsvc.GetTasksByHostStateRequest,
+) (response *hostsvc.GetTasksByHostStateResponse, err error) {
+	return &hostsvc.GetTasksByHostStateResponse{}, nil
+}
+
 func (h *ServiceHandler) releaseHostsHeldForTasks(taskIDs []*peloton.TaskID) error {
 	var errs []error
 	hostHeldForTasks := make(map[string][]*peloton.TaskID)
@@ -1581,6 +1500,28 @@ func (h *ServiceHandler) releaseHostsHeldForTasks(taskIDs []*peloton.TaskID) err
 	}
 
 	return multierr.Combine(errs...)
+}
+
+// GetHostPoolCapacity fetches the resources for all host-pools.
+func (h *ServiceHandler) GetHostPoolCapacity(
+	ctx context.Context,
+	body *hostsvc.GetHostPoolCapacityRequest,
+) (response *hostsvc.GetHostPoolCapacityResponse, err error) {
+	if h.hostPoolManager == nil {
+		err = yarpcerrors.UnimplementedErrorf("host pools not enabled")
+		return
+	}
+	response = &hostsvc.GetHostPoolCapacityResponse{}
+	for _, p := range h.hostPoolManager.Pools() {
+		cap := p.Capacity()
+		hpResource := &hostsvc.HostPoolResources{
+			PoolName:         p.ID(),
+			PhysicalCapacity: toHostSvcResources(&cap.Physical),
+			SlackCapacity:    toHostSvcResources(&cap.Slack),
+		}
+		response.Pools = append(response.Pools, hpResource)
+	}
+	return
 }
 
 // Helper function to convert scalar.Resource into hostsvc format.

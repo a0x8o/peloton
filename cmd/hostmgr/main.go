@@ -22,6 +22,7 @@ import (
 
 	"github.com/uber/peloton/.gen/peloton/private/resmgrsvc"
 	cqos "github.com/uber/peloton/.gen/qos/v1alpha1"
+
 	"github.com/uber/peloton/pkg/auth"
 	auth_impl "github.com/uber/peloton/pkg/auth/impl"
 	"github.com/uber/peloton/pkg/common"
@@ -36,7 +37,10 @@ import (
 	"github.com/uber/peloton/pkg/common/rpc"
 	"github.com/uber/peloton/pkg/hostmgr"
 	bin_packing "github.com/uber/peloton/pkg/hostmgr/binpacking"
+	"github.com/uber/peloton/pkg/hostmgr/goalstate"
 	"github.com/uber/peloton/pkg/hostmgr/host"
+	"github.com/uber/peloton/pkg/hostmgr/host/drainer"
+	"github.com/uber/peloton/pkg/hostmgr/hostpool/hostmover"
 	"github.com/uber/peloton/pkg/hostmgr/hostpool/manager"
 	"github.com/uber/peloton/pkg/hostmgr/hostsvc"
 	"github.com/uber/peloton/pkg/hostmgr/mesos"
@@ -48,6 +52,7 @@ import (
 	"github.com/uber/peloton/pkg/hostmgr/p2k/hostcache"
 	"github.com/uber/peloton/pkg/hostmgr/p2k/hostmgrsvc"
 	"github.com/uber/peloton/pkg/hostmgr/p2k/plugins"
+	mesosplugins "github.com/uber/peloton/pkg/hostmgr/p2k/plugins/mesos"
 	"github.com/uber/peloton/pkg/hostmgr/p2k/podeventmanager"
 	"github.com/uber/peloton/pkg/hostmgr/p2k/scalar"
 	"github.com/uber/peloton/pkg/hostmgr/queue"
@@ -229,6 +234,10 @@ var (
 		"Enable Host Pool Management").
 		Envar("ENABLE_HOST_POOL").
 		Bool()
+)
+
+const (
+	taskEvictionQueueName = "task-eviction-queue"
 )
 
 func main() {
@@ -559,13 +568,13 @@ func main() {
 		cfg.HostManager.TaskReconcilerConfig,
 	)
 
-	maintenanceHostInfoMap := host.NewMaintenanceHostInfoMap(rootScope)
+	ormobjects.InitHostInfoOps(ormStore)
 
 	loader := host.Loader{
-		OperatorClient:         masterOperatorClient,
-		Scope:                  rootScope.SubScope("hostmap"),
-		SlackResourceTypes:     cfg.HostManager.SlackResourceTypes,
-		MaintenanceHostInfoMap: maintenanceHostInfoMap,
+		OperatorClient:     masterOperatorClient,
+		Scope:              rootScope.SubScope("hostmap"),
+		SlackResourceTypes: cfg.HostManager.SlackResourceTypes,
+		HostInfoOps:        ormobjects.GetHostInfoOps(),
 	}
 
 	backgroundManager := background.NewManager()
@@ -627,41 +636,6 @@ func main() {
 	watchevent.InitWatchProcessor(cfg.HostManager.Watch, metric)
 	watchProcessor := watchevent.GetWatchProcessor()
 
-	// Initialize offer pool event handler with nil host pool manager.
-	// TODO: Refactor event stream handler and move it out of offer package
-	//  to avoid circular dependency, since now offer pool event handler requires
-	//  host pool manager, and host pool manager requires event stream handler
-	//  which is part of offer pool event handler.
-	offer.InitEventHandler(
-		dispatcher,
-		rootScope,
-		schedulerClient,
-		resmgrsvc.NewResourceManagerServiceYARPCClient(
-			dispatcher.ClientConfig(common.PelotonResourceManager)),
-		backgroundManager,
-		defaultRanker,
-		cfg.HostManager,
-		watchProcessor,
-		nil,
-	)
-
-	// Construct host pool manager if it is enabled.
-	var hostPoolManager manager.HostPoolManager
-	if cfg.HostManager.EnableHostPool {
-		hostPoolManager = manager.New(
-			cfg.HostManager.HostPoolReconcileInterval,
-			offer.GetEventHandler().GetEventStreamHandler(),
-			rootScope,
-		)
-		hostPoolManager.Start()
-		defer hostPoolManager.Stop()
-
-		// Set host pool manager in offer pool event handler.
-		offer.GetEventHandler().SetHostPoolManager(hostPoolManager)
-	}
-
-	maintenanceQueue := queue.NewMaintenanceQueue()
-
 	plugin := plugins.NewNoopPlugin()
 	var hostCache hostcache.HostCache
 	podEventCh := make(chan *scalar.PodEvent, plugins.EventChanSize)
@@ -681,6 +655,53 @@ func main() {
 		}
 	}
 
+	// a temporary measure to enable mesos plugins for some usecases,
+	// it is not fully ready to be used for v1alpha handler.
+	mesosPlugin := mesosplugins.NewMesosManager(
+		dispatcher,
+		driver,
+		schedulerClient,
+		masterOperatorClient,
+		cfg.HostManager.HostmapRefreshInterval,
+		time.Duration(cfg.HostManager.OfferHoldTimeSec)*time.Second,
+		rootScope,
+		podEventCh,
+		hostEventCh,
+	)
+
+	// Initialize offer pool event handler with nil host pool manager.
+	// TODO: Refactor event stream handler and move it out of offer package
+	//  to avoid circular dependency, since now offer pool event handler requires
+	//  host pool manager, and host pool manager requires event stream handler
+	//  which is part of offer pool event handler.
+	offer.InitEventHandler(
+		dispatcher,
+		rootScope,
+		schedulerClient,
+		resmgrsvc.NewResourceManagerServiceYARPCClient(
+			dispatcher.ClientConfig(common.PelotonResourceManager)),
+		backgroundManager,
+		defaultRanker,
+		cfg.HostManager,
+		watchProcessor,
+		nil,
+		mesosPlugin,
+	)
+
+	// Construct host pool manager if it is enabled.
+	var hostPoolManager manager.HostPoolManager
+	if cfg.HostManager.EnableHostPool {
+		hostPoolManager = manager.New(
+			cfg.HostManager.HostPoolReconcileInterval,
+			offer.GetEventHandler().GetEventStreamHandler(),
+			ormobjects.GetHostInfoOps(),
+			rootScope,
+		)
+
+		// Set host pool manager in offer pool event handler.
+		offer.GetEventHandler().SetHostPoolManager(hostPoolManager)
+	}
+
 	// Create host cache instance.
 	hostCache = hostcache.New(
 		hostEventCh,
@@ -694,7 +715,8 @@ func main() {
 		plugin,
 		hostCache,
 		cfg.HostManager.TaskUpdateBufferSize,
-		rootScope)
+		rootScope,
+		cfg.K8s.Enabled)
 
 	// Create v1alpha hostmgr internal service handler.
 	hostmgrsvc.NewServiceHandler(
@@ -704,6 +726,27 @@ func main() {
 		hostCache,
 		pem,
 	)
+
+	// Create Goal State Engine driver
+	goalStateDriver := goalstate.NewDriver(
+		ormobjects.GetHostInfoOps(),
+		masterOperatorClient,
+		rootScope,
+		cfg.HostManager.GoalState,
+		hostPoolManager,
+	)
+
+	// Create Host mover object
+	hostMover := hostmover.NewHostMover(
+		hostPoolManager,
+		ormobjects.GetHostInfoOps(),
+		goalStateDriver,
+		rootScope,
+		resmgrsvc.NewResourceManagerServiceYARPCClient(
+			dispatcher.ClientConfig(common.PelotonResourceManager)),
+	)
+
+	taskEvictionQueue := queue.NewTaskQueue(taskEvictionQueueName)
 
 	// Create new hostmgr internal service handler.
 	serviceHandler := hostmgr.NewServiceHandler(
@@ -715,35 +758,37 @@ func main() {
 		cfg.Mesos,
 		mesosMasterDetector,
 		&cfg.HostManager,
-		maintenanceQueue,
 		cfg.HostManager.SlackResourceTypes,
-		maintenanceHostInfoMap,
 		watchProcessor,
 		hostPoolManager,
+		goalStateDriver,
+		ormobjects.GetHostInfoOps(),
+		hostCache,
+		mesosPlugin,
 	)
 
-	drainer := host.NewDrainer(
+	hostDrainer := drainer.NewDrainer(
 		cfg.HostManager.HostDrainerPeriod,
 		cfg.Mesos.Framework.Role,
 		masterOperatorClient,
-		maintenanceQueue,
-		maintenanceHostInfoMap,
+		goalStateDriver,
+		ormobjects.GetHostInfoOps(),
+		taskEvictionQueue,
 	)
 
 	hostsvc.InitServiceHandler(
 		dispatcher,
 		rootScope,
-		drainer,
+		hostDrainer,
 		hostPoolManager,
+		hostMover,
 	)
 
 	recoveryHandler := hostmgr.NewRecoveryHandler(
 		rootScope,
 		store,
 		ormStore,
-		maintenanceQueue,
-		masterOperatorClient,
-		maintenanceHostInfoMap,
+		hostCache,
 	)
 
 	server := hostmgr.NewServer(
@@ -756,11 +801,13 @@ func main() {
 		mOutbound,
 		reconciler,
 		recoveryHandler,
-		drainer,
+		hostDrainer,
 		serviceHandler.GetReserver(),
 		watchProcessor,
 		plugin,
 		hostCache,
+		mesosPlugin,
+		hostPoolManager,
 	)
 	server.Start()
 

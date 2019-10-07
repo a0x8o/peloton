@@ -20,6 +20,7 @@ import (
 	"time"
 
 	mesos "github.com/uber/peloton/.gen/mesos/v1"
+	mesosmaster "github.com/uber/peloton/.gen/mesos/v1/master"
 	sched "github.com/uber/peloton/.gen/mesos/v1/scheduler"
 	"github.com/uber/peloton/.gen/peloton/api/v1alpha/peloton"
 	pbpod "github.com/uber/peloton/.gen/peloton/api/v1alpha/pod"
@@ -29,6 +30,7 @@ import (
 	mpbmocks "github.com/uber/peloton/pkg/hostmgr/mesos/yarpc/encoding/mpb/mocks"
 	"github.com/uber/peloton/pkg/hostmgr/models"
 	"github.com/uber/peloton/pkg/hostmgr/p2k/scalar"
+	hmscalar "github.com/uber/peloton/pkg/hostmgr/scalar"
 
 	"github.com/golang/mock/gomock"
 	"github.com/pborman/uuid"
@@ -278,9 +280,9 @@ func (suite *MesosManagerTestSuite) TestNewMesosManagerOffersSameHost() {
 
 	he := <-suite.hostEventCh
 	suite.Equal(he.GetEventType(), scalar.UpdateHostAvailableRes)
-	suite.Equal(he.GetHostInfo().GetAvailable(), &peloton.Resources{
-		Cpu:   3.0,
-		MemMb: 400.0,
+	suite.Equal(he.GetHostInfo().GetAvailable().NonSlack, hmscalar.Resources{
+		CPU: 3.0,
+		Mem: 400.0,
 	})
 	suite.Equal(he.GetHostInfo().GetHostName(), host)
 }
@@ -350,16 +352,16 @@ func (suite *MesosManagerTestSuite) TestNewMesosManagerOffersMultipleHost() {
 	}
 
 	suite.Equal(host1Event.GetEventType(), scalar.UpdateHostAvailableRes)
-	suite.Equal(host1Event.GetHostInfo().GetAvailable(), &peloton.Resources{
-		Cpu:   1.0,
-		MemMb: 100.0,
+	suite.Equal(host1Event.GetHostInfo().GetAvailable().NonSlack, hmscalar.Resources{
+		CPU: 1.0,
+		Mem: 100.0,
 	})
 	suite.Equal(host1Event.GetHostInfo().GetHostName(), host1)
 
 	suite.Equal(host2Event.GetEventType(), scalar.UpdateHostAvailableRes)
-	suite.Equal(host2Event.GetHostInfo().GetAvailable(), &peloton.Resources{
-		Cpu:   2.0,
-		MemMb: 300.0,
+	suite.Equal(host2Event.GetHostInfo().GetAvailable().NonSlack, hmscalar.Resources{
+		CPU: 2.0,
+		Mem: 300.0,
 	})
 	suite.Equal(host2Event.GetHostInfo().GetHostName(), host2)
 }
@@ -407,9 +409,9 @@ func (suite *MesosManagerTestSuite) TestNewMesosManagerRescindOffer() {
 
 	he := <-suite.hostEventCh
 	suite.Equal(he.GetEventType(), scalar.UpdateHostAvailableRes)
-	suite.Equal(he.GetHostInfo().GetAvailable(), &peloton.Resources{
-		Cpu:   3.0,
-		MemMb: 400.0,
+	suite.Equal(he.GetHostInfo().GetAvailable().NonSlack, hmscalar.Resources{
+		CPU: 3.0,
+		Mem: 400.0,
 	})
 	suite.Equal(he.GetHostInfo().GetHostName(), host)
 
@@ -421,9 +423,9 @@ func (suite *MesosManagerTestSuite) TestNewMesosManagerRescindOffer() {
 	})
 	he = <-suite.hostEventCh
 	suite.Equal(he.GetEventType(), scalar.UpdateHostAvailableRes)
-	suite.Equal(he.GetHostInfo().GetAvailable(), &peloton.Resources{
-		Cpu:   2.0,
-		MemMb: 300.0,
+	suite.Equal(he.GetHostInfo().GetAvailable().NonSlack, hmscalar.Resources{
+		CPU: 2.0,
+		Mem: 300.0,
 	})
 	suite.Equal(he.GetHostInfo().GetHostName(), host)
 
@@ -435,9 +437,9 @@ func (suite *MesosManagerTestSuite) TestNewMesosManagerRescindOffer() {
 	})
 	he = <-suite.hostEventCh
 	suite.Equal(he.GetEventType(), scalar.UpdateHostAvailableRes)
-	suite.Equal(he.GetHostInfo().GetAvailable(), &peloton.Resources{
-		Cpu:   0.0,
-		MemMb: 0.0,
+	suite.Equal(he.GetHostInfo().GetAvailable().NonSlack, hmscalar.Resources{
+		CPU: 0.0,
+		Mem: 0.0,
 	})
 	suite.Equal(he.GetHostInfo().GetHostName(), host)
 }
@@ -471,9 +473,9 @@ func (suite *MesosManagerTestSuite) TestNewMesosManagerRescindNonexistentOffer()
 
 	he := <-suite.hostEventCh
 	suite.Equal(he.GetEventType(), scalar.UpdateHostAvailableRes)
-	suite.Equal(he.GetHostInfo().GetAvailable(), &peloton.Resources{
-		Cpu:   1.0,
-		MemMb: 100.0,
+	suite.Equal(he.GetHostInfo().GetAvailable().NonSlack, hmscalar.Resources{
+		CPU: 1.0,
+		Mem: 100.0,
 	})
 	suite.Equal(he.GetHostInfo().GetHostName(), host)
 
@@ -485,9 +487,9 @@ func (suite *MesosManagerTestSuite) TestNewMesosManagerRescindNonexistentOffer()
 	})
 	he = <-suite.hostEventCh
 	suite.Equal(he.GetEventType(), scalar.UpdateHostAvailableRes)
-	suite.Equal(he.GetHostInfo().GetAvailable(), &peloton.Resources{
-		Cpu:   0.0,
-		MemMb: 0.0,
+	suite.Equal(he.GetHostInfo().GetAvailable().NonSlack, hmscalar.Resources{
+		CPU: 0.0,
+		Mem: 0.0,
 	})
 	suite.Equal(he.GetHostInfo().GetHostName(), host)
 
@@ -522,21 +524,25 @@ func (suite *MesosManagerTestSuite) TestNewMesosManagerRescindNonexistentOffer()
 
 // TestNewMesosManagerStatusUpdates tests receiving task status update events.
 func (suite *MesosManagerTestSuite) TestNewMesosManagerStatusUpdates() {
-	host1 := "hostname1"
-	uuid1 := uuid.New()
+	hostname1 := "hostname1"
+	agentID1 := uuid.New()
+	taskID1 := uuid.New()
 	state := mesos.TaskState_TASK_STARTING
 	eventID := []byte{201, 117, 104, 168, 54, 76, 69, 143, 185, 116, 159, 95, 198, 94, 162, 38}
 
 	status := &mesos.TaskStatus{
 		TaskId: &mesos.TaskID{
-			Value: &uuid1,
+			Value: &taskID1,
 		},
 		State: &state,
 		AgentId: &mesos.AgentID{
-			Value: &host1,
+			Value: &agentID1,
 		},
 		Uuid: eventID,
 	}
+
+	// store the map of agentID -> hostname, either wise event would be discarded
+	suite.mesosManager.agentIDToHostname.Store(agentID1, hostname1)
 
 	suite.mesosManager.Update(context.Background(), &sched.Event{
 		Update: &sched.Event_Update{
@@ -548,13 +554,96 @@ func (suite *MesosManagerTestSuite) TestNewMesosManagerStatusUpdates() {
 
 	suite.Equal(pe.EventType, scalar.UpdatePod)
 	suite.Equal(pe.EventID, string(eventID))
-	suite.Equal(pe.Event.GetHostname(), host1)
-	suite.Equal(pe.Event.GetAgentId(), host1)
-	suite.Equal(pe.Event.GetPodId().GetValue(), uuid1)
+	suite.Equal(pe.Event.GetHostname(), hostname1)
+	suite.Equal(pe.Event.GetAgentId(), agentID1)
+	suite.Equal(pe.Event.GetPodId().GetValue(), taskID1)
 	suite.Equal(
 		pe.Event.GetActualState(),
 		pbpod.PodState_POD_STATE_STARTING.String(),
 	)
+}
+
+// TestMesosManagerStatusUpdatesWithoutAgentIDMap tests receiving task status update events,
+// but cannot find corresponding hostname with the agent ID. No event would be sent in this case.
+func (suite *MesosManagerTestSuite) TestMesosManagerStatusUpdatesWithoutAgentIDMap() {
+	agentID1 := uuid.New()
+	taskID1 := uuid.New()
+	state := mesos.TaskState_TASK_STARTING
+	eventID := []byte{201, 117, 104, 168, 54, 76, 69, 143, 185, 116, 159, 95, 198, 94, 162, 38}
+
+	status := &mesos.TaskStatus{
+		TaskId: &mesos.TaskID{
+			Value: &taskID1,
+		},
+		State: &state,
+		AgentId: &mesos.AgentID{
+			Value: &agentID1,
+		},
+		Uuid: eventID,
+	}
+
+	suite.mesosManager.Update(context.Background(), &sched.Event{
+		Update: &sched.Event_Update{
+			Status: status,
+		},
+	})
+
+	select {
+	case <-suite.podEventCh:
+		suite.Fail("no event should be received")
+	default:
+		break
+	}
+}
+
+// TestNewMesosManagerStartProcessingAgentInfo tests that startProcessAgentInfo can
+// process agent info sent via agentCh correctly
+func (suite *MesosManagerTestSuite) TestNewMesosManagerStartProcessingAgentInfo() {
+	cpuName := "cpus"
+
+	hostname1 := "hostname1"
+	agentID1 := uuid.New()
+	cpu1 := 4.0
+
+	hostname2 := "hostname2"
+	agentID2 := uuid.New()
+	cpu2 := 8.0
+
+	suite.mesosManager.lf.Start()
+
+	agentCh := make(chan []*mesosmaster.Response_GetAgents_Agent, 2)
+	agentCh <- []*mesosmaster.Response_GetAgents_Agent{
+		{
+			AgentInfo: &mesos.AgentInfo{
+				Hostname: &hostname1,
+				Id:       &mesos.AgentID{Value: &agentID1},
+			},
+			TotalResources: []*mesos.Resource{{
+				Name:   &cpuName,
+				Scalar: &mesos.Value_Scalar{Value: &cpu1},
+			}},
+		},
+		{
+			AgentInfo:      &mesos.AgentInfo{Hostname: &hostname2, Id: &mesos.AgentID{Value: &agentID2}},
+			TotalResources: []*mesos.Resource{{Name: &cpuName, Scalar: &mesos.Value_Scalar{Value: &cpu2}}},
+		},
+	}
+	suite.mesosManager.startProcessAgentInfo(agentCh)
+
+	suite.mesosManager.lf.Stop()
+
+	hs1, ok := suite.mesosManager.agentIDToHostname.Load(agentID1)
+	suite.True(ok)
+	suite.Equal(hostname1, hs1)
+
+	hs2, ok := suite.mesosManager.agentIDToHostname.Load(agentID2)
+	suite.True(ok)
+	suite.Equal(hostname2, hs2)
+
+	he1 := <-suite.hostEventCh
+	suite.Equal(he1.GetHostInfo().GetCapacity().NonSlack.CPU, cpu1)
+	he2 := <-suite.hostEventCh
+	suite.Equal(he2.GetHostInfo().GetCapacity().NonSlack.CPU, cpu2)
 }
 
 func newTestPelotonPodSpec(podName string) *pbpod.PodSpec {

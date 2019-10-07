@@ -5,22 +5,21 @@ from tests.integration.aurorabridge_test.util import delete_jobs
 from tests.integration.conftest import (
     setup_minicluster,
     teardown_minicluster,
-    wait_for_all_agents_to_register,
 )
 
 
 @pytest.fixture(scope="session", autouse=True)
-def bootstrap_cluster(request):
+def minicluster(request):
     tests_failed_before_module = request.session.testsfailed
-    setup_minicluster()
+    cluster = setup_minicluster()
 
-    yield
+    yield cluster
 
     dump_logs = False
     if (request.session.testsfailed - tests_failed_before_module) > 0:
         dump_logs = True
 
-    teardown_minicluster(dump_logs)
+    teardown_minicluster(cluster, dump_logs)
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -32,8 +31,8 @@ def setup_cluster(request):
 
 
 @pytest.fixture
-def client():
-    wait_for_all_agents_to_register()
+def client(minicluster):
+    minicluster.wait_for_all_agents_to_register()
     client = Client()
 
     yield client

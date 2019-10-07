@@ -20,10 +20,14 @@ import (
 
 	"github.com/uber/peloton/.gen/peloton/api/v1alpha/peloton"
 	pbpod "github.com/uber/peloton/.gen/peloton/api/v1alpha/pod"
+	"github.com/uber/peloton/.gen/peloton/private/hostmgr/hostsvc"
 	hostmgr "github.com/uber/peloton/.gen/peloton/private/hostmgr/v1alpha"
+	"github.com/uber/peloton/pkg/common/api"
 	"github.com/uber/peloton/pkg/common/background"
 	"github.com/uber/peloton/pkg/common/lifecycle"
+	"github.com/uber/peloton/pkg/common/util"
 	"github.com/uber/peloton/pkg/hostmgr/models"
+	"github.com/uber/peloton/pkg/hostmgr/p2k/hostcache/hostsummary"
 	"github.com/uber/peloton/pkg/hostmgr/p2k/scalar"
 	hmscalar "github.com/uber/peloton/pkg/hostmgr/scalar"
 
@@ -67,7 +71,7 @@ type HostCache interface {
 
 	// GetSummaries returns a list of host summaries that the host cache is
 	// managing.
-	GetSummaries() (summaries []HostSummary)
+	GetSummaries() (summaries []hostsummary.HostSummary)
 
 	// HandlePodEvent is called by pod events manager on receiving a pod event.
 	HandlePodEvent(event *scalar.PodEvent)
@@ -92,6 +96,20 @@ type HostCache interface {
 	// For example, ports should not be removed after a failed launch,
 	// otherwise the ports are leaked.
 	CompleteLaunchPod(hostname string, pod *models.LaunchablePod) error
+
+	// RecoverPodInfo updates pods info running on a particular host,
+	// it is used only when hostsummary needs to recover the info
+	// upon restart
+	RecoverPodInfoOnHost(
+		id *peloton.PodID,
+		hostname string,
+		state pbpod.PodState,
+		spec *pbpod.PodSpec,
+	)
+
+	// AddPodsToHost is a temporary method to add host entries in host cache.
+	// It would be removed after CompleteLease is called when launching pod.
+	AddPodsToHost(tasks []*hostsvc.LaunchableTask, hostname string)
 }
 
 // hostCache is an implementation of HostCache interface.
@@ -99,7 +117,7 @@ type hostCache struct {
 	mu sync.RWMutex
 
 	// Map of hostname to HostSummary.
-	hostIndex map[string]HostSummary
+	hostIndex map[string]hostsummary.HostSummary
 
 	// Map of podID to host held.
 	podHeldIndex map[string]string
@@ -125,7 +143,7 @@ func New(
 	parent tally.Scope,
 ) HostCache {
 	return &hostCache{
-		hostIndex:     make(map[string]HostSummary),
+		hostIndex:     make(map[string]hostsummary.HostSummary),
 		podHeldIndex:  make(map[string]string),
 		hostEventCh:   hostEventCh,
 		lifecycle:     lifecycle.NewLifeCycle(),
@@ -134,11 +152,11 @@ func New(
 	}
 }
 
-func (c *hostCache) GetSummaries() []HostSummary {
+func (c *hostCache) GetSummaries() []hostsummary.HostSummary {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
-	summaries := make([]HostSummary, 0, len(c.hostIndex))
+	summaries := make([]hostsummary.HostSummary, 0, len(c.hostIndex))
 	for _, summary := range c.hostIndex {
 		summaries = append(summaries, summary)
 	}
@@ -157,13 +175,13 @@ func (c *hostCache) AcquireLeases(
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
-	matcher := NewMatcher(hostFilter)
+	matcher := hostsummary.NewMatcher(hostFilter)
 
 	// If host hint is provided, try to return the hosts in hints first.
 	for _, filterHints := range hostFilter.GetHint().GetHostHint() {
 		if hs, ok := c.hostIndex[filterHints.GetHostname()]; ok {
-			matcher.tryMatch(hs.GetHostname(), hs)
-			if matcher.hostLimitReached() {
+			matcher.TryMatch(hs.GetHostname(), hs)
+			if matcher.HostLimitReached() {
 				break
 			}
 		}
@@ -171,15 +189,15 @@ func (c *hostCache) AcquireLeases(
 
 	// TODO: implement defrag/firstfit ranker, for now default to first fit
 	for hostname, hs := range c.hostIndex {
-		matcher.tryMatch(hostname, hs)
-		if matcher.hostLimitReached() {
+		matcher.TryMatch(hostname, hs)
+		if matcher.HostLimitReached() {
 			break
 		}
 	}
 
 	var hostLeases []*hostmgr.HostLease
-	hostLimitReached := matcher.hostLimitReached()
-	for _, hostname := range matcher.hostNames {
+	hostLimitReached := matcher.HostLimitReached()
+	for _, hostname := range matcher.GetHostNames() {
 		hs := c.hostIndex[hostname]
 		hostLeases = append(hostLeases, hs.GetHostLease())
 	}
@@ -189,10 +207,10 @@ func (c *hostCache) AcquireLeases(
 		log.WithFields(log.Fields{
 			"host_filter":         hostFilter,
 			"matched_host_leases": hostLeases,
-			"match_result_counts": matcher.filterCounts,
+			"match_result_counts": matcher.GetFilterCounts(),
 		}).Debug("Number of hosts matched is fewer than max hosts")
 	}
-	return hostLeases, matcher.filterCounts
+	return hostLeases, matcher.GetFilterCounts()
 }
 
 // TerminateLease is called when a lease that was previously acquired, and a
@@ -262,9 +280,10 @@ func (c *hostCache) GetClusterCapacity() (
 
 	// Go through the hostIndex and calculate capacity and allocation
 	// and sum it up to get these at a cluster level
+	// TODO: do this for slack resources too.
 	for _, hs := range c.hostIndex {
-		capacity = capacity.Add(hs.GetCapacity())
-		allocation = allocation.Add(hs.GetAllocated())
+		capacity = capacity.Add(hs.GetCapacity().NonSlack)
+		allocation = allocation.Add(hs.GetAllocated().NonSlack)
 	}
 	return
 }
@@ -351,14 +370,14 @@ func (c *hostCache) RefreshMetrics() {
 
 	for _, h := range hosts {
 		allocated, capacity := h.GetAllocated(), h.GetCapacity()
-		available, _ := capacity.TrySubtract(allocated)
-		totalAllocated = totalAllocated.Add(allocated)
+		available, _ := capacity.NonSlack.TrySubtract(allocated.NonSlack)
+		totalAllocated = totalAllocated.Add(allocated.NonSlack)
 		totalAvailable = totalAvailable.Add(available)
 
 		switch h.GetHostStatus() {
-		case ReadyHost:
+		case hostsummary.ReadyHost:
 			readyHosts++
-		case PlacingHost:
+		case hostsummary.PlacingHost:
 			placingHosts++
 		}
 		if len(h.GetHeldPods()) > 0 {
@@ -406,7 +425,7 @@ func (c *hostCache) CompleteLaunchPod(hostname string, pod *models.LaunchablePod
 
 // getSummary returns host summary given name. If the host does not exist,
 // return error not found.
-func (c *hostCache) getSummary(hostname string) (HostSummary, error) {
+func (c *hostCache) getSummary(hostname string) (hostsummary.HostSummary, error) {
 	hs, ok := c.hostIndex[hostname]
 	if !ok {
 		// TODO: metrics
@@ -495,7 +514,7 @@ func (c *hostCache) addHost(event *scalar.HostEvent) {
 
 	// TODO: figure out how to differemtiate mesos/k8s hosts,
 	// now addHost is only used by k8s hosts
-	c.hostIndex[hostInfo.GetHostName()] = newKubeletHostSummary(
+	c.hostIndex[hostInfo.GetHostName()] = hostsummary.NewKubeletHostSummary(
 		hostInfo.GetHostName(),
 		capacity,
 		version,
@@ -511,7 +530,7 @@ func (c *hostCache) updateHostSpec(event *scalar.HostEvent) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	var hs HostSummary
+	var hs hostsummary.HostSummary
 	var ok bool
 
 	hostInfo := event.GetHostInfo()
@@ -544,8 +563,7 @@ func (c *hostCache) updateHostSpec(event *scalar.HostEvent) {
 		return
 	}
 
-	r := hmscalar.FromPelotonResources(capacity)
-	hs.SetCapacity(r)
+	hs.SetCapacity(capacity)
 	hs.SetVersion(evtVersion)
 	log.WithFields(log.Fields{
 		"hostname": hostInfo.GetHostName(),
@@ -591,7 +609,7 @@ func (c *hostCache) updateAgent(event *scalar.HostEvent) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	var hs HostSummary
+	var hs hostsummary.HostSummary
 	var ok bool
 
 	hostInfo := event.GetHostInfo()
@@ -600,12 +618,11 @@ func (c *hostCache) updateAgent(event *scalar.HostEvent) {
 	hs, ok = c.hostIndex[hostInfo.GetHostName()]
 
 	if !ok {
-		hs = newMesosHostSummary(hostInfo.GetHostName(), evtVersion)
+		hs = hostsummary.NewMesosHostSummary(hostInfo.GetHostName())
 		c.hostIndex[hostInfo.GetHostName()] = hs
 	}
 
-	r := hmscalar.FromPelotonResources(hostInfo.GetCapacity())
-	hs.SetCapacity(r)
+	hs.SetCapacity(hostInfo.GetCapacity())
 	hs.SetVersion(evtVersion)
 	log.WithFields(log.Fields{
 		"hostname":  hostInfo.GetHostName(),
@@ -619,7 +636,7 @@ func (c *hostCache) updateHostAvailable(event *scalar.HostEvent) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	var hs HostSummary
+	var hs hostsummary.HostSummary
 	var ok bool
 
 	hostInfo := event.GetHostInfo()
@@ -628,12 +645,11 @@ func (c *hostCache) updateHostAvailable(event *scalar.HostEvent) {
 	hs, ok = c.hostIndex[hostInfo.GetHostName()]
 
 	if !ok {
-		hs = newMesosHostSummary(hostInfo.GetHostName(), evtVersion)
+		hs = hostsummary.NewMesosHostSummary(hostInfo.GetHostName())
 		c.hostIndex[hostInfo.GetHostName()] = hs
 	}
 
-	r := hmscalar.FromPelotonResources(hostInfo.GetAvailable())
-	hs.SetAvailable(r)
+	hs.SetAvailable(hostInfo.GetAvailable())
 	hs.SetVersion(evtVersion)
 	log.WithFields(log.Fields{
 		"hostname":  hostInfo.GetHostName(),
@@ -688,4 +704,52 @@ func (c *hostCache) Stop() {
 func (c *hostCache) Reconcile() error {
 	// TODO: Implement
 	return nil
+}
+
+// RecoverPodInfo updates pods info running on a particular host,
+// it is used only when hostsummary needs to recover the info
+// upon restart
+func (c *hostCache) RecoverPodInfoOnHost(
+	id *peloton.PodID,
+	hostname string,
+	state pbpod.PodState,
+	spec *pbpod.PodSpec,
+) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	var hs hostsummary.HostSummary
+	hs, ok := c.hostIndex[hostname]
+	if !ok {
+		if spec.GetMesosSpec() != nil {
+			hs = hostsummary.NewMesosHostSummary(hostname)
+		} else {
+			// TODO: populate capacity and version correctly
+			hs = hostsummary.NewKubeletHostSummary(hostname, models.HostResources{}, "")
+		}
+		c.hostIndex[hostname] = hs
+	}
+
+	hs.RecoverPodInfo(id, state, spec)
+}
+
+// AddPodsToHost is a temporary method to add host entries in host cache.
+// It would be removed after CompleteLease is called when launching pod.
+func (c *hostCache) AddPodsToHost(tasks []*hostsvc.LaunchableTask, hostname string) {
+	for _, lt := range tasks {
+		jobID, instanceID, err := util.ParseJobAndInstanceID(lt.GetTaskId().GetValue())
+		if err != nil {
+			log.WithFields(log.Fields{
+				"mesos_id": lt.GetTaskId().GetValue(),
+			}).WithError(err).Error("fail to parse ID when RecoverPodInfoOnHost in LaunchTask")
+			continue
+		}
+
+		c.RecoverPodInfoOnHost(
+			util.CreatePodIDFromMesosTaskID(lt.GetTaskId()),
+			hostname,
+			pbpod.PodState_POD_STATE_LAUNCHED,
+			api.ConvertTaskConfigToPodSpec(lt.GetConfig(), jobID, instanceID),
+		)
+	}
 }

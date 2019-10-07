@@ -386,7 +386,18 @@ func (h *serviceHandler) RestartPod(
 	runtimeDiff[instanceID] = jobmgrcommon.RuntimeDiff{
 		jobmgrcommon.DesiredMesosTaskIDField: newPodID,
 	}
-	_, instancesToRetry, err := cachedJob.PatchTasks(ctx, runtimeDiff, false)
+
+	if req.GetCheckSla() {
+		runtimeDiff[instanceID][jobmgrcommon.TerminationStatusField] = &pbtask.TerminationStatus{
+			Reason: pbtask.TerminationStatus_TERMINATION_STATUS_REASON_KILLED_FOR_SLA_AWARE_RESTART,
+		}
+	} else {
+		runtimeDiff[instanceID][jobmgrcommon.TerminationStatusField] = &pbtask.TerminationStatus{
+			Reason: pbtask.TerminationStatus_TERMINATION_STATUS_REASON_KILLED_FOR_RESTART,
+		}
+	}
+
+	instancesSucceeded, instancesToRetry, err := cachedJob.PatchTasks(ctx, runtimeDiff, false)
 
 	// We should enqueue the tasks even if PatchTasks fail,
 	// because some tasks may get updated successfully in db.
@@ -399,6 +410,11 @@ func (h *serviceHandler) RestartPod(
 
 	if err == nil && len(instancesToRetry) != 0 {
 		return nil, _errPodNotInCache
+	}
+
+	// the restart would violate SLA
+	if req.GetCheckSla() && len(instancesSucceeded) == 0 {
+		return nil, yarpcerrors.AbortedErrorf("pod restart would violate SLA")
 	}
 
 	return &svc.RestartPodResponse{}, err
@@ -508,7 +524,7 @@ func (h *serviceHandler) GetPodEvents(
 		return nil, err
 	}
 
-	taskEvents, err := h.podEventsOps.GetAll(
+	podEvents, err := h.podStore.GetPodEvents(
 		ctx,
 		jobID,
 		instanceID,
@@ -518,7 +534,7 @@ func (h *serviceHandler) GetPodEvents(
 	}
 
 	return &svc.GetPodEventsResponse{
-		Events: api.ConvertTaskEventsToPodEvents(taskEvents),
+		Events: podEvents,
 	}, nil
 }
 
@@ -767,18 +783,18 @@ func (h *serviceHandler) getHostInfo(
 	instanceID uint32,
 	podID string,
 ) (hostname, podid, agentID string, err error) {
-	taskEvents, err := h.podEventsOps.GetAll(ctx, jobID, instanceID, podID)
+	podEvents, err := h.podStore.GetPodEvents(ctx, jobID, instanceID, podID)
 	if err != nil {
 		return "", "", "", errors.Wrap(err, "failed to get pod events")
 	}
 
 	hostname = ""
 	agentID = ""
-	for _, event := range taskEvents {
-		podid = event.GetTaskId().GetValue()
-		if event.GetActualState() == jobmgrtask.GetDefaultTaskGoalState(pbjob.JobType_SERVICE).String() {
+	for _, event := range podEvents {
+		podid = event.GetPodId().GetValue()
+		if event.GetActualState() == jobmgrtask.GetDefaultPodGoalState(pbjob.JobType_SERVICE).String() {
 			hostname = event.GetHostname()
-			agentID = event.GetAgentID()
+			agentID = event.GetAgentId()
 			break
 		}
 	}
@@ -861,12 +877,10 @@ func (h *serviceHandler) getPodInfoForAllPodRuns(
 
 	pID := podID.GetValue()
 	for {
-		taskEvents, err := h.podEventsOps.GetAll(ctx, jobID, instanceID, pID)
+		podEvents, err := h.podStore.GetPodEvents(ctx, jobID, instanceID, pID)
 		if err != nil {
 			return nil, err
 		}
-
-		podEvents := api.ConvertTaskEventsToPodEvents(taskEvents)
 
 		if len(podEvents) == 0 {
 			break

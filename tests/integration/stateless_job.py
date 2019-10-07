@@ -50,7 +50,7 @@ class StatelessJob(object):
         self.config = config or IntegrationTestConfig(
             pool_file='test_stateless_respool.yaml')
         self.client = client or Client()
-        self.pool = pool or Pool(self.config, self.client)
+        self.pool = pool or Pool(self.config, client=self.client)
         self.job_id = job_id
         self.entity_version = None
         self.job_spec = None
@@ -66,6 +66,27 @@ class StatelessJob(object):
             job_spec = stateless.JobSpec()
             json_format.ParseDict(job_spec_dump, job_spec)
             self.job_spec = job_spec
+
+    def set_config(self, config):
+        self.config = config
+        self.pool = Pool(self.config, client=self.client)
+        return self
+
+    def set_command(self, cmd, args=None, ctn=0):
+        if self.job_spec.default_spec.mesos_spec.shell:
+            self.job_spec.default_spec.containers[ctn].entrypoint.value = ' '.join(
+                [cmd] + args)
+        else:
+            self.job_spec.default_spec.containers[ctn].entrypoint.value = cmd
+            self.job_spec.default_spec.containers[ctn].entrypoint.arguments.extend(
+                args)
+        return self
+
+    def set_resources(self, cpu, mem, disk, ctn=0):
+        self.job_spec.default_spec.containers[ctn].resource.cpu_limit = cpu
+        self.job_spec.default_spec.containers[ctn].resource.mem_limit_mb = mem
+        self.job_spec.default_spec.containers[ctn].resource.disk_limit_mb = disk
+        return self
 
     def create(self):
         """
@@ -800,11 +821,11 @@ def query_jobs(respool_path=None, client=None):
     return jobs
 
 
-def get_job_from_job_name(job_name):
+def get_job_from_job_name(job_name, client=None):
     """
     Get the job id from job name.
     """
-    client = Client()
+    client = client or Client()
     request = stateless_svc.GetJobIDFromJobNameRequest(
         job_name=job_name
     )
@@ -820,11 +841,11 @@ def get_job_from_job_name(job_name):
     return StatelessJob(job_id=resp.job_id[0].value)
 
 
-def list_jobs():
+def list_jobs(client=None):
     """
     return all jobs in the cluster
     """
-    client = Client()
+    client = client or Client()
     jobSummaries = []
     request = stateless_svc.ListJobsRequest()
     for resp in client.stateless_svc.ListJobs(

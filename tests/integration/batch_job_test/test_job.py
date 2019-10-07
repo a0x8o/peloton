@@ -12,8 +12,9 @@ pytestmark = [
 
 
 @pytest.mark.smoketest
-def test__create_batch_job():
+def test__create_batch_job(peloton_client):
     job = Job(
+        client=peloton_client,
         job_file="test_job_no_container.yaml",
         config=IntegrationTestConfig(max_retry_attempts=100),
     )
@@ -22,15 +23,21 @@ def test__create_batch_job():
 
 
 @pytest.mark.smoketest
-def test__create_job():
-    job = Job(config=IntegrationTestConfig(max_retry_attempts=100))
+def test__create_job(peloton_client):
+    job = Job(
+        client=peloton_client,
+        config=IntegrationTestConfig(max_retry_attempts=100)
+    )
     job.create()
     job.wait_for_state()
 
 
 @pytest.mark.smoketest
-def test__create_job_without_default_config():
-    job = Job(config=IntegrationTestConfig(max_retry_attempts=100))
+def test__create_job_without_default_config(peloton_client):
+    job = Job(
+        client=peloton_client,
+        config=IntegrationTestConfig(max_retry_attempts=100),
+    )
     default_config = job.job_config.defaultConfig
     job.job_config.ClearField("defaultConfig")
 
@@ -52,8 +59,9 @@ def test__stop_long_running_batch_job_immediately(long_running_job):
     long_running_job.wait_for_state(goal_state="KILLED")
 
 
-def test__run_failing_job():
+def test__run_failing_job(peloton_client):
     job = Job(
+        client=peloton_client,
         job_file="test_job_fail.yaml",
         config=IntegrationTestConfig(max_retry_attempts=100),
     )
@@ -72,8 +80,9 @@ def test__run_failing_job():
 
 
 @pytest.mark.smoketest
-def test_update_job_increase_instances():
+def test_update_job_increase_instances(peloton_client):
     job = Job(
+        client=peloton_client,
         job_file="long_running_job.yaml",
         config=IntegrationTestConfig(max_retry_attempts=100),
     )

@@ -2,19 +2,21 @@ import logging
 import os
 import pytest
 import time
-import grpc
-import requests
+import sys
 
-from docker import Client
-from tools.minicluster.main import setup, teardown, config as mc_config
-from tools.minicluster.minicluster import run_mesos_agent, teardown_mesos_agent
-from host import start_maintenance, complete_maintenance, wait_for_host_state
+import tools.minicluster.docker_client as docker_client
+from tools.minicluster.utils import default_config as mc_config
+import tools.minicluster.minicluster as minicluster
+from host import (
+    start_maintenance,
+    complete_maintenance,
+    wait_for_host_state,
+)
 from job import Job
 from job import query_jobs as batch_query_jobs
 from job import kill_jobs as batch_kill_jobs
 from stateless_job import StatelessJob
 from stateless_job import query_jobs as stateless_query_jobs
-from stateless_job import delete_jobs as stateless_delete_jobs
 from m3.client import M3
 from m3.emitter import BatchedEmitter
 from peloton_client.pbgen.peloton.api.v0.host import host_pb2
@@ -54,14 +56,18 @@ collect_metrics = TestMetrics()
 @pytest.fixture(scope="module", autouse=True)
 def setup_cluster(request):
     tests_failed_before_module = request.session.testsfailed
-    setup_minicluster()
+    try:
+        cluster = setup_minicluster()
+    except Exception as e:
+        log.error(e)
+        sys.exit(1)
 
     def teardown_cluster():
         dump_logs = False
         if (request.session.testsfailed - tests_failed_before_module) > 0:
             dump_logs = True
 
-        teardown_minicluster(dump_logs)
+        teardown_minicluster(cluster, dump_logs)
 
     request.addfinalizer(teardown_cluster)
 
@@ -93,36 +99,20 @@ def pytest_runtest_makereport(item, call):
             parent._previousfailed = item
 
 
-def pytest_sessionfinish(session, exitstatus):
-    emitter = BatchedEmitter()
-    m3 = M3(
-        application_identifier="peloton",
-        emitter=emitter,
-        environment="production",
-        default_tags={"result": "watchdog", "cluster": os.getenv("CLUSTER")},
-    )
-    if collect_metrics.failed > 0:
-        m3.gauge("watchdog_result", 1)
-    else:
-        m3.gauge("watchdog_result", 0)
-    m3.gauge("total_tests", collect_metrics.failed + collect_metrics.passed)
-    m3.gauge("failed_tests", collect_metrics.failed)
-    m3.gauge("passed_tests", collect_metrics.passed)
-    m3.gauge("duration_tests", collect_metrics.duration)
-
-
 class Container(object):
-    def __init__(self, names):
-        self._cli = Client(base_url="unix://var/run/docker.sock")
+    def __init__(self, names, is_mesos_master=False):
+        self._cluster = minicluster.default_cluster
+        self._cli = docker_client.default_client
         self._names = names
+        self._is_mesos_master = is_mesos_master
 
     def start(self):
         for name in self._names:
             self._cli.start(name)
             log.info("%s started", name)
 
-        if self._names[0] in MESOS_MASTER:
-            wait_for_mesos_master_leader()
+        if self._is_mesos_master:
+            self._cluster.wait_for_mesos_master_leader()
 
     def stop(self):
         for name in self._names:
@@ -134,104 +124,69 @@ class Container(object):
             self._cli.restart(name, timeout=0)
             log.info("%s restarted", name)
 
-        if self._names[0] in MESOS_MASTER:
-            wait_for_mesos_master_leader()
+        if self._is_mesos_master:
+            self._cluster.wait_for_mesos_master_leader()
 
 
 def get_container(container_name):
     return Container(container_name)
 
 
-def wait_for_mesos_master_leader(
-    url="http://127.0.0.1:5050/state.json", timeout_secs=20
-):
-    """
-    util method to wait for mesos master leader elected
-    """
-
-    deadline = time.time() + timeout_secs
-    while time.time() < deadline:
-        try:
-            resp = requests.get(url)
-            if resp.status_code != 200:
-                time.sleep(2)
-                continue
-            return
-        except Exception:
-            pass
-
-    assert False, "timed out waiting for mesos master leader"
-
-
-def wait_for_all_agents_to_register(
-    url="http://127.0.0.1:5050/state.json",
-    timeout_secs=300,
-):
-    """
-    util method to wait for all agents to register
-    """
-
-    deadline = time.time() + timeout_secs
-    while time.time() < deadline:
-        try:
-            resp = requests.get(url)
-            if resp.status_code == 200:
-                registered_agents = 0
-                for a in resp.json()['slaves']:
-                    if a['active'] == True:
-                        registered_agents += 1
-
-                if registered_agents == 3:
-                    return
-            time.sleep(10)
-        except Exception:
-            pass
-
-    assert False, "timed out waiting for agents to register"
-
-
-def setup_minicluster(enable_k8s=False):
+def setup_minicluster(enable_k8s=False, use_host_pool=False,
+                      isolate_cluster=False):
     """
     setup minicluster
     """
     log.info("setup cluster")
+    cluster = minicluster.Minicluster(mc_config(), enable_peloton=True,
+                                      enable_k8s=enable_k8s,
+                                      use_host_pool=use_host_pool)
     if os.getenv("CLUSTER", ""):
         log.info("cluster mode")
-    else:
-        log.info("local minicluster mode")
-        setup(enable_peloton=True, enable_k8s=enable_k8s)
-        time.sleep(5)
+        return cluster
+    log.info("local minicluster mode")
+
+    if isolate_cluster:
+        ns = cluster.isolate()
+        log.info("local minicluster isolated: " + ns)
+
+    cluster.setup()
+    return cluster
 
 
-def teardown_minicluster(dump_logs=False):
+def teardown_minicluster(cluster, dump_logs=False):
     """
     teardown minicluster
     """
     log.info("\nteardown cluster")
     if os.getenv("CLUSTER", ""):
         log.info("cluster mode, no teardown actions")
+        return
     elif os.getenv("NO_TEARDOWN", ""):
         log.info("skip teardown")
-    else:
-        log.info("tearing down")
+        return
+    elif cluster is None:
+        log.info("no cluster to tear down")
+        return
 
-        # dump logs only if tests have failed in the current module
-        if dump_logs:
-            # stop containers so that log stream will not block
-            teardown(stop=True)
+    log.info("tearing down")
 
-            try:
-                # TODO (varung): enable PE and mesos-master logs if needed
-                cli = Client(base_url="unix://var/run/docker.sock")
-                for c in ("peloton-jobmgr0",
-                          "peloton-resmgr0"):
-                    for l in cli.logs(c, stream=True):
-                        # remove newline character when logging
-                        log.info(l.rstrip())
-            except Exception as e:
-                log.info(e)
+    # dump logs only if tests have failed in the current module
+    if dump_logs and not os.getenv("NO_LOG_DUMPS"):
+        # stop containers so that log stream will not block
+        cluster.teardown(stop=True)
 
-        teardown()
+        try:
+            # TODO (varung): enable PE and mesos-master logs if needed
+            cli = cluster.cli
+            for c in ("peloton-jobmgr0", "peloton-resmgr0"):
+                for l in cli.logs(c, stream=True):
+                    # remove newline character when logging
+                    log.info(l.rstrip())
+        except Exception as e:
+            log.info(e)
+
+    cluster.teardown()
 
 
 def cleanup_batch_jobs():
@@ -242,38 +197,9 @@ def cleanup_batch_jobs():
     batch_kill_jobs(jobs)
 
 
-def cleanup_stateless_jobs(timeout_secs=10):
-    """
-    delete all service jobs from minicluster
-    """
-    jobs = stateless_query_jobs()
-
-    # opportunistic delete for jobs, if not deleted within
-    # timeout period, it will get cleanup in next test run.
-    stateless_delete_jobs(jobs)
-
-    # Wait for job deletion to complete.
-    deadline = time.time() + timeout_secs
-    while time.time() < deadline:
-        try:
-            jobs = stateless_query_jobs()
-            if len(jobs) == 0:
-                return
-            time.sleep(2)
-        except grpc.RpcError as e:
-            # Catch "not-found" error here because QueryJobs endpoint does
-            # two db queries in sequence: "QueryJobs" and "GetUpdate".
-            # However, when we delete a job, updates are deleted first,
-            # there is a slight chance QueryJobs will fail to query the
-            # update, returning "not-found" error.
-            if e.code() == grpc.StatusCode.NOT_FOUND:
-                time.sleep(2)
-                continue
-
-
 @pytest.fixture()
 def mesos_master():
-    return Container(MESOS_MASTER)
+    return Container(MESOS_MASTER, is_mesos_master=True)
 
 
 @pytest.fixture()
@@ -312,22 +238,12 @@ def aurorabridge():
 
 
 @pytest.fixture
-def long_running_job(request):
-    job = Job(job_file="long_running_job.yaml")
-
-    # teardown
-    def kill_long_running_job():
-        print("\nstopping long running job")
-        job.stop()
-
-    request.addfinalizer(kill_long_running_job)
-
-    return job
-
-
-@pytest.fixture
 def stateless_job(request):
     job = StatelessJob()
+    if util.minicluster_type() == "k8s":
+        job = StatelessJob(
+            job_file="test_stateless_job_spec_k8s.yaml",
+        )
 
     # teardown
     def kill_stateless_job():
@@ -341,7 +257,9 @@ def stateless_job(request):
 
 @pytest.fixture
 def host_affinity_job(request):
-    job = Job(job_file="test_job_host_affinity_constraint.yaml")
+    job = Job(
+        job_file="test_job_host_affinity_constraint.yaml",
+    )
 
     # Kill job
     def kill_host_affinity_job():
@@ -368,7 +286,7 @@ def maintenance(request):
         client[0] = new_client
 
     def start(hosts):
-        resp = start_maintenance(hosts)
+        resp = start_maintenance(hosts, client=client[0])
         if not resp:
             log.error("Start maintenance failed:" + resp)
             return resp
@@ -376,7 +294,7 @@ def maintenance(request):
         return resp
 
     def stop(hosts):
-        resp = complete_maintenance(hosts)
+        resp = complete_maintenance(hosts, client=client[0])
         if not resp:
             log.error("Complete maintenance failed:" + resp)
             return resp
@@ -524,19 +442,13 @@ the exact opposite.
 
 @pytest.fixture
 def exclusive_host(request):
-    def clean_up():
-        teardown_mesos_agent(mc_config, 0, is_exclusive=True)
-        run_mesos_agent(mc_config, 0, 0)
-        time.sleep(5)
+    cluster = minicluster.default_cluster
 
-    # Remove agent #0 and instead create exclusive agent #0
-    teardown_mesos_agent(mc_config, 0)
-    run_mesos_agent(
-        mc_config,
-        0,
-        3,
-        is_exclusive=True,
-        exclusive_label_value="exclusive-test-label",
-    )
-    time.sleep(5)
+    def clean_up():
+        cluster.set_mesos_agent_nonexclusive(0)
+        cluster.wait_for_all_agents_to_register()
+
+    cluster.set_mesos_agent_exclusive(0, "exclusive-test-label")
+    cluster.wait_for_all_agents_to_register()
+
     request.addfinalizer(clean_up)

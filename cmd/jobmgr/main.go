@@ -47,8 +47,8 @@ import (
 	"github.com/uber/peloton/pkg/jobmgr/task/activermtask"
 	"github.com/uber/peloton/pkg/jobmgr/task/deadline"
 	"github.com/uber/peloton/pkg/jobmgr/task/event"
+	"github.com/uber/peloton/pkg/jobmgr/task/evictor"
 	"github.com/uber/peloton/pkg/jobmgr/task/placement"
-	"github.com/uber/peloton/pkg/jobmgr/task/preemptor"
 	"github.com/uber/peloton/pkg/jobmgr/tasksvc"
 	"github.com/uber/peloton/pkg/jobmgr/updatesvc"
 	"github.com/uber/peloton/pkg/jobmgr/volumesvc"
@@ -66,7 +66,7 @@ import (
 	"go.uber.org/yarpc"
 	"go.uber.org/yarpc/api/transport"
 	"golang.org/x/time/rate"
-	"gopkg.in/alecthomas/kingpin.v2"
+	kingpin "gopkg.in/alecthomas/kingpin.v2"
 )
 
 const (
@@ -237,6 +237,23 @@ var (
 		Default("0").
 		Envar("EXECUTOR_SHUTDOWN_BURST_LIMIT").
 		Int()
+
+	taskLaunchTimeout = app.Flag(
+		"task-launch-timeout",
+		"Timeout after which a task in launched state will be restarted",
+	).
+		Default("0").
+		Envar("TASK_LAUNCH_TIMEOUT").
+		String()
+
+	taskStartTimeout = app.Flag(
+		"task-start-timeout",
+		"Timeout after which a task in started state will be restarted",
+	).
+		Default("0").
+		Envar("TASK_START_TIMEOUT").
+		String()
+
 	hostMgrAPIVersionStr = app.Flag(
 		"hostmgr-api-version",
 		"Define the API Version of host manager",
@@ -365,6 +382,26 @@ func main() {
 
 	if *executorShutdownRateLimit != 0 {
 		cfg.JobManager.GoalState.RateLimiterConfig.ExecutorShutdown.Rate = rate.Limit(*executorShutdownRateLimit)
+	}
+
+	if *taskLaunchTimeout != "0" {
+		var err error
+		cfg.JobManager.GoalState.LaunchTimeout, err = time.ParseDuration(*taskLaunchTimeout)
+		if err != nil {
+			log.WithError(err).
+				WithField("TASK_LAUNCH_TIMEOUT", *taskLaunchTimeout).
+				Fatal("Cannot parse launch timeout")
+		}
+	}
+
+	if *taskStartTimeout != "0" {
+		var err error
+		cfg.JobManager.GoalState.StartTimeout, err = time.ParseDuration(*taskStartTimeout)
+		if err != nil {
+			log.WithError(err).
+				WithField("TASK_START_TIMEOUT", *taskStartTimeout).
+				Fatal("Cannot parse start timeout")
+		}
 	}
 
 	if *executorShutdownBurstLimit != 0 {
@@ -565,14 +602,15 @@ func main() {
 		rootScope,
 	)
 
-	// Create a new task preemptor
-	taskPreemptor := preemptor.New(
+	// Create a new task evictor
+	taskEvictor := evictor.New(
 		dispatcher,
 		common.PelotonResourceManager,
 		ormStore, // store implements TaskStore
 		jobFactory,
 		goalStateDriver,
-		&cfg.JobManager.Preemptor,
+		cfg.JobManager.HostManagerAPIVersion,
+		&cfg.JobManager.Evictor,
 		rootScope,
 	)
 
@@ -606,7 +644,7 @@ func main() {
 		cfg.JobManager.GRPCPort,
 		jobFactory,
 		goalStateDriver,
-		taskPreemptor,
+		taskEvictor,
 		deadlineTracker,
 		placementProcessor,
 		statusUpdate,

@@ -26,16 +26,21 @@ job_manager:
   task_launcher:
     placement_dequeue_limit: 10
     get_placements_timeout_ms: 100
-  task_preemptor:
-    preemption_period: 60s
-    preemption_dequeue_limit: 100
-    preemption_dequeue_timeout_ms: 100
+  task_evictor:
+    eviction_period: 60s
+    eviction_dequeue_limit: 100
+    eviction_dequeue_timeout_ms: 100
   deadline:
     deadline_tracking_period: 30m
   job_service:
     # TODO (adityacb): Adjust this limit once we fix T1689063 and T1689077
     # and have a better data model
     max_tasks_per_job: 100000
+    med_instance_count: 500
+    high_instance_count: 1000
+    low_get_workflow_events_workers: 25
+    med_get_workflow_events_workers: 50
+    high_get_workflow_events_workers: 100
     enable_secrets: false
     thermos_executor:
       path: "/usr/share/aurora/bin/thermos_executor.pex"

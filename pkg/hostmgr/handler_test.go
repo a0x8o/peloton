@@ -25,35 +25,40 @@ import (
 	"time"
 
 	mesos "github.com/uber/peloton/.gen/mesos/v1"
-	mesos_maintenance "github.com/uber/peloton/.gen/mesos/v1/maintenance"
 	mesos_master "github.com/uber/peloton/.gen/mesos/v1/master"
 	sched "github.com/uber/peloton/.gen/mesos/v1/scheduler"
-	hpb "github.com/uber/peloton/.gen/peloton/api/v0/host"
+	pbhost "github.com/uber/peloton/.gen/peloton/api/v0/host"
 	"github.com/uber/peloton/.gen/peloton/api/v0/peloton"
 	"github.com/uber/peloton/.gen/peloton/api/v0/task"
 	halphapb "github.com/uber/peloton/.gen/peloton/api/v1alpha/host"
+	v1alphapeloton "github.com/uber/peloton/.gen/peloton/api/v1alpha/peloton"
 	pb_eventstream "github.com/uber/peloton/.gen/peloton/private/eventstream"
 	"github.com/uber/peloton/.gen/peloton/private/hostmgr/hostsvc"
 	hostsvcmocks "github.com/uber/peloton/.gen/peloton/private/hostmgr/hostsvc/mocks"
 	cqosmocks "github.com/uber/peloton/.gen/qos/v1alpha1/mocks"
-	"github.com/uber/peloton/pkg/common/queue"
+
 	"github.com/uber/peloton/pkg/common/util"
 	bin_packing "github.com/uber/peloton/pkg/hostmgr/binpacking"
 	"github.com/uber/peloton/pkg/hostmgr/config"
+	goalstate_mocks "github.com/uber/peloton/pkg/hostmgr/goalstate/mocks"
 	"github.com/uber/peloton/pkg/hostmgr/host"
-	hm "github.com/uber/peloton/pkg/hostmgr/host/mocks"
+	hp "github.com/uber/peloton/pkg/hostmgr/hostpool"
 	hostpool_manager_mocks "github.com/uber/peloton/pkg/hostmgr/hostpool/manager/mocks"
 	hostmgr_hostpool_mocks "github.com/uber/peloton/pkg/hostmgr/hostpool/mocks"
 	hostmgr_mesos_mocks "github.com/uber/peloton/pkg/hostmgr/mesos/mocks"
 	mpb_mocks "github.com/uber/peloton/pkg/hostmgr/mesos/yarpc/encoding/mpb/mocks"
 	"github.com/uber/peloton/pkg/hostmgr/metrics"
+	"github.com/uber/peloton/pkg/hostmgr/models"
 	"github.com/uber/peloton/pkg/hostmgr/offer/offerpool"
-	qm "github.com/uber/peloton/pkg/hostmgr/queue/mocks"
+	hostcache_mocks "github.com/uber/peloton/pkg/hostmgr/p2k/hostcache/mocks"
+	plugins_mocks "github.com/uber/peloton/pkg/hostmgr/p2k/plugins/mocks"
 	"github.com/uber/peloton/pkg/hostmgr/reserver"
 	reserver_mocks "github.com/uber/peloton/pkg/hostmgr/reserver/mocks"
+	"github.com/uber/peloton/pkg/hostmgr/scalar"
 	"github.com/uber/peloton/pkg/hostmgr/summary"
 	"github.com/uber/peloton/pkg/hostmgr/watchevent"
 	watchmocks "github.com/uber/peloton/pkg/hostmgr/watchevent/mocks"
+	orm_mocks "github.com/uber/peloton/pkg/storage/objects/mocks"
 
 	"github.com/gogo/protobuf/proto"
 	"github.com/golang/mock/gomock"
@@ -202,10 +207,6 @@ type HostMgrHandlerTestSuite struct {
 	handler                *ServiceHandler
 	frameworkID            *mesos.FrameworkID
 	mesosDetector          *hostmgr_mesos_mocks.MockMasterDetector
-	maintenanceQueue       *qm.MockMaintenanceQueue
-	drainingMachines       []*mesos.MachineID
-	downMachines           []*mesos.MachineID
-	maintenanceHostInfoMap *hm.MockMaintenanceHostInfoMap
 	watchProcessor         *watchmocks.MockWatchProcessor
 	watchEventStreamServer *hostsvcmocks.MockInternalHostServiceServiceWatchEventStreamEventYARPCServer
 	watchHostSummaryServer *hostsvcmocks.MockInternalHostServiceServiceWatchHostSummaryEventYARPCServer
@@ -213,25 +214,13 @@ type HostMgrHandlerTestSuite struct {
 	mockedCQosClient       *cqosmocks.MockQoSAdvisorServiceYARPCClient
 	metric                 *metrics.Metrics
 	hostPoolManager        *hostpool_manager_mocks.MockHostPoolManager
+	hostCache              *hostcache_mocks.MockHostCache
+	mockHostInfoOps        *orm_mocks.MockHostInfoOps
+	mockGoalStateDriver    *goalstate_mocks.MockDriver
+	mockPlugin             *plugins_mocks.MockPlugin
 }
 
 func (suite *HostMgrHandlerTestSuite) SetupSuite() {
-	drainingHostname := "draininghost"
-	drainingIP := "172.17.0.6"
-	drainingMachine := &mesos.MachineID{
-		Hostname: &drainingHostname,
-		Ip:       &drainingIP,
-	}
-	suite.drainingMachines = append(suite.drainingMachines, drainingMachine)
-
-	downHostname := "downhost"
-	downIP := "172.17.0.7"
-	downMachine := &mesos.MachineID{
-		Hostname: &downHostname,
-		Ip:       &downIP,
-	}
-
-	suite.downMachines = append(suite.downMachines, downMachine)
 	suite.mockedCQosClient = cqosmocks.NewMockQoSAdvisorServiceYARPCClient(
 		suite.ctrl)
 	suite.metric = metrics.NewMetrics(tally.NoopScope)
@@ -251,6 +240,10 @@ func (suite *HostMgrHandlerTestSuite) SetupTest() {
 	suite.watchHostSummaryServer = hostsvcmocks.NewMockInternalHostServiceServiceWatchHostSummaryEventYARPCServer(suite.ctrl)
 	suite.topicsSupported = []watchevent.Topic{watchevent.EventStream, watchevent.HostSummary}
 	suite.hostPoolManager = hostpool_manager_mocks.NewMockHostPoolManager(suite.ctrl)
+	suite.hostCache = hostcache_mocks.NewMockHostCache(suite.ctrl)
+	suite.mockHostInfoOps = orm_mocks.NewMockHostInfoOps(suite.ctrl)
+	suite.mockGoalStateDriver = goalstate_mocks.NewMockDriver(suite.ctrl)
+	suite.mockPlugin = plugins_mocks.NewMockPlugin(suite.ctrl)
 
 	mockValidValue := new(string)
 	*mockValidValue = _frameworkID
@@ -259,37 +252,63 @@ func (suite *HostMgrHandlerTestSuite) SetupTest() {
 	}
 
 	suite.frameworkID = mockValidFrameWorkID
+
+	slacResourceTypes := []string{"cpus"}
 	suite.pool = offerpool.NewOfferPool(
 		_offerHoldTime,
 		suite.schedulerClient,
 		offerpool.NewMetrics(suite.testScope.SubScope("offer")),
-		nil,        /* frameworkInfoProvider */
+		suite.provider,
 		[]string{}, /*scarce_resource_types*/
-		[]string{}, /*slack_resource_types*/
+		slacResourceTypes,
 		bin_packing.GetRankerByName("FIRST_FIT"),
 		time.Duration(30*time.Second),
 		suite.watchProcessor,
 		suite.hostPoolManager,
 	)
 
-	suite.maintenanceQueue = qm.NewMockMaintenanceQueue(suite.ctrl)
-	suite.maintenanceHostInfoMap = hm.NewMockMaintenanceHostInfoMap(suite.ctrl)
 	suite.handler = &ServiceHandler{
-		schedulerClient:        suite.schedulerClient,
-		operatorMasterClient:   suite.masterOperatorClient,
-		metrics:                metrics.NewMetrics(suite.testScope),
-		offerPool:              suite.pool,
-		frameworkInfoProvider:  suite.provider,
-		mesosDetector:          suite.mesosDetector,
-		maintenanceQueue:       suite.maintenanceQueue,
-		maintenanceHostInfoMap: suite.maintenanceHostInfoMap,
-		watchProcessor:         suite.watchProcessor,
-		hostPoolManager:        suite.hostPoolManager,
+		schedulerClient:       suite.schedulerClient,
+		operatorMasterClient:  suite.masterOperatorClient,
+		metrics:               metrics.NewMetrics(suite.testScope),
+		offerPool:             suite.pool,
+		frameworkInfoProvider: suite.provider,
+		mesosDetector:         suite.mesosDetector,
+		watchProcessor:        suite.watchProcessor,
+		hostPoolManager:       suite.hostPoolManager,
+		goalStateDriver:       suite.mockGoalStateDriver,
+		hostInfoOps:           suite.mockHostInfoOps,
+		hostCache:             suite.hostCache,
+		plugin:                suite.mockPlugin,
+		slackResourceTypes:    slacResourceTypes,
 	}
 	suite.handler.reserver = reserver.NewReserver(
 		metrics.NewMetrics(suite.testScope),
 		&config.Config{},
 		suite.pool)
+}
+
+func (suite *HostMgrHandlerTestSuite) setupLoaderMocks(
+	response *mesos_master.Response_GetAgents,
+) {
+	suite.mockHostInfoOps.EXPECT().GetAll(gomock.Any()).Return(nil, nil)
+	suite.masterOperatorClient.EXPECT().Agents().Return(response, nil)
+	suite.masterOperatorClient.EXPECT().GetMaintenanceStatus().Return(nil, nil)
+	for _, a := range response.GetAgents() {
+		ip, _, err := util.ExtractIPAndPortFromMesosAgentPID(a.GetPid())
+		suite.NoError(err)
+
+		suite.mockHostInfoOps.EXPECT().Create(
+			gomock.Any(),
+			a.GetAgentInfo().GetHostname(),
+			ip,
+			pbhost.HostState_HOST_STATE_UP,
+			pbhost.HostState_HOST_STATE_UP,
+			map[string]string{},
+			"",
+			"",
+		).Return(nil)
+	}
 }
 
 func (suite *HostMgrHandlerTestSuite) TearDownTest() {
@@ -400,6 +419,24 @@ func (suite *HostMgrHandlerTestSuite) TestGetHostsByQueryAllHosts() {
 	suite.pool.AddOffers(context.Background(), generateOffers(numHosts))
 	resp, _ := suite.handler.GetHostsByQuery(rootCtx, req)
 	suite.Equal(numHosts, len(resp.Hosts))
+}
+
+func (suite *HostMgrHandlerTestSuite) TestGetHostsByQueryRevocableHosts() {
+	defer suite.ctrl.Finish()
+
+	req := &hostsvc.GetHostsByQueryRequest{
+		Resource: &task.ResourceConfig{
+			CpuLimit: 1.0,
+			GpuLimit: 0.0,
+		},
+		IncludeRevocable: true,
+	}
+	numHosts := 5
+	offers := generateOffers(numHosts)
+	offers[0].Resources[0].Revocable = &mesos.Resource_RevocableInfo{}
+	suite.pool.AddOffers(context.Background(), offers)
+	resp, _ := suite.handler.GetHostsByQuery(rootCtx, req)
+	suite.Equal(1, len(resp.Hosts))
 }
 
 func (suite *HostMgrHandlerTestSuite) TestGetHostsByQueryFilterHostnames() {
@@ -753,40 +790,17 @@ func (suite *HostMgrHandlerTestSuite) TestAcquireAndLaunch() {
 
 	gomock.InOrder(
 		suite.watchProcessor.EXPECT().NotifyEventChange(gomock.Any()),
-		// Set expectations on provider
-		suite.provider.EXPECT().GetFrameworkID(context.Background()).Return(
-			suite.frameworkID),
-		// Set expectations on provider
-		suite.provider.EXPECT().GetMesosStreamID(context.Background()).Return(_streamID),
-		// Set expectations on scheduler schedulerClient
-		suite.schedulerClient.EXPECT().
-			Call(
-				gomock.Eq(_streamID),
-				gomock.Any(),
-			).
-			Do(func(_ string, msg proto.Message) {
-				// Verify clientCall message.
-				call := msg.(*sched.Call)
-				suite.Equal(sched.Call_ACCEPT, call.GetType())
-				suite.Equal(_frameworkID, call.GetFrameworkId().GetValue())
-
-				accept := call.GetAccept()
-				suite.NotNil(accept)
-				suite.Equal(1, len(accept.GetOfferIds()))
-				suite.Equal("offer-0", accept.GetOfferIds()[0].GetValue())
-				suite.Equal(1, len(accept.GetOperations()))
-				operation := accept.GetOperations()[0]
-				suite.Equal(
-					mesos.Offer_Operation_LAUNCH,
-					operation.GetType())
-				launch := operation.GetLaunch()
-				suite.NotNil(launch)
-				suite.Equal(1, len(launch.GetTaskInfos()))
-				suite.Equal(
-					fmt.Sprintf(_taskIDFmt, 0),
-					launch.GetTaskInfos()[0].GetTaskId().GetValue())
-			}).
-			Return(nil),
+		suite.hostCache.EXPECT().AddPodsToHost(
+			gomock.Any(),
+			gomock.Any()).
+			Return(),
+		suite.mockPlugin.EXPECT().
+			LaunchPods(gomock.Any(), gomock.Any(), launchReq.GetHostname()).
+			Return([]*models.LaunchablePod{{
+				PodId: &v1alphapeloton.PodID{
+					Value: launchReq.GetTasks()[0].GetTaskId().GetValue(),
+				},
+			}}, nil),
 	)
 
 	launchResp, err = suite.handler.LaunchTasks(
@@ -851,40 +865,17 @@ func (suite *HostMgrHandlerTestSuite) TestAcquireAndLaunchOnNonHeldTask() {
 	gomock.InOrder(
 		// set expectation on watch processor
 		suite.watchProcessor.EXPECT().NotifyEventChange(gomock.Any()),
-		// Set expectations on provider
-		suite.provider.EXPECT().GetFrameworkID(context.Background()).Return(
-			suite.frameworkID),
-		// Set expectations on provider
-		suite.provider.EXPECT().GetMesosStreamID(context.Background()).Return(_streamID),
-		// Set expectations on scheduler schedulerClient
-		suite.schedulerClient.EXPECT().
-			Call(
-				gomock.Eq(_streamID),
-				gomock.Any(),
-			).
-			Do(func(_ string, msg proto.Message) {
-				// Verify clientCall message.
-				call := msg.(*sched.Call)
-				suite.Equal(sched.Call_ACCEPT, call.GetType())
-				suite.Equal(_frameworkID, call.GetFrameworkId().GetValue())
-
-				accept := call.GetAccept()
-				suite.NotNil(accept)
-				suite.Equal(1, len(accept.GetOfferIds()))
-				suite.Equal("offer-0", accept.GetOfferIds()[0].GetValue())
-				suite.Equal(1, len(accept.GetOperations()))
-				operation := accept.GetOperations()[0]
-				suite.Equal(
-					mesos.Offer_Operation_LAUNCH,
-					operation.GetType())
-				launch := operation.GetLaunch()
-				suite.NotNil(launch)
-				suite.Equal(1, len(launch.GetTaskInfos()))
-				suite.Equal(
-					fmt.Sprintf(_taskIDFmt, 0),
-					launch.GetTaskInfos()[0].GetTaskId().GetValue())
-			}).
-			Return(nil),
+		suite.hostCache.EXPECT().AddPodsToHost(
+			gomock.Any(),
+			gomock.Any()).
+			Return(),
+		suite.mockPlugin.EXPECT().
+			LaunchPods(gomock.Any(), gomock.Any(), launchReq.GetHostname()).
+			Return([]*models.LaunchablePod{{
+				PodId: &v1alphapeloton.PodID{
+					Value: launchReq.GetTasks()[0].GetTaskId().GetValue(),
+				},
+			}}, nil),
 	)
 
 	launchResp, err := suite.handler.LaunchTasks(
@@ -1101,44 +1092,20 @@ func (suite *HostMgrHandlerTestSuite) TestKillAndReserveTaskWithoutHostSummary()
 	killAndReserveReq := &hostsvc.KillAndReserveTasksRequest{
 		Entries: entries,
 	}
-	killedTaskIds := make(map[string]bool)
-	mockMutex := &sync.Mutex{}
 
-	// Set expectations on provider
-	suite.provider.EXPECT().GetFrameworkID(context.Background()).Return(
-		suite.frameworkID,
-	).Times(2)
-	suite.provider.EXPECT().GetMesosStreamID(context.Background()).Return(
-		_streamID,
-	).Times(2)
+	suite.mockPlugin.
+		EXPECT().
+		KillPod(gomock.Any(), t1).
+		Return(nil)
 
-	// Set expectations on scheduler schedulerClient
-	suite.schedulerClient.EXPECT().
-		Call(
-			gomock.Eq(_streamID),
-			gomock.Any(),
-		).
-		Do(func(_ string, msg proto.Message) {
-			// Verify clientCall message.
-			call := msg.(*sched.Call)
-			suite.Equal(sched.Call_KILL, call.GetType())
-			suite.Equal(_frameworkID, call.GetFrameworkId().GetValue())
-
-			tid := call.GetKill().GetTaskId()
-			suite.NotNil(tid)
-			mockMutex.Lock()
-			defer mockMutex.Unlock()
-			killedTaskIds[tid.GetValue()] = true
-		}).
-		Return(nil).
-		Times(2)
+	suite.mockPlugin.
+		EXPECT().
+		KillPod(gomock.Any(), t2).
+		Return(nil)
 
 	resp, err := suite.handler.KillAndReserveTasks(rootCtx, killAndReserveReq)
 	suite.NoError(err)
 	suite.Nil(resp.GetError())
-	suite.Equal(
-		map[string]bool{"t1": true, "t2": true},
-		killedTaskIds)
 
 	suite.Equal(
 		int64(2),
@@ -1164,47 +1131,23 @@ func (suite *HostMgrHandlerTestSuite) TestKillAndReserveTaskKillFailure() {
 	killAndReserveReq := &hostsvc.KillAndReserveTasksRequest{
 		Entries: entries,
 	}
-	killedTaskIds := make(map[string]bool)
-	mockMutex := &sync.Mutex{}
 	// set expectation on watch processor
 	suite.watchProcessor.EXPECT().NotifyEventChange(gomock.Any())
 	suite.watchProcessor.EXPECT().NotifyEventChange(gomock.Any())
 
-	// Set expectations on provider
-	suite.provider.EXPECT().GetFrameworkID(context.Background()).Return(
-		suite.frameworkID,
-	).Times(2)
-	suite.provider.EXPECT().GetMesosStreamID(context.Background()).Return(
-		_streamID,
-	).Times(2)
+	suite.mockPlugin.
+		EXPECT().
+		KillPod(gomock.Any(), t1).
+		Return(errors.New("test error"))
 
-	// Set expectations on scheduler schedulerClient
-	suite.schedulerClient.EXPECT().
-		Call(
-			gomock.Eq(_streamID),
-			gomock.Any(),
-		).
-		Do(func(_ string, msg proto.Message) {
-			// Verify clientCall message.
-			call := msg.(*sched.Call)
-			suite.Equal(sched.Call_KILL, call.GetType())
-			suite.Equal(_frameworkID, call.GetFrameworkId().GetValue())
-
-			tid := call.GetKill().GetTaskId()
-			suite.NotNil(tid)
-			mockMutex.Lock()
-			defer mockMutex.Unlock()
-			killedTaskIds[tid.GetValue()] = true
-		}).
-		Return(fmt.Errorf("test error")).
-		Times(2)
+	suite.mockPlugin.
+		EXPECT().
+		KillPod(gomock.Any(), t2).
+		Return(errors.New("test error"))
 
 	resp, err := suite.handler.KillAndReserveTasks(rootCtx, killAndReserveReq)
 	suite.NoError(err)
 	suite.NotNil(resp.GetError())
-	suite.Equal(
-		map[string]bool{"t1": true, "t2": true},
-		killedTaskIds)
 
 	suite.Equal(
 		int64(0),
@@ -1238,44 +1181,18 @@ func (suite *HostMgrHandlerTestSuite) TestKillAndReserveTask() {
 	killAndReserveReq := &hostsvc.KillAndReserveTasksRequest{
 		Entries: entries,
 	}
-	killedTaskIds := make(map[string]bool)
-	mockMutex := &sync.Mutex{}
 
-	// Set expectations on provider
-	suite.provider.EXPECT().GetFrameworkID(context.Background()).Return(
-		suite.frameworkID,
-	).Times(2)
-	suite.provider.EXPECT().GetMesosStreamID(context.Background()).Return(
-		_streamID,
-	).Times(2)
+	suite.mockPlugin.EXPECT().
+		KillPod(gomock.Any(), t1).
+		Return(nil)
 
-	// Set expectations on scheduler schedulerClient
-	suite.schedulerClient.EXPECT().
-		Call(
-			gomock.Eq(_streamID),
-			gomock.Any(),
-		).
-		Do(func(_ string, msg proto.Message) {
-			// Verify clientCall message.
-			call := msg.(*sched.Call)
-			suite.Equal(sched.Call_KILL, call.GetType())
-			suite.Equal(_frameworkID, call.GetFrameworkId().GetValue())
-
-			tid := call.GetKill().GetTaskId()
-			suite.NotNil(tid)
-			mockMutex.Lock()
-			defer mockMutex.Unlock()
-			killedTaskIds[tid.GetValue()] = true
-		}).
-		Return(nil).
-		Times(2)
+	suite.mockPlugin.EXPECT().
+		KillPod(gomock.Any(), t2).
+		Return(nil)
 
 	resp, err := suite.handler.KillAndReserveTasks(rootCtx, killAndReserveReq)
 	suite.NoError(err)
 	suite.Nil(resp.GetError())
-	suite.Equal(
-		map[string]bool{"t1": true, "t2": true},
-		killedTaskIds)
 
 	suite.Equal(
 		int64(2),
@@ -1305,8 +1222,6 @@ func (suite *HostMgrHandlerTestSuite) TestKillTask() {
 	killReq := &hostsvc.KillTasksRequest{
 		TaskIds: taskIDs,
 	}
-	killedTaskIds := make(map[string]bool)
-	mockMutex := &sync.Mutex{}
 	suite.watchProcessor.EXPECT().NotifyEventChange(gomock.Any()).AnyTimes()
 	suite.pool.AddOffers(context.Background(), generateOffers(1))
 	// simulate hold for mesosT1 on h1
@@ -1315,34 +1230,15 @@ func (suite *HostMgrHandlerTestSuite) TestKillTask() {
 			HoldForTasks(h1, []*peloton.TaskID{{Value: pelotonT1}}),
 	)
 
-	// Set expectations on provider
-	suite.provider.EXPECT().GetFrameworkID(context.Background()).Return(
-		suite.frameworkID,
-	).Times(2)
-	suite.provider.EXPECT().GetMesosStreamID(context.Background()).Return(
-		_streamID,
-	).Times(2)
+	suite.mockPlugin.
+		EXPECT().
+		KillPod(gomock.Any(), mesosT1).
+		Return(nil)
 
-	// Set expectations on scheduler schedulerClient
-	suite.schedulerClient.EXPECT().
-		Call(
-			gomock.Eq(_streamID),
-			gomock.Any(),
-		).
-		Do(func(_ string, msg proto.Message) {
-			// Verify clientCall message.
-			call := msg.(*sched.Call)
-			suite.Equal(sched.Call_KILL, call.GetType())
-			suite.Equal(_frameworkID, call.GetFrameworkId().GetValue())
-
-			tid := call.GetKill().GetTaskId()
-			suite.NotNil(tid)
-			mockMutex.Lock()
-			defer mockMutex.Unlock()
-			killedTaskIds[tid.GetValue()] = true
-		}).
-		Return(nil).
-		Times(2)
+	suite.mockPlugin.
+		EXPECT().
+		KillPod(gomock.Any(), mesosT2).
+		Return(nil)
 
 	// host held before kill
 	suite.Equal(
@@ -1352,9 +1248,6 @@ func (suite *HostMgrHandlerTestSuite) TestKillTask() {
 	resp, err := suite.handler.KillTasks(rootCtx, killReq)
 	suite.NoError(err)
 	suite.Nil(resp.GetError())
-	suite.Equal(
-		map[string]bool{mesosT1: true, mesosT2: true},
-		killedTaskIds)
 
 	suite.Equal(
 		int64(2),
@@ -1414,24 +1307,15 @@ func (suite *HostMgrHandlerTestSuite) TestKillTaskFailure() {
 				err = errors.New(tt.errMsg)
 			}
 
-			suite.provider.EXPECT().GetFrameworkID(context.Background()).Return(suite.frameworkID).Times(2)
-			suite.provider.EXPECT().GetMesosStreamID(context.Background()).Return(_streamID).Times(2)
+			suite.mockPlugin.
+				EXPECT().
+				KillPod(gomock.Any(), t1).
+				Return(err)
 
-			suite.schedulerClient.EXPECT().
-				Call(
-					gomock.Eq(_streamID),
-					gomock.Any()).
-				Do(func(_ string, msg proto.Message) {
-					// Verify call message while process the kill task id into `killedTaskIds`
-					call := msg.(*sched.Call)
-					suite.Equal(sched.Call_KILL, call.GetType())
-					suite.Equal(_frameworkID, call.GetFrameworkId().GetValue())
-
-					tid := call.GetKill().GetTaskId()
-					suite.NotNil(tid)
-				}).
-				Return(err).
-				Times(2)
+			suite.mockPlugin.
+				EXPECT().
+				KillPod(gomock.Any(), t2).
+				Return(err)
 		}
 
 		resp, _ := suite.handler.KillTasks(rootCtx, killReq)
@@ -1458,18 +1342,13 @@ func (suite *HostMgrHandlerTestSuite) TestServiceHandlerClusterCapacity() {
 	name := "cpus"
 
 	loader := &host.Loader{
-		OperatorClient:         suite.masterOperatorClient,
-		Scope:                  suite.testScope,
-		MaintenanceHostInfoMap: suite.maintenanceHostInfoMap,
+		OperatorClient: suite.masterOperatorClient,
+		Scope:          suite.testScope,
+		HostInfoOps:    suite.mockHostInfoOps,
 	}
 	numAgents := 2
 	response := makeAgentsResponse(numAgents)
-	suite.masterOperatorClient.EXPECT().Agents().Return(response, nil)
-	suite.maintenanceHostInfoMap.EXPECT().
-		GetDrainingHostInfos(gomock.Any()).
-		Return([]*hpb.HostInfo{}).
-		Times(len(response.GetAgents()))
-
+	suite.setupLoaderMocks(response)
 	loader.Load(nil)
 
 	tests := []struct {
@@ -1551,11 +1430,11 @@ func (suite *HostMgrHandlerTestSuite) TestServiceHandlerClusterCapacityWithoutAg
 		Agents: []*mesos_master.Response_GetAgents_Agent{},
 	}
 	loader := &host.Loader{
-		OperatorClient:         suite.masterOperatorClient,
-		Scope:                  suite.testScope,
-		MaintenanceHostInfoMap: hm.NewMockMaintenanceHostInfoMap(suite.ctrl),
+		OperatorClient: suite.masterOperatorClient,
+		Scope:          suite.testScope,
+		HostInfoOps:    suite.mockHostInfoOps,
 	}
-	suite.masterOperatorClient.EXPECT().Agents().Return(response, nil)
+	suite.setupLoaderMocks(response)
 	loader.Load(nil)
 
 	suite.provider.EXPECT().GetFrameworkID(rootCtx).Return(suite.frameworkID)
@@ -1598,18 +1477,13 @@ func (suite *HostMgrHandlerTestSuite) TestServiceHandlerClusterCapacityWithQuota
 	quotaVal := 100.0
 
 	loader := &host.Loader{
-		OperatorClient:         suite.masterOperatorClient,
-		Scope:                  suite.testScope,
-		MaintenanceHostInfoMap: suite.maintenanceHostInfoMap,
+		OperatorClient: suite.masterOperatorClient,
+		Scope:          suite.testScope,
+		HostInfoOps:    suite.mockHostInfoOps,
 	}
 	numAgents := 2
 	response := makeAgentsResponse(numAgents)
-	suite.masterOperatorClient.EXPECT().Agents().Return(response, nil)
-	suite.maintenanceHostInfoMap.EXPECT().
-		GetDrainingHostInfos(gomock.Any()).
-		Return([]*hpb.HostInfo{}).
-		Times(len(response.GetAgents()))
-
+	suite.setupLoaderMocks(response)
 	loader.Load(nil)
 
 	clusterCapacityReq := &hostsvc.ClusterCapacityRequest{}
@@ -1681,122 +1555,109 @@ func (suite *HostMgrHandlerTestSuite) TestGetMesosMasterHostPort() {
 func (suite *HostMgrHandlerTestSuite) TestServiceHandlerGetDrainingHosts() {
 	defer suite.ctrl.Finish()
 
+	suite.mockHostInfoOps.EXPECT().
+		GetAll(gomock.Any()).
+		Return([]*pbhost.HostInfo{
+			{
+				Hostname: "host1",
+				State:    pbhost.HostState_HOST_STATE_DRAINING,
+			},
+			{
+				Hostname: "host2",
+				State:    pbhost.HostState_HOST_STATE_DRAINING,
+			},
+			{
+				Hostname: "host3",
+				State:    pbhost.HostState_HOST_STATE_DOWN,
+			},
+		}, nil).Times(2)
+
+	// With a set limit 1
 	req := &hostsvc.GetDrainingHostsRequest{
 		Limit:   1,
 		Timeout: 1000,
 	}
-	testHost := "testhost"
-
-	suite.maintenanceQueue.EXPECT().Dequeue(gomock.Any()).Return(testHost, nil)
 	resp, err := suite.handler.GetDrainingHosts(context.Background(), req)
+
 	suite.Equal(1, len(resp.GetHostnames()))
-	suite.Equal(testHost, resp.GetHostnames()[0])
+	suite.Equal("host1", resp.GetHostnames()[0])
 	suite.NoError(err)
 
-	suite.maintenanceQueue.EXPECT().
-		Dequeue(gomock.Any()).
-		Return("", fmt.Errorf("fake Dequeue error"))
-	resp, err = suite.handler.GetDrainingHosts(context.Background(), req)
-	suite.Error(err)
-	suite.Nil(resp)
-
-	// Request with limit set to 0
+	// With no limit
 	req = &hostsvc.GetDrainingHostsRequest{
 		Limit:   0,
 		Timeout: 1000,
 	}
-	suite.maintenanceQueue.EXPECT().Length().Return(2)
-	suite.maintenanceQueue.EXPECT().
-		Dequeue(gomock.Any()).
-		Return(testHost, nil)
-	suite.maintenanceQueue.EXPECT().
-		Dequeue(gomock.Any()).
-		Return("", queue.DequeueTimeOutError{})
 	resp, err = suite.handler.GetDrainingHosts(context.Background(), req)
-	suite.Equal(1, len(resp.GetHostnames()))
-	suite.Equal(testHost, resp.GetHostnames()[0])
+
+	suite.Equal(2, len(resp.GetHostnames()))
+	suite.Equal("host1", resp.GetHostnames()[0])
+	suite.Equal("host2", resp.GetHostnames()[1])
 	suite.NoError(err)
 }
 
-func (suite *HostMgrHandlerTestSuite) TestServiceHandlerMarkHostsDrained() {
+func (suite *HostMgrHandlerTestSuite) TestServiceHandlerMarkHostDrained() {
 	defer suite.ctrl.Finish()
 
 	hostname := "testhost"
-	hostInfo := &hpb.HostInfo{
-		Hostname: hostname,
-		Ip:       "0.0.0.0",
-		State:    hpb.HostState_HOST_STATE_DRAINING,
-	}
 
-	drainingMachines := []*mesos_maintenance.ClusterStatus_DrainingMachine{
-		{
-			Id: &mesos.MachineID{
-				Hostname: &hostInfo.Hostname,
-				Ip:       &hostInfo.Ip,
-			},
-		},
-	}
-
-	gomock.InOrder(
-		suite.maintenanceHostInfoMap.EXPECT().
-			GetDrainingHostInfos([]string{}).
-			Return([]*hpb.HostInfo{hostInfo}),
-
-		suite.masterOperatorClient.EXPECT().
-			StartMaintenance(gomock.Any()).
-			Return(nil).
-			Do(func(machineIds []*mesos.MachineID) {
-				suite.Exactly(drainingMachines[0].Id, machineIds[0])
-			}),
-	)
-	suite.maintenanceHostInfoMap.EXPECT().UpdateHostState(
-		hostInfo.GetHostname(),
-		hpb.HostState_HOST_STATE_DRAINING,
-		hpb.HostState_HOST_STATE_DOWN)
+	suite.mockHostInfoOps.EXPECT().
+		Get(gomock.Any(), gomock.Any()).
+		Return(&pbhost.HostInfo{
+			Hostname: hostname,
+			State:    pbhost.HostState_HOST_STATE_DRAINING,
+		}, nil)
+	suite.mockHostInfoOps.EXPECT().
+		UpdateState(gomock.Any(), gomock.Any(), gomock.Any()).
+		Return(nil)
+	suite.mockGoalStateDriver.EXPECT().
+		EnqueueHost(gomock.Any(), gomock.Any())
 
 	resp, err := suite.handler.MarkHostDrained(
 		context.Background(),
 		&hostsvc.MarkHostDrainedRequest{
 			Hostname: hostname,
 		})
+
 	suite.NoError(err)
 	suite.Equal(&hostsvc.MarkHostDrainedResponse{
 		Hostname: hostname,
 	}, resp)
+}
 
-	// Test host-not-DRAINING
-	suite.maintenanceHostInfoMap.EXPECT().
-		GetDrainingHostInfos([]string{}).
-		Return([]*hpb.HostInfo{})
+func (suite *HostMgrHandlerTestSuite) TestServiceHandlerMarkHostDrainedFailure() {
+	// Host not in DRAINING state
+	hostname := "testhost"
 
-	resp, err = suite.handler.MarkHostDrained(
+	suite.mockHostInfoOps.EXPECT().
+		Get(gomock.Any(), gomock.Any()).
+		Return(&pbhost.HostInfo{
+			Hostname: hostname,
+			State:    pbhost.HostState_HOST_STATE_DOWN,
+		}, nil)
+
+	resp, err := suite.handler.MarkHostDrained(
 		context.Background(),
 		&hostsvc.MarkHostDrainedRequest{
 			Hostname: hostname,
 		})
-	suite.Equal("", resp.GetHostname())
 
-	// Test StartMaintenance error
-	suite.maintenanceHostInfoMap.EXPECT().
-		GetDrainingHostInfos([]string{}).
-		Return([]*hpb.HostInfo{
-			{
-				Hostname: hostname,
-				Ip:       "0.0.0.0",
-				State:    hpb.HostState_HOST_STATE_DRAINING,
-			},
-		})
-
-	suite.masterOperatorClient.EXPECT().
-		StartMaintenance(gomock.Any()).
-		Return(fmt.Errorf("fake StartMaintenance error"))
-	resp, err = suite.handler.MarkHostDrained(
-		context.Background(),
-		&hostsvc.MarkHostDrainedRequest{
-			Hostname: hostname,
-		})
 	suite.Error(err)
-	suite.Equal("", resp.GetHostname())
+	suite.Nil(resp)
+
+	// Failure to read from DB
+	suite.mockHostInfoOps.EXPECT().
+		Get(gomock.Any(), gomock.Any()).
+		Return(nil, errors.New("some error"))
+
+	resp, err = suite.handler.MarkHostDrained(
+		context.Background(),
+		&hostsvc.MarkHostDrainedRequest{
+			Hostname: hostname,
+		})
+
+	suite.Error(err)
+	suite.Nil(resp)
 }
 
 func getAcquireHostOffersRequest() *hostsvc.AcquireHostOffersRequest {
@@ -1857,6 +1718,9 @@ func makeAgentsResponse(numAgents int) *mesos_master.Response_GetAgents {
 				Resources: resources,
 			},
 			TotalResources: resources,
+			Pid: &[]string{
+				fmt.Sprintf("slave%d@%d.%d.%d.%d:%d", i, i, i, i, i, i),
+			}[0],
 		}
 		response.Agents = append(response.Agents, getAgent)
 	}
@@ -2041,20 +1905,14 @@ func TestHostManagerTestSuite(t *testing.T) {
 
 // InitializeHosts adds the hosts to host map
 func (suite *HostMgrHandlerTestSuite) InitializeHosts(numAgents int) {
-	mockMaintenanceMap := hm.NewMockMaintenanceHostInfoMap(suite.ctrl)
 	loader := &host.Loader{
-		OperatorClient:         suite.masterOperatorClient,
-		Scope:                  suite.testScope,
-		SlackResourceTypes:     []string{"cpus"},
-		MaintenanceHostInfoMap: mockMaintenanceMap,
+		OperatorClient:     suite.masterOperatorClient,
+		Scope:              suite.testScope,
+		SlackResourceTypes: []string{"cpus"},
+		HostInfoOps:        suite.mockHostInfoOps,
 	}
 	response := makeAgentsResponse(numAgents)
-	gomock.InOrder(
-		suite.masterOperatorClient.EXPECT().Agents().Return(response, nil),
-		mockMaintenanceMap.EXPECT().
-			GetDrainingHostInfos(gomock.Any()).
-			Return([]*hpb.HostInfo{}).Times(len(response.GetAgents())),
-	)
+	suite.setupLoaderMocks(response)
 	loader.Load(nil)
 }
 
@@ -2267,17 +2125,24 @@ func (suite *HostMgrHandlerTestSuite) TestLaunchTasksSchedulerError() {
 	gomock.InOrder(
 		// set expectation on watch Processor
 		suite.watchProcessor.EXPECT().NotifyEventChange(gomock.Any()),
-		// Set expectations on provider
+		suite.hostCache.EXPECT().AddPodsToHost(
+			gomock.Any(),
+			gomock.Any()).
+			Return(),
+		suite.mockPlugin.EXPECT().
+			LaunchPods(gomock.Any(), gomock.Any(), gomock.Any()).
+			Return(nil, errors.New(errString)),
+		// Set expectations on provider for offer decline
 		suite.provider.EXPECT().GetFrameworkID(context.Background()).Return(
 			suite.frameworkID),
-		// Set expectations on provider
+		// Set expectations on provider for offer decline
 		suite.provider.EXPECT().GetMesosStreamID(context.Background()).Return(_streamID),
-		// Set expectations on scheduler schedulerClient
+		// Set expectations on scheduler schedulerClient for offer decline
 		suite.schedulerClient.EXPECT().
 			Call(
 				gomock.Eq(_streamID),
 				gomock.Any(),
-			).Return(fmt.Errorf(errString)),
+			).Return(nil),
 	)
 
 	launchResp, err := suite.handler.LaunchTasks(
@@ -2360,13 +2225,12 @@ func (suite *HostMgrHandlerTestSuite) TestGetMesosAgentInfo() {
 	response := makeAgentsResponse(3)
 	agentInfo := AgentSlice(response.GetAgents())
 	sort.Sort(agentInfo)
-	suite.masterOperatorClient.EXPECT().Agents().Return(response, nil)
-	suite.maintenanceHostInfoMap.EXPECT().GetDrainingHostInfos(gomock.Any()).Return([]*hpb.HostInfo{}).Times(len(response.GetAgents()))
 	loader := &host.Loader{
-		OperatorClient:         suite.masterOperatorClient,
-		Scope:                  suite.testScope,
-		MaintenanceHostInfoMap: suite.maintenanceHostInfoMap,
+		OperatorClient: suite.masterOperatorClient,
+		Scope:          suite.testScope,
+		HostInfoOps:    suite.mockHostInfoOps,
 	}
+	suite.setupLoaderMocks(response)
 	loader.Load(nil)
 
 	testcases := []struct {
@@ -2822,4 +2686,91 @@ func (suite *HostMgrHandlerTestSuite) TestCancel_NotFoundTask() {
 	suite.Nil(resp)
 	suite.Error(err)
 	suite.True(yarpcerrors.IsNotFound(err))
+}
+
+// TestGetHostPoolCapacity tests GetHostPoolCapacity API.
+func (suite *HostMgrHandlerTestSuite) TestGetHostPoolCapacity() {
+	phy := scalar.Resources{
+		CPU:  float64(2.0),
+		Mem:  float64(4.0),
+		Disk: float64(10.0),
+		GPU:  float64(1.0),
+	}
+	slack := scalar.Resources{
+		CPU: float64(1.5),
+	}
+	pools := map[string]host.ResourceCapacity{
+		"pool0": {
+			Physical: phy,
+			Slack:    slack,
+		},
+		"pool1": {
+			Physical: phy.Add(phy),
+			Slack:    slack.Add(slack),
+		},
+		"pool2": {
+			Physical: phy.Add(phy).Add(phy),
+			Slack:    slack.Add(slack).Add(slack),
+		},
+	}
+
+	mockPools := make(map[string]hp.HostPool, 0)
+	for name, capacity := range pools {
+		mpool := hostmgr_hostpool_mocks.NewMockHostPool(suite.ctrl)
+		mpool.EXPECT().ID().Return(name)
+		mpool.EXPECT().Capacity().Return(capacity)
+		mockPools[name] = mpool
+	}
+	suite.hostPoolManager.EXPECT().Pools().Return(mockPools)
+
+	resp, err := suite.handler.GetHostPoolCapacity(
+		suite.ctx,
+		&hostsvc.GetHostPoolCapacityRequest{})
+	suite.Nil(err)
+
+	suite.Equal(len(pools), len(resp.Pools))
+	for _, hpRes := range resp.Pools {
+		mult := 0.0
+		switch hpRes.PoolName {
+		case "pool0":
+			mult = 1.0
+		case "pool1":
+			mult = 2.0
+		case "pool2":
+			mult = 3.0
+		default:
+			suite.Fail("Unknown pool %s", hpRes.PoolName)
+			continue
+		}
+		name := hpRes.PoolName
+		for _, r := range hpRes.PhysicalCapacity {
+			switch r.Kind {
+			case "cpu":
+				suite.Equal(mult*phy.CPU, r.Capacity, "Pool %s cpu", name)
+			case "mem":
+				suite.Equal(mult*phy.Mem, r.Capacity, "Pool %s mem", name)
+			case "disk":
+				suite.Equal(mult*phy.Disk, r.Capacity, "Pool %s disk", name)
+			case "gpu":
+				suite.Equal(mult*phy.GPU, r.Capacity, "Pool %s gpu", name)
+			}
+		}
+		for _, r := range hpRes.SlackCapacity {
+			switch r.Kind {
+			case "cpu":
+				suite.Equal(mult*slack.CPU, r.Capacity, "Pool %s cpu", name)
+			}
+		}
+	}
+}
+
+// TestGetHostPoolCapacityHostPoolDisabled tests GetHostPoolCapacity API when
+// host-pools are disabled.
+func (suite *HostMgrHandlerTestSuite) TestGetHostPoolCapacityHostPoolDisabled() {
+	suite.handler.hostPoolManager = nil
+	resp, err := suite.handler.GetHostPoolCapacity(
+		suite.ctx,
+		&hostsvc.GetHostPoolCapacityRequest{})
+	suite.Error(err)
+	suite.Nil(resp)
 }

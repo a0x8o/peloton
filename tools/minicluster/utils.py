@@ -1,63 +1,76 @@
 #!/usr/bin/env python
 
-from docker import Client
 import os
 import requests
+from socket import socket
 import time
+import yaml
 
 import print_utils
 
-cli = Client(base_url="unix://var/run/docker.sock")
-max_retry_attempts = 20
+HTTP_LOCALHOST = "http://localhost"
+
+max_retry_attempts = 100
 default_host = "localhost"
 healthcheck_path = "/health"
-sleep_time_secs = 5
+sleep_time_secs = 1
 
 
 #
-# Get container local ip.
-# IP address returned is only reachable on the local machine and within
-# the container.
+# Load configs from file
 #
-def get_container_ip(container_name):
-    cmd = "docker inspect "
-    cmd += '-f "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}" %s'
-    return os.popen(cmd % container_name).read().strip()
+def default_config(config='config.yaml', dir=""):
+    config_file = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)) + dir, config
+    )
+    with open(config_file, "r") as f:
+        config = yaml.load(f, Loader=yaml.FullLoader)
+    return config
 
 
 #
-# Force remove container by name (best effort)
+# Returns whether the zk listening on the given port is ready.
 #
-def remove_existing_container(name):
-    try:
-        cli.remove_container(name, force=True)
-        print_utils.okblue("removed container %s" % name)
-    except Exception as e:
-        if "No such container" in str(e):
-            return
-        raise e
+def is_zk_ready(port):
+    cmd = "bash -c 'echo ruok | nc localhost {}'".format(port)
+    return os.popen(cmd).read().strip() == "imok"
 
 
 #
-# Stop container by name
+# Returns a free port on the host.
 #
-def stop_container(name):
-    try:
-        cli.stop(name, timeout=5)
-        print_utils.okblue("stopped container %s" % name)
-    except Exception as e:
-        if "No such container" in str(e):
-            return
-        raise e
+def find_free_port():
+    s = socket()
+    s.bind(('', 0))
+    port = s.getsockname()[1]
+    s.close()
+    return port
+
+
+#
+# Goes through the input list and replaces any integer it finds with a random
+# free port. If one of the elements is a list itself, we will recursively
+# perform this operation in there.
+#
+def randomize_ports(array):
+    for i in range(0, len(array)):
+        if type(array[i]) is int:
+            array[i] = find_free_port()
+        elif type(array[i]) is list:
+            array[i] = randomize_ports(array[i])
+        else:
+            raise Exception("randomize_ports must only be called on lists " +
+                            "of lists or integers")
+    return array
 
 
 #
 # Run health check for peloton apps
 #
-def wait_for_up(app, port):
+def wait_for_up(app, port, path=healthcheck_path):
     count = 0
     error = ""
-    url = "http://%s:%s/%s" % (default_host, port, healthcheck_path)
+    url = "http://%s:%s/%s" % (default_host, port, path)
     while count < max_retry_attempts:
         try:
             r = requests.get(url)
@@ -65,7 +78,9 @@ def wait_for_up(app, port):
                 print_utils.okgreen("started %s" % app)
                 return
         except Exception as e:
-            print_utils.warn("app %s is not up yet, retrying..." % app)
+            if count % 5 == 1:
+                msg = "app %s is not up yet, retrying at %s" % (app, url)
+                print_utils.warn(msg)
             error = str(e)
             time.sleep(sleep_time_secs)
             count += 1

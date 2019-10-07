@@ -1,5 +1,5 @@
-.PHONY: all apiserver placement install cli test unit_test cover lint clean \
-	hostmgr jobmgr resmgr docker version debs docker-push \
+.PHONY: all apiserver mock-cqos placement install cli test unit_test cover lint\
+clean hostmgr jobmgr resmgr docker version debs docker-push \
 	test-containers archiver failure-test-minicluster \
 	failure-test-vcluster aurorabridge docs migratedb
 
@@ -51,7 +51,8 @@ endif
 
 .PRECIOUS: $(GENS) $(LOCAL_MOCKS) $(VENDOR_MOCKS) mockgens
 
-all: gens placement cli hostmgr resmgr jobmgr archiver aurorabridge apiserver migratedb
+all: gens placement cli hostmgr resmgr jobmgr archiver aurorabridge apiserver \
+migratedb mock-cqos
 
 cli:
 	go build $(GO_FLAGS) -o ./$(BIN_DIR)/peloton cmd/cli/*.go
@@ -79,6 +80,9 @@ apiserver:
 
 migratedb:
 	go build $(GO_FLAGS) -o ./$(BIN_DIR)/migratedb cmd/migratedb/*.go
+
+mock-cqos:
+	go build $(GO_FLAGS) -o ./$(BIN_DIR)/peloton-mock-cqos cmd/mock-cqos/*.go
 
 # Use the same version of mockgen in unit tests as in mock generation
 build-mockgen:
@@ -208,20 +212,24 @@ mockgens: build-mockgen gens $(GOMOCK)
 	$(call local_mockgen,pkg/common/leader,Candidate;Discovery;Nomination)
 	$(call local_mockgen,pkg/middleware/inbound,APILockInterface)
 	$(call local_mockgen,pkg/hostmgr,RecoveryHandler)
-	$(call local_mockgen,pkg/hostmgr/host,Drainer;MaintenanceHostInfoMap)
+	$(call local_mockgen,pkg/hostmgr/goalstate,Driver)
+	$(call local_mockgen,pkg/hostmgr/host/drainer,Drainer)
 	$(call local_mockgen,pkg/hostmgr/hostpool,HostPool)
+	$(call local_mockgen,pkg/hostmgr/hostpool/hostmover,HostMover)
 	$(call local_mockgen,pkg/hostmgr/hostpool/manager,HostPoolManager)
+	$(call local_mockgen,pkg/hostmgr/hostpool/hostmover,HostMover)
 	$(call local_mockgen,pkg/hostmgr/mesos,MasterDetector;FrameworkInfoProvider)
 	$(call local_mockgen,pkg/hostmgr/offer,EventHandler)
 	$(call local_mockgen,pkg/hostmgr/offer/offerpool,Pool)
-	$(call local_mockgen,pkg/hostmgr/queue,MaintenanceQueue)
+	$(call local_mockgen,pkg/hostmgr/queue,TaskQueue)
 	$(call local_mockgen,pkg/hostmgr/summary,HostSummary)
 	$(call local_mockgen,pkg/hostmgr/reconcile,TaskReconciler)
 	$(call local_mockgen,pkg/hostmgr/reserver,Reserver)
 	$(call local_mockgen,pkg/hostmgr/watchevent,WatchProcessor)
 	$(call local_mockgen,pkg/hostmgr/mesos/yarpc/encoding/mpb,SchedulerClient;MasterOperatorClient)
 	$(call local_mockgen,pkg/hostmgr/mesos/yarpc/transport/mhttp,Inbound)
-	$(call local_mockgen,pkg/hostmgr/p2k/hostcache,HostCache;HostSummary)
+	$(call local_mockgen,pkg/hostmgr/p2k/hostcache,HostCache)
+	$(call local_mockgen,pkg/hostmgr/p2k/hostcache/hostsummary,HostSummary)
 	$(call local_mockgen,pkg/hostmgr/p2k/plugins,Plugin)
 	$(call local_mockgen,pkg/jobmgr/cached,JobFactory;Job;Task;JobConfigCache;Update)
 	$(call local_mockgen,pkg/jobmgr/goalstate,Driver)
@@ -243,7 +251,7 @@ mockgens: build-mockgen gens $(GOMOCK)
 	$(call local_mockgen,pkg/resmgr/task,Scheduler;Tracker)
 	$(call local_mockgen,pkg/storage,JobStore;TaskStore;UpdateStore;FrameworkInfoStore;PersistentVolumeStore)
 	$(call local_mockgen,pkg/storage/cassandra/api,DataStore)
-	$(call local_mockgen,pkg/storage/objects,JobIndexOps;JobNameToIDOps;JobConfigOps;SecretInfoOps;JobRuntimeOps;ResPoolOps;PodEventsOps;JobUpdateEventsOps;ActiveJobsOps;TaskConfigV2Ops)
+	$(call local_mockgen,pkg/storage/objects,JobIndexOps;JobNameToIDOps;JobConfigOps;SecretInfoOps;JobRuntimeOps;ResPoolOps;PodEventsOps;JobUpdateEventsOps;ActiveJobsOps;TaskConfigV2Ops;HostInfoOps)
 	$(call local_mockgen,pkg/storage/orm,Client;Connector;Iterator)
 	$(call local_mockgen,.gen/peloton/api/v0/host/svc,HostServiceYARPCClient)
 	$(call local_mockgen,.gen/peloton/api/v0/job,JobManagerYARPCClient)
@@ -288,6 +296,9 @@ stateless-integ-test: $(GOKIND)
 aurorabridge-integ-test: $(GOKIND)
 	ls -la $(shell pwd)/bin
 	PATH="$(PATH):$(shell pwd)/bin" ./tests/run-aurorabridge-integration-tests.sh
+
+hostpool-integ-test: $(GOKIND)
+	PATH="$(PATH):$(shell pwd)/bin" ./tests/run-hostpool-integration-tests.sh
 
 # launch peloton with PELOTON={any value}, default to none
 minicluster: $(GOKIND)

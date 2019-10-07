@@ -32,7 +32,6 @@ import (
 	hostmocks "github.com/uber/peloton/.gen/peloton/private/hostmgr/hostsvc/mocks"
 	"github.com/uber/peloton/.gen/peloton/private/models"
 
-	"github.com/uber/peloton/pkg/common/api"
 	leadermocks "github.com/uber/peloton/pkg/common/leader/mocks"
 	"github.com/uber/peloton/pkg/common/util"
 	cachedmocks "github.com/uber/peloton/pkg/jobmgr/cached/mocks"
@@ -1107,6 +1106,9 @@ func (suite *podHandlerTestSuite) TestRestartPodSuccess() {
 	runtimeDiff[uint32(testInstanceID)] = jobmgrcommon.RuntimeDiff{
 		jobmgrcommon.DesiredMesosTaskIDField: util.CreateMesosTaskID(
 			jobID, uint32(testInstanceID), uint64(testRunID)+1),
+		jobmgrcommon.TerminationStatusField: &pbtask.TerminationStatus{
+			Reason: pbtask.TerminationStatus_TERMINATION_STATUS_REASON_KILLED_FOR_RESTART,
+		},
 	}
 
 	suite.cachedJob.EXPECT().
@@ -1141,6 +1143,60 @@ func (suite *podHandlerTestSuite) TestRestartPodSuccess() {
 	response, err := suite.handler.RestartPod(context.Background(), request)
 	suite.NoError(err)
 	suite.NotNil(response)
+}
+
+// TestRestartPodViolatingSLA tests the case of restarting pod
+// in SLA aware pattern that would violate SLA
+func (suite *podHandlerTestSuite) TestRestartPodViolatingSLA() {
+	jobID := &peloton.JobID{Value: testJobID}
+	mesosTaskID := testPodID
+	taskRuntimeInfo := &pbtask.RuntimeInfo{
+		MesosTaskId: &mesos.TaskID{
+			Value: &mesosTaskID,
+		},
+	}
+	runtimeDiff := make(map[uint32]jobmgrcommon.RuntimeDiff)
+	runtimeDiff[uint32(testInstanceID)] = jobmgrcommon.RuntimeDiff{
+		jobmgrcommon.DesiredMesosTaskIDField: util.CreateMesosTaskID(
+			jobID, uint32(testInstanceID), uint64(testRunID)+1),
+		jobmgrcommon.TerminationStatusField: &pbtask.TerminationStatus{
+			Reason: pbtask.TerminationStatus_TERMINATION_STATUS_REASON_KILLED_FOR_SLA_AWARE_RESTART,
+		},
+	}
+
+	suite.cachedJob.EXPECT().
+		ID().
+		Return(jobID).
+		AnyTimes()
+
+	gomock.InOrder(
+		suite.candidate.EXPECT().
+			IsLeader().
+			Return(true),
+
+		suite.jobFactory.EXPECT().
+			AddJob(&peloton.JobID{Value: testJobID}).
+			Return(suite.cachedJob),
+
+		suite.podStore.EXPECT().
+			GetTaskRuntime(gomock.Any(), jobID, uint32(testInstanceID)).
+			Return(taskRuntimeInfo, nil),
+
+		suite.cachedJob.EXPECT().
+			PatchTasks(gomock.Any(), runtimeDiff, false).
+			Return(nil, nil, nil),
+
+		suite.goalStateDriver.EXPECT().
+			EnqueueTask(jobID, uint32(testInstanceID), gomock.Any()),
+	)
+
+	request := &svc.RestartPodRequest{
+		PodName:  &v1alphapeloton.PodName{Value: testPodName},
+		CheckSla: true,
+	}
+	response, err := suite.handler.RestartPod(context.Background(), request)
+	suite.Error(err)
+	suite.Nil(response)
 }
 
 // TestRestartPodNonLeader tests calling restart pod
@@ -1225,6 +1281,9 @@ func (suite *podHandlerTestSuite) TestRestartPodPatchTasksFailure() {
 	runtimeDiff[uint32(testInstanceID)] = jobmgrcommon.RuntimeDiff{
 		jobmgrcommon.DesiredMesosTaskIDField: util.CreateMesosTaskID(
 			jobID, uint32(testInstanceID), 1),
+		jobmgrcommon.TerminationStatusField: &pbtask.TerminationStatus{
+			Reason: pbtask.TerminationStatus_TERMINATION_STATUS_REASON_KILLED_FOR_RESTART,
+		},
 	}
 
 	suite.cachedJob.EXPECT().
@@ -1295,17 +1354,23 @@ func (suite *podHandlerTestSuite) TestGetPodSuccess() {
 	}
 	mesosTaskID := testPodID
 	prevMesosTaskID := testPrevPodID
-	events := []*pbtask.PodEvent{
+
+	events := []*pod.PodEvent{
 		{
-			TaskId: &mesos.TaskID{
-				Value: &mesosTaskID,
+			PodId: &v1alphapeloton.PodID{
+				Value: mesosTaskID,
 			},
-			ActualState: "RUNNING",
-			GoalState:   "RUNNING",
-			PrevTaskId: &mesos.TaskID{
-				Value: &prevMesosTaskID,
+			PrevPodId: &v1alphapeloton.PodID{
+				Value: prevMesosTaskID,
 			},
-			ConfigVersion: configVersion,
+			Timestamp:    "2019-01-03T22:14:58Z",
+			Message:      "",
+			ActualState:  pod.PodState_POD_STATE_RUNNING.String(),
+			DesiredState: pod.PodState_POD_STATE_RUNNING.String(),
+			Hostname:     "peloton-host-0",
+			Version: &v1alphapeloton.EntityVersion{
+				Value: "1-0-0",
+			},
 		},
 	}
 
@@ -1338,8 +1403,8 @@ func (suite *podHandlerTestSuite) TestGetPodSuccess() {
 			nil,
 		),
 
-		suite.mockedPodEventsOps.EXPECT().
-			GetAll(
+		suite.podStore.EXPECT().
+			GetPodEvents(
 				gomock.Any(),
 				testJobID,
 				uint32(testInstanceID),
@@ -1354,8 +1419,8 @@ func (suite *podHandlerTestSuite) TestGetPodSuccess() {
 				configVersion,
 			),
 
-		suite.mockedPodEventsOps.EXPECT().
-			GetAll(
+		suite.podStore.EXPECT().
+			GetPodEvents(
 				gomock.Any(),
 				testJobID,
 				uint32(testInstanceID),
@@ -1467,28 +1532,41 @@ func (suite *podHandlerTestSuite) TestGetPodSuccessLimit() {
 	}
 	mesosTaskID := testPodID
 	prevMesosTaskID := testPrevPodID
-	events := []*pbtask.PodEvent{
+	events := []*pod.PodEvent{
 		{
-			TaskId: &mesos.TaskID{
-				Value: &mesosTaskID,
+			PodId: &v1alphapeloton.PodID{
+				Value: mesosTaskID,
 			},
-			ActualState: "RUNNING",
-			GoalState:   "RUNNING",
-			PrevTaskId: &mesos.TaskID{
-				Value: &prevMesosTaskID,
+			PrevPodId: &v1alphapeloton.PodID{
+				Value: prevMesosTaskID,
 			},
-			ConfigVersion: configVersion,
+			Timestamp:    "2019-01-03T22:14:58Z",
+			Message:      "",
+			ActualState:  pod.PodState_POD_STATE_RUNNING.String(),
+			DesiredState: pod.PodState_POD_STATE_RUNNING.String(),
+			Hostname:     "peloton-host-0",
+			Version: &v1alphapeloton.EntityVersion{
+				Value: "1-0-0",
+			},
 		},
 	}
 
-	prevEvents := []*pbtask.PodEvent{
+	prevEvents := []*pod.PodEvent{
 		{
-			TaskId: &mesos.TaskID{
-				Value: &prevMesosTaskID,
+			PodId: &v1alphapeloton.PodID{
+				Value: mesosTaskID,
 			},
-			ActualState:   "RUNNING",
-			GoalState:     "RUNNING",
-			ConfigVersion: configVersion,
+			PrevPodId: &v1alphapeloton.PodID{
+				Value: prevMesosTaskID,
+			},
+			Timestamp:    "2019-01-03T22:14:58Z",
+			Message:      "",
+			ActualState:  pod.PodState_POD_STATE_RUNNING.String(),
+			DesiredState: pod.PodState_POD_STATE_RUNNING.String(),
+			Hostname:     "peloton-host-0",
+			Version: &v1alphapeloton.EntityVersion{
+				Value: "1-0-0",
+			},
 		},
 	}
 
@@ -1521,8 +1599,8 @@ func (suite *podHandlerTestSuite) TestGetPodSuccessLimit() {
 			nil,
 		),
 
-		suite.mockedPodEventsOps.EXPECT().
-			GetAll(
+		suite.podStore.EXPECT().
+			GetPodEvents(
 				gomock.Any(),
 				testJobID,
 				uint32(testInstanceID),
@@ -1537,8 +1615,8 @@ func (suite *podHandlerTestSuite) TestGetPodSuccessLimit() {
 				configVersion,
 			),
 
-		suite.mockedPodEventsOps.EXPECT().
-			GetAll(
+		suite.podStore.EXPECT().
+			GetPodEvents(
 				gomock.Any(),
 				testJobID,
 				uint32(testInstanceID),
@@ -1654,8 +1732,8 @@ func (suite *podHandlerTestSuite) TestGetPodFailureToGetPreviousPodEvents() {
 			nil,
 		),
 
-		suite.mockedPodEventsOps.EXPECT().
-			GetAll(
+		suite.podStore.EXPECT().
+			GetPodEvents(
 				gomock.Any(),
 				testJobID,
 				uint32(testInstanceID),
@@ -1676,26 +1754,25 @@ func (suite *podHandlerTestSuite) TestGetPodEvents() {
 	}
 
 	mesosTaskID := testPodID
-	prevMesosTaskID := "0"
-	events := []*pbtask.PodEvent{
+	events := []*pod.PodEvent{
 		{
-			TaskId: &mesos.TaskID{
-				Value: &mesosTaskID,
+			PodId: &v1alphapeloton.PodID{
+				Value: mesosTaskID,
 			},
-			ActualState: "STARTING",
-			GoalState:   "RUNNING",
-			PrevTaskId: &mesos.TaskID{
-				Value: &prevMesosTaskID,
-			},
+			Timestamp:    "2019-01-03T22:14:58Z",
+			Message:      "",
+			ActualState:  pod.PodState_POD_STATE_RUNNING.String(),
+			DesiredState: pod.PodState_POD_STATE_RUNNING.String(),
+			Hostname:     "peloton-host-0",
 		},
 	}
 
-	suite.mockedPodEventsOps.EXPECT().
-		GetAll(gomock.Any(), testJobID, uint32(testInstanceID), "").
+	suite.podStore.EXPECT().
+		GetPodEvents(gomock.Any(), testJobID, uint32(testInstanceID), "").
 		Return(events, nil)
 	response, err := suite.handler.GetPodEvents(context.Background(), request)
 	suite.NoError(err)
-	suite.Equal(api.ConvertTaskEventsToPodEvents(events), response.GetEvents())
+	suite.Equal(events, response.GetEvents())
 }
 
 // TestGetPodEventsPodNameParseError tests PodName parse error
@@ -1714,8 +1791,8 @@ func (suite *podHandlerTestSuite) TestGetPodEventsStoreError() {
 			Value: testPodName,
 		},
 	}
-	suite.mockedPodEventsOps.EXPECT().
-		GetAll(gomock.Any(), testJobID, uint32(testInstanceID), "").
+	suite.podStore.EXPECT().
+		GetPodEvents(gomock.Any(), testJobID, uint32(testInstanceID), "").
 		Return(nil, fmt.Errorf("fake GetPodEvents error"))
 	_, err := suite.handler.GetPodEvents(context.Background(), request)
 	suite.Error(err)
@@ -1744,21 +1821,23 @@ func (suite *podHandlerTestSuite) TestBrowsePodSandboxSuccess() {
 		},
 	}
 	mesosTaskID := testPodID
-	events := []*pbtask.PodEvent{
+	events := []*pod.PodEvent{
 		{
-			TaskId: &mesos.TaskID{
-				Value: &mesosTaskID,
+			PodId: &v1alphapeloton.PodID{
+				Value: mesosTaskID,
 			},
-			ActualState: pbtask.TaskState_RUNNING.String(),
-			Hostname:    hostname,
-			AgentID:     agentID,
+			ActualState:  pod.PodState_POD_STATE_RUNNING.String(),
+			DesiredState: pod.PodState_POD_STATE_RUNNING.String(),
+			Hostname:     hostname,
+			AgentId:      agentID,
 		},
 	}
+
 	logPaths := []string{}
 
 	gomock.InOrder(
-		suite.mockedPodEventsOps.EXPECT().
-			GetAll(gomock.Any(), testJobID, uint32(testInstanceID), testPodID).
+		suite.podStore.EXPECT().
+			GetPodEvents(gomock.Any(), testJobID, uint32(testInstanceID), testPodID).
 			Return(events, nil),
 
 		suite.frameworkInfoStore.EXPECT().
@@ -1818,8 +1897,8 @@ func (suite *podHandlerTestSuite) TestBrowsePodSandboxGetPodEventsFailure() {
 		},
 	}
 
-	suite.mockedPodEventsOps.EXPECT().
-		GetAll(gomock.Any(), testJobID, uint32(testInstanceID), "").
+	suite.podStore.EXPECT().
+		GetPodEvents(gomock.Any(), testJobID, uint32(testInstanceID), "").
 		Return(nil, yarpcerrors.NotFoundErrorf("test error"))
 	_, err := suite.handler.BrowsePodSandbox(context.Background(), request)
 	suite.Error(err)
@@ -1833,8 +1912,8 @@ func (suite *podHandlerTestSuite) TestBrowsePodSandboxAbort() {
 		},
 	}
 
-	suite.mockedPodEventsOps.EXPECT().
-		GetAll(gomock.Any(), testJobID, uint32(testInstanceID), "").
+	suite.podStore.EXPECT().
+		GetPodEvents(gomock.Any(), testJobID, uint32(testInstanceID), "").
 		Return(nil, nil)
 	_, err := suite.handler.BrowsePodSandbox(context.Background(), request)
 	suite.Error(err)
@@ -1850,20 +1929,21 @@ func (suite *podHandlerTestSuite) TestBrowsePodSandboxGetFrameworkIDFailure() {
 	}
 
 	mesosTaskID := testPodID
-	events := []*pbtask.PodEvent{
+	events := []*pod.PodEvent{
 		{
-			TaskId: &mesos.TaskID{
-				Value: &mesosTaskID,
+			PodId: &v1alphapeloton.PodID{
+				Value: mesosTaskID,
 			},
-			ActualState: pbtask.TaskState_RUNNING.String(),
-			Hostname:    "hostname",
-			AgentID:     "agentID",
+			ActualState:  pod.PodState_POD_STATE_RUNNING.String(),
+			DesiredState: pod.PodState_POD_STATE_RUNNING.String(),
+			Hostname:     "hostname",
+			AgentId:      "agentId",
 		},
 	}
 
 	gomock.InOrder(
-		suite.mockedPodEventsOps.EXPECT().
-			GetAll(gomock.Any(), testJobID, uint32(testInstanceID), "").
+		suite.podStore.EXPECT().
+			GetPodEvents(gomock.Any(), testJobID, uint32(testInstanceID), "").
 			Return(events, nil),
 
 		suite.frameworkInfoStore.EXPECT().
@@ -1876,8 +1956,8 @@ func (suite *podHandlerTestSuite) TestBrowsePodSandboxGetFrameworkIDFailure() {
 
 	// Test error due to empty framework id
 	gomock.InOrder(
-		suite.mockedPodEventsOps.EXPECT().
-			GetAll(gomock.Any(), testJobID, uint32(testInstanceID), "").
+		suite.podStore.EXPECT().
+			GetPodEvents(gomock.Any(), testJobID, uint32(testInstanceID), "").
 			Return(events, nil),
 
 		suite.frameworkInfoStore.EXPECT().
@@ -1906,20 +1986,22 @@ func (suite *podHandlerTestSuite) TestBrowsePodSandboxListSandboxFilesPathsFailu
 	agentID := "agentID"
 	agents := []*mesosmaster.Response_GetAgents_Agent{}
 	mesosTaskID := testPodID
-	events := []*pbtask.PodEvent{
+
+	events := []*pod.PodEvent{
 		{
-			TaskId: &mesos.TaskID{
-				Value: &mesosTaskID,
+			PodId: &v1alphapeloton.PodID{
+				Value: mesosTaskID,
 			},
-			ActualState: pbtask.TaskState_RUNNING.String(),
-			Hostname:    hostname,
-			AgentID:     agentID,
+			ActualState:  pod.PodState_POD_STATE_RUNNING.String(),
+			DesiredState: pod.PodState_POD_STATE_RUNNING.String(),
+			Hostname:     hostname,
+			AgentId:      agentID,
 		},
 	}
 
 	gomock.InOrder(
-		suite.mockedPodEventsOps.EXPECT().
-			GetAll(gomock.Any(), testJobID, uint32(testInstanceID), testPodID).
+		suite.podStore.EXPECT().
+			GetPodEvents(gomock.Any(), testJobID, uint32(testInstanceID), testPodID).
 			Return(events, nil),
 
 		suite.frameworkInfoStore.EXPECT().
@@ -1971,21 +2053,23 @@ func (suite *podHandlerTestSuite) TestBrowsePodSandboxGetMesosMasterHostPortFail
 		},
 	}
 	mesosTaskID := testPodID
-	events := []*pbtask.PodEvent{
+
+	events := []*pod.PodEvent{
 		{
-			TaskId: &mesos.TaskID{
-				Value: &mesosTaskID,
+			PodId: &v1alphapeloton.PodID{
+				Value: mesosTaskID,
 			},
-			ActualState: pbtask.TaskState_RUNNING.String(),
-			Hostname:    hostname,
-			AgentID:     agentID,
+			ActualState:  pod.PodState_POD_STATE_RUNNING.String(),
+			DesiredState: pod.PodState_POD_STATE_RUNNING.String(),
+			Hostname:     hostname,
+			AgentId:      agentID,
 		},
 	}
 	logPaths := []string{}
 
 	gomock.InOrder(
-		suite.mockedPodEventsOps.EXPECT().
-			GetAll(gomock.Any(), testJobID, uint32(testInstanceID), testPodID).
+		suite.podStore.EXPECT().
+			GetPodEvents(gomock.Any(), testJobID, uint32(testInstanceID), testPodID).
 			Return(events, nil),
 
 		suite.frameworkInfoStore.EXPECT().

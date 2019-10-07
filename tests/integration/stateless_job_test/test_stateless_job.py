@@ -40,6 +40,7 @@ pytestmark = [
 log = logging.getLogger(__name__)
 
 
+@pytest.mark.k8s
 @pytest.mark.smoketest
 def test__create_job(stateless_job):
     stateless_job.create()
@@ -60,6 +61,7 @@ def test__create_job(stateless_job):
     assert len(podSummaries) == statelessJobSummary.instance_count
 
 
+@pytest.mark.k8s
 @pytest.mark.smoketest
 def test__stop_stateless_job(stateless_job):
     stateless_job.create()
@@ -68,6 +70,7 @@ def test__stop_stateless_job(stateless_job):
     stateless_job.wait_for_state(goal_state="KILLED")
 
 
+@pytest.mark.k8s
 @pytest.mark.smoketest
 def test__create_job_without_default_spec(stateless_job):
     default_spec = stateless_job.job_spec.default_spec
@@ -79,6 +82,7 @@ def test__create_job_without_default_spec(stateless_job):
     stateless_job.wait_for_state(goal_state="RUNNING")
 
 
+@pytest.mark.k8s
 @pytest.mark.smoketest
 def test__stop_start_all_tasks_stateless_kills_tasks_and_job(stateless_job):
     stateless_job.create()
@@ -91,29 +95,27 @@ def test__stop_start_all_tasks_stateless_kills_tasks_and_job(stateless_job):
     stateless_job.wait_for_all_pods_running()
 
 
-def test__exit_task_automatically_restart():
-    job = StatelessJob(
-        job_file="test_stateless_job_exit_without_err_spec.yaml",
-        config=IntegrationTestConfig(
-            max_retry_attempts=100,
-            pool_file='test_stateless_respool.yaml',
-        ),
-    )
-    job.create()
-    job.wait_for_state(goal_state="RUNNING")
+@pytest.mark.k8s
+def test__exit_task_automatically_restart(stateless_job):
+    stateless_job.config = IntegrationTestConfig(
+        max_retry_attempts=100,
+        pool_file='test_stateless_respool.yaml')
+    stateless_job.set_command('sleep', args=['10'])
+    stateless_job.create()
+    stateless_job.wait_for_state(goal_state="RUNNING")
 
-    old_pod_id = job.get_pod(0).get_pod_status().pod_id.value
+    old_pod_id = stateless_job.get_pod(0).get_pod_status().pod_id.value
 
     def job_not_running():
-        return job.get_status().state != "JOB_STATE_RUNNING"
+        return stateless_job.get_status().state != "JOB_STATE_RUNNING"
 
-    job.wait_for_condition(job_not_running)
+    stateless_job.wait_for_condition(job_not_running)
 
     def pod_id_changed():
-        new_pod_id = job.get_pod(0).get_pod_status().pod_id.value
+        new_pod_id = stateless_job.get_pod(0).get_pod_status().pod_id.value
         return old_pod_id != new_pod_id
 
-    job.wait_for_condition(pod_id_changed)
+    stateless_job.wait_for_condition(pod_id_changed)
 
 
 def test__failed_task_automatically_restart():
@@ -428,6 +430,7 @@ def test__restart_running_job(stateless_job, in_place):
 
 
 # test restarting killed job without batch size,
+@pytest.mark.k8s
 def test__restart_killed_job(stateless_job, in_place):
     stateless_job.create()
     stateless_job.wait_for_state(goal_state="RUNNING")
@@ -718,6 +721,40 @@ def test__delete_sla_violated_job():
         assert e.code() == grpc.StatusCode.NOT_FOUND
         return
     raise Exception("job not found error not received")
+
+
+# Test restart job manager when waiting for pod kill due to
+# host maintenance which can violate job SLA.
+def test__host_maintenance_violate_sla_restart_jobmgr(stateless_job, maintenance, jobmgr):
+    """
+    1. Create a stateless job(instance_count=4) with host-limit-1 constraint and
+       MaximumUnavailableInstances=1. Since there are only 3 UP hosts, one of
+       the instances will not get placed (hence unavailable).
+    2. Start host maintenance on one of the hosts (say A).
+    3. Restart job manager.
+    4. Since one instance is already unavailable, no more instances should be
+       killed due to host maintenance. Verify that host A does not transition to DOWN
+    """
+    job_spec_dump = load_test_config('test_stateless_job_spec_sla.yaml')
+    json_format.ParseDict(job_spec_dump, stateless_job.job_spec)
+    stateless_job.job_spec.instance_count = 4
+    stateless_job.create()
+    stateless_job.wait_for_all_pods_running(num_pods=3)
+
+    # Pick a host that is UP and start maintenance on it
+    test_host1 = get_host_in_state(host_pb2.HOST_STATE_UP)
+    resp = maintenance["start"]([test_host1])
+    assert resp
+
+    jobmgr.restart()
+
+    try:
+        wait_for_host_state(test_host1, host_pb2.HOST_STATE_DOWN)
+        assert False, 'Host should not transition to DOWN'
+    except:
+        assert is_host_in_state(test_host1, host_pb2.HOST_STATE_DRAINING)
+        assert len(stateless_job.query_pods(
+            states=[pod_pb2.POD_STATE_RUNNING])) == 3
 
 
 # Test pod stop/start for a job whose SLA is violated

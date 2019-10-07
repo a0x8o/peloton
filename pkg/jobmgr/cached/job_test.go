@@ -31,6 +31,7 @@ import (
 	"github.com/uber/peloton/.gen/peloton/private/models"
 
 	"github.com/uber/peloton/pkg/common"
+	"github.com/uber/peloton/pkg/common/api"
 	versionutil "github.com/uber/peloton/pkg/common/util/entityversion"
 	jobmgrcommon "github.com/uber/peloton/pkg/jobmgr/common"
 	storemocks "github.com/uber/peloton/pkg/storage/mocks"
@@ -230,11 +231,16 @@ func (suite *jobTestSuite) checkListeners() {
 	for i, l := range suite.listeners {
 		msg := fmt.Sprintf("Listener %d", i)
 		jobSummary, updateInfo := suite.job.generateJobSummaryFromCache(suite.job.runtime, suite.job.runtime.GetUpdateID())
+		s := api.ConvertJobSummary(jobSummary, updateInfo)
 
-		suite.Equal(suite.jobID, l.jobID, msg)
-		suite.Equal(suite.job.GetJobType(), l.jobType, msg)
-		suite.Equal(jobSummary, l.jobSummary, msg)
-		suite.Equal(updateInfo, l.updateInfo, msg)
+		if l.jobType == pbjob.JobType_SERVICE {
+			suite.Equal(s, l.statelessJobSummary, msg)
+		}
+
+		if l.jobType == pbjob.JobType_BATCH {
+			suite.Equal(suite.jobID, l.jobID, msg)
+			suite.Equal(jobSummary, l.jobSummary, msg)
+		}
 	}
 }
 
@@ -245,7 +251,7 @@ func (suite *jobTestSuite) checkListenersNotCalled() {
 		msg := fmt.Sprintf("Listener %d", i)
 		suite.Nil(l.jobID, msg)
 		suite.Nil(l.jobSummary, msg)
-		suite.Nil(l.updateInfo, msg)
+		suite.Nil(l.statelessJobSummary, msg)
 	}
 }
 
@@ -1569,13 +1575,13 @@ func (suite *jobTestSuite) TestJobCreate() {
 		}).Return(nil)
 
 	suite.jobIndexOps.EXPECT().
-		Create(gomock.Any(), suite.jobID, gomock.Any(), gomock.Any(), gomock.Any()).
+		Create(gomock.Any(), suite.jobID, gomock.Any(), gomock.Any()).
 		Do(func(
 			_ context.Context,
 			_ *peloton.JobID,
 			config *pbjob.JobConfig,
 			runtime *pbjob.RuntimeInfo,
-			sla *pbjob.SlaConfig) {
+		) {
 			suite.Equal(config.InstanceCount, jobConfig.InstanceCount)
 			suite.Equal(config.Type, jobConfig.Type)
 			suite.Equal(runtime.GetState(), pbjob.JobState_INITIALIZED)
@@ -2136,13 +2142,18 @@ func (suite *jobTestSuite) TestPatchTasksForUpdate() {
 // TestPatchTasksSLAAwareViolation tests the case of skipping
 // the patching tasks which violate the job SLA
 func (suite *jobTestSuite) TestPatchTasksSLAAwareViolation() {
+	mesosTaskID0 := "941ff353-ba82-49fe-8f80-fb5bc649b04d-0-2"
+	mesosTaskID1 := "941ff353-ba82-49fe-8f80-fb5bc649b04d-1-2"
+	newMesosTaskID0 := "941ff353-ba82-49fe-8f80-fb5bc649b04d-0-3"
+	newMesosTaskID1 := "941ff353-ba82-49fe-8f80-fb5bc649b04d-1-3"
+
 	suite.job.jobType = pbjob.JobType_SERVICE
 	suite.job.config.sla = &pbjob.SlaConfig{
 		MaximumUnavailableInstances: 1,
 	}
 
 	unavailableInstances := make(map[uint32]bool)
-	unavailableInstances[1] = true
+	unavailableInstances[2] = true
 	suite.job.instanceAvailabilityInfo = &instanceAvailabilityInfo{
 		unavailableInstances: unavailableInstances,
 		killedInstances:      make(map[uint32]bool),
@@ -2151,25 +2162,46 @@ func (suite *jobTestSuite) TestPatchTasksSLAAwareViolation() {
 	diffs := make(map[uint32]jobmgrcommon.RuntimeDiff)
 	diffs[0] = jobmgrcommon.RuntimeDiff{
 		jobmgrcommon.DesiredMesosTaskIDField: &mesos.TaskID{
-			Value: &[]string{testNewMesosTaskID}[0],
+			Value: &mesosTaskID0,
 		},
 		jobmgrcommon.TerminationStatusField: &pbtask.TerminationStatus{
 			Reason: pbtask.TerminationStatus_TERMINATION_STATUS_REASON_KILLED_HOST_MAINTENANCE,
 		},
 	}
 
-	oldRuntime := &pbtask.RuntimeInfo{
+	diffs[1] = jobmgrcommon.RuntimeDiff{
+		jobmgrcommon.DesiredMesosTaskIDField: &mesos.TaskID{
+			Value: &mesosTaskID1,
+		},
+		jobmgrcommon.TerminationStatusField: &pbtask.TerminationStatus{
+			Reason: pbtask.TerminationStatus_TERMINATION_STATUS_REASON_KILLED_FOR_SLA_AWARE_RESTART,
+		},
+	}
+
+	tt := suite.job.addTaskToJobMap(0)
+	tt.runtime = &pbtask.RuntimeInfo{
 		State:     pbtask.TaskState_RUNNING,
 		GoalState: pbtask.TaskState_RUNNING,
 		MesosTaskId: &mesos.TaskID{
-			Value: &[]string{testMesosTaskID}[0],
+			Value: &mesosTaskID0,
 		},
 		DesiredMesosTaskId: &mesos.TaskID{
-			Value: &[]string{testMesosTaskID}[0],
+			Value: &newMesosTaskID0,
 		},
 	}
-	tt := suite.job.addTaskToJobMap(0)
-	tt.runtime = oldRuntime
+	tt.config = &taskConfigCache{}
+
+	tt = suite.job.addTaskToJobMap(1)
+	tt.runtime = &pbtask.RuntimeInfo{
+		State:     pbtask.TaskState_RUNNING,
+		GoalState: pbtask.TaskState_RUNNING,
+		MesosTaskId: &mesos.TaskID{
+			Value: &mesosTaskID1,
+		},
+		DesiredMesosTaskId: &mesos.TaskID{
+			Value: &newMesosTaskID1,
+		},
+	}
 	tt.config = &taskConfigCache{}
 
 	s, r, err := suite.job.PatchTasks(context.Background(), diffs, false)
@@ -2181,7 +2213,7 @@ func (suite *jobTestSuite) TestPatchTasksSLAAwareViolation() {
 	att := suite.job.GetTask(0)
 	actRuntime, err := att.GetRuntime(context.Background())
 	suite.NoError(err)
-	suite.Equal(testMesosTaskID, actRuntime.GetDesiredMesosTaskId().GetValue())
+	suite.Equal(newMesosTaskID0, actRuntime.GetDesiredMesosTaskId().GetValue())
 }
 
 // TestPatchTasksForcePatch tests the case of force
@@ -5943,7 +5975,7 @@ func (suite *jobTestSuite) TestJobRollingCreateSuccess() {
 			suite.Equal(runtime.GetState(), pbjob.JobState_PENDING)
 		}).Return(nil)
 	suite.jobIndexOps.EXPECT().
-		Create(gomock.Any(), suite.jobID, gomock.Any(), gomock.Any(), gomock.Any()).
+		Create(gomock.Any(), suite.jobID, gomock.Any(), gomock.Any()).
 		Return(nil)
 
 	err := suite.job.RollingCreate(

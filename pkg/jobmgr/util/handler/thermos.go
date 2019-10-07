@@ -15,9 +15,9 @@
 package handler
 
 import (
-	"bytes"
 	"encoding/json"
 	"math"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -31,11 +31,11 @@ import (
 
 	"github.com/uber/peloton/pkg/common/config"
 	"github.com/uber/peloton/pkg/common/taskconfig"
+	"github.com/uber/peloton/pkg/common/thermos"
 	"github.com/uber/peloton/pkg/jobmgr/util/expansion"
 
 	"github.com/gogo/protobuf/proto"
 	"github.com/pkg/errors"
-	"go.uber.org/thriftrw/protocol"
 	"go.uber.org/thriftrw/ptr"
 )
 
@@ -46,6 +46,21 @@ const (
 
 	MbInBytes = 1024 * 1024
 )
+
+// portSpecByName sorts a list of port spec by name
+type portSpecByName []*pod.PortSpec
+
+func (p portSpecByName) Len() int {
+	return len(p)
+}
+
+func (p portSpecByName) Swap(i, j int) {
+	p[i], p[j] = p[j], p[i]
+}
+
+func (p portSpecByName) Less(i, j int) bool {
+	return strings.Compare(p[i].GetName(), p[j].GetName()) < 0
+}
 
 // ConvertForThermosExecutor takes JobSpec as an input, generates and attaches
 // thermos executor data if conversion could happen, and returns a mutated
@@ -198,10 +213,6 @@ func requiresThermosConvert(podSpec *pod.PodSpec) (bool, error) {
 				return false, yarpcerrors.InvalidArgumentErrorf("environment variable name not defined")
 			}
 
-			if len(e.GetValue()) == 0 {
-				return false, yarpcerrors.InvalidArgumentErrorf("environment variable value not defined")
-			}
-
 			if _, ok := envs[e.GetName()]; ok {
 				return false, yarpcerrors.InvalidArgumentErrorf("duplicate environment variable not allowed")
 			}
@@ -295,6 +306,10 @@ func collectResources(podSpec *pod.PodSpec) (*pod.ResourceSpec, []*pod.PortSpec)
 	for _, p := range portsMap {
 		resultPorts = append(resultPorts, p)
 	}
+
+	// Make sure the order of the ports are consistent to avoid
+	// unnecessary job restarts.
+	sort.Stable(portSpecByName(resultPorts))
 
 	return resultRes, resultPorts
 }
@@ -658,23 +673,6 @@ func convertCmdline(
 	return strings.Join(cmd, " ")
 }
 
-// convertTaskConfigToBinary converts thermos executor data thrift struct
-// to byte array using thrift binary encoding.
-func convertTaskConfigToBinary(config *aurora.TaskConfig) ([]byte, error) {
-	configWire, err := config.ToWire()
-	if err != nil {
-		return nil, err
-	}
-
-	var configBuffer bytes.Buffer
-	err = protocol.Binary.Encode(configWire, &configBuffer)
-	if err != nil {
-		return nil, err
-	}
-
-	return configBuffer.Bytes(), nil
-}
-
 // convertToData converts Peloton PodSpec to thermos executor data
 // encoded in thrift binary protocol.
 func convertToData(
@@ -686,7 +684,7 @@ func convertToData(
 		return nil, err
 	}
 
-	taskConfigBytes, err := convertTaskConfigToBinary(taskConfig)
+	taskConfigBytes, err := thermos.EncodeTaskConfig(taskConfig)
 	if err != nil {
 		return nil, err
 	}

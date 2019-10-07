@@ -36,6 +36,7 @@ import (
 	hostmgr_mesos "github.com/uber/peloton/pkg/hostmgr/mesos"
 	"github.com/uber/peloton/pkg/hostmgr/mesos/yarpc/encoding/mpb"
 	"github.com/uber/peloton/pkg/hostmgr/offer/offerpool"
+	mesosplugins "github.com/uber/peloton/pkg/hostmgr/p2k/plugins/mesos"
 	"github.com/uber/peloton/pkg/hostmgr/prune"
 	"github.com/uber/peloton/pkg/hostmgr/watchevent"
 
@@ -102,6 +103,9 @@ type eventHandler struct {
 	// used to dedupe same event
 	ackStatusMap sync.Map
 
+	// Temporary measure to pass mesos events into mesos plugin,
+	mesosPlugin *mesosplugins.MesosManager
+
 	metrics *Metrics
 }
 
@@ -136,7 +140,9 @@ func InitEventHandler(
 	ranker binpacking.Ranker,
 	hostMgrConfig config.Config,
 	processor watchevent.WatchProcessor,
-	hostPoolManager manager.HostPoolManager) {
+	hostPoolManager manager.HostPoolManager,
+	mesosPlugin *mesosplugins.MesosManager,
+) {
 
 	if handler != nil {
 		log.Warning("Offer event handler has already been initialized")
@@ -214,6 +220,7 @@ func InitEventHandler(
 		metrics:              NewMetrics(parent),
 		ackChannel:           make(chan *mesos.TaskStatus, hostMgrConfig.TaskUpdateBufferSize),
 		updateAckConcurrency: hostMgrConfig.TaskUpdateAckConcurrency,
+		mesosPlugin:          mesosPlugin,
 	}
 	handler.eventStreamHandler = initEventStreamHandler(
 		d,
@@ -323,7 +330,8 @@ func (h *eventHandler) Offers(ctx context.Context, body *sched.Event) error {
 		}).Info("offers received")
 	}
 	h.offerPool.AddOffers(ctx, event.Offers)
-
+	// temporary measure to hook mesos plugins
+	h.mesosPlugin.Offers(ctx, body)
 	return nil
 }
 
@@ -344,7 +352,8 @@ func (h *eventHandler) Rescind(ctx context.Context, body *sched.Event) error {
 	event := body.GetRescind()
 	log.WithField("event", event).Debug("OfferManager: processing Rescind event")
 	h.offerPool.RescindOffer(event.OfferId)
-
+	// temporary measure to hook mesos plugins
+	h.mesosPlugin.Rescind(ctx, body)
 	return nil
 }
 
@@ -394,6 +403,9 @@ func (h *eventHandler) Update(ctx context.Context, body *sched.Event) error {
 		taskUpdate.GetStatus().GetTaskId().GetValue(),
 		util.MesosStateToPelotonState(taskUpdate.GetStatus().GetState()),
 		nil)
+
+	// temporary measure to pass mesos event into plugin
+	h.mesosPlugin.Update(ctx, body)
 
 	// If buffer is full, AddStatusUpdate would fail and peloton would not
 	// ack the status update and mesos master would resend the status update.
@@ -471,8 +483,8 @@ func (h *eventHandler) EventPurged(events []*cirbuf.CircularBufferItem) {
 			h.metrics.taskUpdateAckDeDupe.Inc(1)
 			continue
 		}
-		h.ackChannel <- event.GetMesosTaskStatus()
 		h.ackStatusMap.Store(uid, struct{}{})
+		h.ackChannel <- event.GetMesosTaskStatus()
 	}
 }
 

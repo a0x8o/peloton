@@ -22,7 +22,8 @@ import (
 	"github.com/uber/peloton/pkg/common"
 	"github.com/uber/peloton/pkg/common/background"
 	"github.com/uber/peloton/pkg/common/leader"
-	"github.com/uber/peloton/pkg/hostmgr/host"
+	"github.com/uber/peloton/pkg/hostmgr/host/drainer"
+	hpm "github.com/uber/peloton/pkg/hostmgr/hostpool/manager"
 	"github.com/uber/peloton/pkg/hostmgr/mesos"
 	"github.com/uber/peloton/pkg/hostmgr/mesos/yarpc/transport/mhttp"
 	"github.com/uber/peloton/pkg/hostmgr/metrics"
@@ -78,7 +79,7 @@ type Server struct {
 
 	recoveryHandler RecoveryHandler
 
-	drainer host.Drainer
+	drainer drainer.Drainer
 
 	reserver reserver.Reserver
 
@@ -93,6 +94,11 @@ type Server struct {
 	plugin plugins.Plugin
 
 	hostCache hostcache.HostCache
+
+	// temporary workaround to start mesos manager on server start
+	mesosManager plugins.Plugin
+
+	hostPoolManager hpm.HostPoolManager
 }
 
 // NewServer creates a host manager Server instance.
@@ -105,11 +111,14 @@ func NewServer(
 	mesosOutbound transport.Outbounds,
 	reconciler reconcile.TaskReconciler,
 	recoveryHandler RecoveryHandler,
-	drainer host.Drainer,
+	drainer drainer.Drainer,
 	reserver reserver.Reserver,
 	watchProcessor watchevent.WatchProcessor,
 	plugin plugins.Plugin,
-	hostCache hostcache.HostCache) *Server {
+	hostCache hostcache.HostCache,
+	mesosManager plugins.Plugin,
+	hostPoolManager hpm.HostPoolManager,
+) *Server {
 
 	s := &Server{
 		ID:                   leader.NewID(httpPort, grpcPort),
@@ -129,6 +138,8 @@ func NewServer(
 		watchProcessor:       watchProcessor,
 		plugin:               plugin,
 		hostCache:            hostCache,
+		mesosManager:         mesosManager,
+		hostPoolManager:      hostPoolManager,
 	}
 	log.Info("Hostmgr server started.")
 	return s
@@ -282,6 +293,16 @@ func (s *Server) ensureRunning() {
 		log.Errorf("Failed to start plugin: %s", err)
 		return
 	}
+	if err := s.mesosManager.Start(); err != nil {
+		log.Errorf("Failed to start mesosManager: %s", err)
+		return
+	}
+	if s.hostPoolManager != nil {
+		if err := s.hostPoolManager.Start(); err != nil {
+			log.WithError(err).Error("Failed to start hostpool manager")
+			return
+		}
+	}
 
 	if !s.handlersRunning.Load() {
 		s.startHandlers()
@@ -302,7 +323,11 @@ func (s *Server) ensureStopped() {
 		s.stopHandlers()
 	}
 
+	if s.hostPoolManager != nil {
+		s.hostPoolManager.Stop()
+	}
 	s.plugin.Stop()
+	s.mesosManager.Stop()
 	s.hostCache.Stop()
 }
 

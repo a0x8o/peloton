@@ -212,10 +212,14 @@ var (
 
 	watch = app.Command("watch", "watch job / pod runtime changes")
 
+	watchJob       = watch.Command("job", "watch job runtime changes")
+	watchJobIDList = watchJob.Arg("job", "job identifier").Strings()
+	watchJobLabels = watchJob.Flag("labels", "filter on labels (key:value pairs)").Strings()
+
 	watchPod         = watch.Command("pod", "watch pod runtime changes")
 	watchPodJobID    = watchPod.Arg("job", "job identifier").String()
 	watchPodPodNames = watchPod.Arg("pod", "pod name").Strings()
-	watchLabels      = watchPod.Flag("labels", "filter on labels (key:value pairs)").Strings()
+	watchPodLabels   = watchPod.Flag("labels", "filter on labels (key:value pairs)").Strings()
 
 	watchCancel        = watch.Command("cancel", "cancel watch")
 	watchCancelWatchID = watchCancel.Arg("id", "watch id").Required().String()
@@ -296,6 +300,29 @@ var (
 		"start the update with best effort in-place update").Default("false").Bool()
 	statelessStartPods = statelessReplace.Flag("start-pods",
 		"start pods affected by the update if they are not running").Default("false").Bool()
+
+	statelessRollback              = stateless.Command("rollback", "rollback the job to a previous configuration")
+	statelessRollbackJobID         = statelessRollback.Arg("job", "job identifier").Required().String()
+	statelessRollbackBatchSize     = statelessRollback.Arg("batch-size", "batch size for the rollback").Required().Uint32()
+	statelessRollbackEntityVersion = statelessRollback.Arg("entityVersion",
+		"the entity version for the previous configuration to rollback to").Required().String()
+	statelessRollbackMaxInstanceRetries = statelessRollback.Flag(
+		"maxInstanceRetries",
+		"maximum instance retries to bring up the instance after rollback before marking it failed."+
+			"If the value is 0, the instance can be retried for infinite times.").Default("0").Uint32()
+	statelessRollbackMaxTolerableInstanceFailures = statelessRollback.Flag(
+		"maxTolerableInstanceFailures",
+		"maximum number of instance failures tolerable before failing the rollback."+
+			"If the value is 0, there is no limit for max failure instances and"+
+			"the rollback is marked successful even if all of the instances fail.").Default("0").Uint32()
+	statelessRollbackStartPaused = statelessRollback.Flag("start-paused",
+		"start the rollback in a paused state").Default("false").Bool()
+	statelessRollbackOpaqueData = statelessRollback.Flag("opaque-data",
+		"opaque data provided by the user").Default("").String()
+	statelessRollbackInPlace = statelessRollback.Flag("in-place",
+		"start the rollback with best effort in-place update").Default("false").Bool()
+	statelessRollbackStartPods = statelessRollback.Flag("start-pods",
+		"start pods affected by the rollback if they are not running").Default("false").Bool()
 
 	statelessListJobs = stateless.Command("list", "list all jobs")
 
@@ -525,6 +552,7 @@ var (
 	respoolUpdatePath = respoolUpdate.Arg("respool", "complete path of the "+
 		"resource pool starting from the root").Required().String()
 	respoolUpdateConfig = respoolUpdate.Arg("config", "YAML Resource Pool configuration").Required().ExistingFile()
+	respoolUpdateForce  = respoolUpdate.Flag("force", "force an update even if the validation fails").Short('f').Bool()
 
 	resPoolDump = resPool.Command(
 		"dump",
@@ -659,6 +687,13 @@ var (
 		"hosts",
 		"filter the hosts based on the comma separated hostnames provided",
 	).String()
+	getHostsRevocable = getHosts.Flag(
+		"includeRevocable",
+		"when set to true, resources returned in host would include revocable resources when applicable, "+
+			"which are the same as those available to revocable pods",
+	).
+		Short('r').
+		Bool()
 
 	// command to watch mesos events update present in the event stream
 	watchEventMesosUpdate = hostmgr.Command("events-mesos-update", "watch mesos event update received from mesos")
@@ -960,7 +995,7 @@ func main() {
 	case resPoolCreate.FullCommand():
 		err = client.ResPoolCreateAction(*resPoolCreatePath, *resPoolCreateConfig)
 	case respoolUpdate.FullCommand():
-		err = client.ResPoolUpdateAction(*respoolUpdatePath, *respoolUpdateConfig)
+		err = client.ResPoolUpdateAction(*respoolUpdatePath, *respoolUpdateConfig, *respoolUpdateForce)
 	case resPoolDump.FullCommand():
 		err = client.ResPoolDumpAction(*resPoolDumpFormat)
 	case resPoolDelete.FullCommand():
@@ -1006,6 +1041,7 @@ func main() {
 			*getHostsDisk,
 			*getHostsCmpLess,
 			*getHostsHostnames,
+			*getHostsRevocable,
 		)
 	case disableKillTasks.FullCommand():
 		err = client.DisableKillTasksAction()
@@ -1066,6 +1102,18 @@ func main() {
 			*statelessReplaceOpaqueData,
 			*statelessReplaceInPlace,
 			*statelessStartPods,
+		)
+	case statelessRollback.FullCommand():
+		err = client.StatelessRollbackJobAction(
+			*statelessRollbackJobID,
+			*statelessRollbackBatchSize,
+			*statelessRollbackEntityVersion,
+			*statelessRollbackMaxInstanceRetries,
+			*statelessRollbackMaxTolerableInstanceFailures,
+			*statelessRollbackStartPaused,
+			*statelessRollbackOpaqueData,
+			*statelessRollbackInPlace,
+			*statelessRollbackStartPods,
 		)
 	case statelessReplaceJobDiff.FullCommand():
 		err = client.StatelessReplaceJobDiffAction(
@@ -1138,8 +1186,10 @@ func main() {
 			*statelessDeleteEntityVersion,
 			*statelessDeleteForce,
 		)
+	case watchJob.FullCommand():
+		err = client.WatchJob(*watchJobIDList, *watchJobLabels)
 	case watchPod.FullCommand():
-		err = client.WatchPod(*watchPodJobID, *watchPodPodNames, *watchLabels)
+		err = client.WatchPod(*watchPodJobID, *watchPodPodNames, *watchPodLabels)
 	case watchCancel.FullCommand():
 		err = client.CancelWatch(*watchCancelWatchID)
 	case lock.FullCommand():

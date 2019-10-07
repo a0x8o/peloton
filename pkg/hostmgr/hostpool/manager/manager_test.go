@@ -20,71 +20,100 @@ import (
 	"testing"
 	"time"
 
-	mesospb "github.com/uber/peloton/.gen/mesos/v1"
-	masterpb "github.com/uber/peloton/.gen/mesos/v1/master"
-	pb_host "github.com/uber/peloton/.gen/peloton/api/v0/host"
-	pb_eventstream "github.com/uber/peloton/.gen/peloton/private/eventstream"
+	"github.com/uber/peloton/pkg/common/util"
+
+	pbmesos "github.com/uber/peloton/.gen/mesos/v1"
+	pbmesosmaster "github.com/uber/peloton/.gen/mesos/v1/master"
+	pbhost "github.com/uber/peloton/.gen/peloton/api/v0/host"
+	pbeventstream "github.com/uber/peloton/.gen/peloton/private/eventstream"
+
 	"github.com/uber/peloton/pkg/common"
 	"github.com/uber/peloton/pkg/common/constraints"
 	"github.com/uber/peloton/pkg/common/eventstream"
 	"github.com/uber/peloton/pkg/common/lifecycle"
 	"github.com/uber/peloton/pkg/hostmgr/host"
-	hostmgr_host_mocks "github.com/uber/peloton/pkg/hostmgr/host/mocks"
 	"github.com/uber/peloton/pkg/hostmgr/hostpool"
-	mpb_mocks "github.com/uber/peloton/pkg/hostmgr/mesos/yarpc/encoding/mpb/mocks"
+	mpbmocks "github.com/uber/peloton/pkg/hostmgr/mesos/yarpc/encoding/mpb/mocks"
+	"github.com/uber/peloton/pkg/hostmgr/scalar"
+	orm_mocks "github.com/uber/peloton/pkg/storage/objects/mocks"
 
 	"github.com/golang/mock/gomock"
+	"github.com/pkg/errors"
 	"github.com/stretchr/testify/suite"
 	"github.com/uber-go/tally"
 )
 
 const (
 	_testPoolIDTemplate    = "pool%d"
-	_testReconcileInterval = time.Second
+	_testReconcileInterval = 50 * time.Millisecond
 )
 
 // HostPoolManagerTestSuite is test suite for host pool manager.
 type HostPoolManagerTestSuite struct {
 	suite.Suite
 
-	upMachines         []*mesospb.MachineID
-	drainingMachines   []*mesospb.MachineID
+	ctrl               *gomock.Controller
+	upMachines         []*pbmesos.MachineID
+	drainingMachines   []*pbmesos.MachineID
 	manager            HostPoolManager
 	eventStreamHandler *eventstream.Handler
+	hostCapacity       *host.ResourceCapacity
+	mockHostInfoOps    *orm_mocks.MockHostInfoOps
 }
 
 // SetupTest is setup function for this suite.
 func (suite *HostPoolManagerTestSuite) SetupSuite() {
 	upHost := "host1"
 	upIP := "172.0.0.1"
-	upMachine := &mesospb.MachineID{
+	upMachine := &pbmesos.MachineID{
 		Hostname: &upHost,
 		Ip:       &upIP,
 	}
-	suite.upMachines = []*mesospb.MachineID{upMachine}
+	suite.upMachines = []*pbmesos.MachineID{upMachine}
 
 	drainingHost := "host2"
 	drainingIP := "172.0.0.2"
-	drainingMachine := &mesospb.MachineID{
+	drainingMachine := &pbmesos.MachineID{
 		Hostname: &drainingHost,
 		Ip:       &drainingIP,
 	}
-	suite.drainingMachines = []*mesospb.MachineID{drainingMachine}
+	suite.drainingMachines = []*pbmesos.MachineID{drainingMachine}
+	suite.hostCapacity = &host.ResourceCapacity{
+		Physical: scalar.Resources{
+			CPU:  float64(2.0),
+			Mem:  float64(4.0),
+			Disk: float64(10.0),
+			GPU:  float64(1.0),
+		},
+		Slack: scalar.Resources{
+			CPU: float64(1.5),
+		},
+	}
 }
 
 // SetupTest is setup function for each test in this suite.
 func (suite *HostPoolManagerTestSuite) SetupTest() {
 	testScope := tally.NewTestScope("", map[string]string{})
+
 	suite.eventStreamHandler = eventstream.NewEventStreamHandler(
 		10,
 		[]string{"client1"},
 		nil,
 		testScope)
+
+	suite.ctrl = gomock.NewController(suite.T())
+	suite.mockHostInfoOps = orm_mocks.NewMockHostInfoOps(suite.ctrl)
+
 	suite.manager = New(
 		_testReconcileInterval,
 		suite.eventStreamHandler,
+		suite.mockHostInfoOps,
 		tally.NoopScope,
 	)
+}
+
+func (suite *HostPoolManagerTestSuite) TearDownTest() {
+	suite.ctrl.Finish()
 }
 
 // TestHostPoolManagerTestSuite runs HostPoolManagerTestSuite.
@@ -130,13 +159,14 @@ func (suite *HostPoolManagerTestSuite) TestGetPoolByHostname() {
 	}
 
 	for tcName, tc := range testCases {
-		manager := setupTestManager(
+		suite.manager = setupTestManager(
 			tc.poolIndex,
 			tc.hostToPoolMap,
 			suite.eventStreamHandler,
+			suite.mockHostInfoOps,
 		)
 
-		_, err := manager.GetPoolByHostname(testHostname)
+		_, err := suite.manager.GetPoolByHostname(testHostname)
 		if tc.expectedErrMsg != "" {
 			suite.EqualError(
 				err,
@@ -210,6 +240,17 @@ func (suite *HostPoolManagerTestSuite) TestDeregisterPool() {
 
 // TestDeregisterPoolWithHosts tests removing a pool that has hosts associated
 func (suite *HostPoolManagerTestSuite) TestDeregisterPoolWithHosts() {
+	ctrl := gomock.NewController(suite.T())
+	defer ctrl.Finish()
+
+	loader := suite.setupAgentMapLoader(ctrl)
+	loader.Load(nil)
+	host.GetAgentMap().HostCapacities = map[string]*host.ResourceCapacity{
+		"host0": suite.hostCapacity,
+		"host1": suite.hostCapacity,
+		"host2": suite.hostCapacity,
+	}
+
 	hostToPoolMap := map[string]string{
 		"host0": "pool0",
 		"host1": "pool0",
@@ -218,20 +259,32 @@ func (suite *HostPoolManagerTestSuite) TestDeregisterPoolWithHosts() {
 	poolIndex := map[string][]string{
 		"pool0": {"host0", "host1", "host2"},
 	}
-	manager := setupTestManager(
+	suite.manager = setupTestManager(
 		poolIndex,
 		hostToPoolMap,
-		suite.eventStreamHandler)
-	manager.RegisterPool("default")
+		suite.eventStreamHandler,
+		suite.mockHostInfoOps,
+	)
+	suite.manager.RegisterPool("default")
 
-	manager.DeregisterPool("pool0")
+	for _, h := range poolIndex["pool0"] {
+		suite.mockHostInfoOps.EXPECT().UpdatePool(
+			gomock.Any(),
+			h,
+			common.DefaultHostPoolID,
+			common.DefaultHostPoolID,
+		).Return(nil)
+	}
+
+	err := suite.manager.DeregisterPool("pool0")
+	suite.NoError(err)
 
 	for h := range hostToPoolMap {
-		p, err := manager.GetPoolByHostname(h)
+		p, err := suite.manager.GetPoolByHostname(h)
 		suite.NoError(err)
 		suite.Equal("default", p.ID())
 	}
-	defpool, err := manager.GetPool("default")
+	defpool, err := suite.manager.GetPool("default")
 	suite.NoError(err)
 	defpoolHosts := defpool.Hosts()
 	suite.Contains(defpoolHosts, "host0")
@@ -241,6 +294,10 @@ func (suite *HostPoolManagerTestSuite) TestDeregisterPoolWithHosts() {
 	events, err := suite.eventStreamHandler.GetEvents()
 	suite.NoError(err)
 	suite.Equal(3, len(events))
+
+	suite.checkPoolCapacity(
+		suite.manager.(*hostPoolManager),
+		"TestDeregisterPoolWithHosts")
 }
 
 // TestGetHostPoolLabelValuesGetHostPoolLabelValues tests creating a LabelValues
@@ -275,12 +332,13 @@ func (suite *HostPoolManagerTestSuite) TestGetHostPoolLabelValues() {
 	}
 
 	for tcName, tc := range testCases {
-		manager := setupTestManager(
+		suite.manager = setupTestManager(
 			tc.poolIndex,
 			tc.hostToPoolMap,
 			suite.eventStreamHandler,
+			suite.mockHostInfoOps,
 		)
-		res, err := GetHostPoolLabelValues(manager, tc.hostname)
+		res, err := GetHostPoolLabelValues(suite.manager, tc.hostname)
 		if tc.expectedErrMsg != "" {
 			suite.EqualError(err, tc.expectedErrMsg, "test case: %s", tcName)
 		} else {
@@ -290,154 +348,416 @@ func (suite *HostPoolManagerTestSuite) TestGetHostPoolLabelValues() {
 	}
 }
 
-// TestReconcile tests Start, Stop and reconcile host pool manager.
+// TestStartStop tests Start, Stop and recovery
+func (suite *HostPoolManagerTestSuite) TestStartStopRecover() {
+	ctrl := gomock.NewController(suite.T())
+	defer ctrl.Finish()
+
+	loader := suite.setupAgentMapLoader(ctrl)
+	loader.Load(nil)
+	host.GetAgentMap().HostCapacities = map[string]*host.ResourceCapacity{
+		"host0": suite.hostCapacity,
+		"host1": suite.hostCapacity,
+		"host2": suite.hostCapacity,
+		"host3": suite.hostCapacity,
+	}
+
+	defaultHostInfo := []*pbhost.HostInfo{
+		{
+			Hostname:    "host0",
+			CurrentPool: "pool1",
+		},
+		{
+			Hostname:    "host1",
+			CurrentPool: "pool1",
+		},
+		{
+			Hostname:    "host2",
+			CurrentPool: "pool2",
+		},
+		{
+			Hostname: "host3",
+		},
+	}
+	suite.mockHostInfoOps.EXPECT().GetAll(gomock.Any()).
+		Return(defaultHostInfo, nil)
+	suite.mockHostInfoOps.EXPECT().UpdatePool(
+		gomock.Any(),
+		"host3",
+		common.DefaultHostPoolID,
+		common.DefaultHostPoolID).
+		Return(nil)
+
+	manager := setupTestManager(
+		make(map[string][]string),
+		make(map[string]string),
+		suite.eventStreamHandler,
+		suite.mockHostInfoOps,
+	)
+	// Disable reconciliation by setting the interval to a large value
+	mgr := manager.(*hostPoolManager)
+	mgr.reconcileInternal = 5 * time.Minute
+
+	// Stop before Start should go through fine.
+	manager.Stop()
+
+	suite.NoError(manager.Start())
+	resultPoolIndex := manager.Pools()
+	for poolID, pool := range resultPoolIndex {
+		if poolID == common.DefaultHostPoolID {
+			suite.Equal(1, len(pool.Hosts()))
+			suite.Contains(pool.Hosts(), "host3")
+		} else if poolID == "pool1" {
+			suite.Equal(2, len(pool.Hosts()))
+			suite.Contains(pool.Hosts(), "host0")
+			suite.Contains(pool.Hosts(), "host1")
+		} else if poolID == "pool2" {
+			suite.Equal(1, len(pool.Hosts()))
+			suite.Contains(pool.Hosts(), "host2")
+		} else {
+			suite.Fail("Unexpected pool %s", poolID)
+		}
+	}
+	suite.checkPoolCapacity(mgr, "recover")
+
+	// verify starting again is ok
+	suite.NoError(manager.Start())
+
+	manager.Stop()
+	// verify stopping again is ok
+	manager.Stop()
+}
+
+// TestStartError tests Start error due to recovery error
+func (suite *HostPoolManagerTestSuite) TestStartError() {
+	ctrl := gomock.NewController(suite.T())
+	defer ctrl.Finish()
+
+	expectedErr := errors.New("something bad")
+	suite.mockHostInfoOps.EXPECT().GetAll(gomock.Any()).
+		Return(nil, expectedErr)
+
+	manager := setupTestManager(
+		make(map[string][]string),
+		make(map[string]string),
+		suite.eventStreamHandler,
+		suite.mockHostInfoOps,
+	)
+	suite.Error(manager.Start())
+}
+
 func (suite *HostPoolManagerTestSuite) TestReconcile() {
 	ctrl := gomock.NewController(suite.T())
 	defer ctrl.Finish()
 
-	mockMasterOperatorClient := mpb_mocks.NewMockMasterOperatorClient(ctrl)
-	mockMaintenanceMap := hostmgr_host_mocks.NewMockMaintenanceHostInfoMap(ctrl)
-
-	response := suite.makeAgentsResponse()
-	mockMaintenanceMap.EXPECT().
-		GetDrainingHostInfos(gomock.Any()).
-		Return([]*pb_host.HostInfo{}).
-		Times(len(suite.upMachines) + len(suite.drainingMachines))
-	mockMasterOperatorClient.EXPECT().Agents().Return(response, nil)
-
-	loader := &host.Loader{
-		OperatorClient:         mockMasterOperatorClient,
-		Scope:                  tally.NewTestScope("", map[string]string{}),
-		MaintenanceHostInfoMap: mockMaintenanceMap,
-	}
+	loader := suite.setupAgentMapLoader(ctrl)
 	loader.Load(nil)
+	host.GetAgentMap().HostCapacities = map[string]*host.ResourceCapacity{
+		"host1": suite.hostCapacity,
+		"host2": suite.hostCapacity,
+		"host3": suite.hostCapacity,
+		"host4": suite.hostCapacity,
+	}
+	poolIndex := map[string][]string{
+		"pool0": {"host1"},
+		"pool1": {"host2", "host3"},
+	}
+	hostToPoolMap := map[string]string{
+		"host1": "pool0",
+		"host2": "pool1",
+		"host3": "pool1",
+	}
 
-	testCases := map[string]struct {
-		poolIndex     map[string][]string
-		hostToPoolMap map[string]string
-		expectedCache map[string]string
+	testCases := []struct {
+		tcName                string
+		dbHosts               []*pbhost.HostInfo
+		expectedhostToPoolMap map[string]string
+		expectedNewHost       string
+		expectedNumEvents     int
 	}{
-		"default-host-pool-not-exist": {
-			poolIndex:     map[string][]string{},
-			hostToPoolMap: map[string]string{},
-			expectedCache: map[string]string{
-				"host1": common.DefaultHostPoolID,
-				"host2": common.DefaultHostPoolID,
+		{
+			tcName: "in-sync-with-db",
+			dbHosts: []*pbhost.HostInfo{
+				{Hostname: "host1", CurrentPool: "pool0"},
+				{Hostname: "host2", CurrentPool: "pool1"},
+				{Hostname: "host3", CurrentPool: "pool1"},
 			},
+			expectedhostToPoolMap: hostToPoolMap,
 		},
-		"host-pool-cache-in-sync": {
-			poolIndex: map[string][]string{
-				common.DefaultHostPoolID: {"host1", "host2"},
+		{
+			tcName: "new-host-in-db",
+			dbHosts: []*pbhost.HostInfo{
+				{Hostname: "host1", CurrentPool: "pool0"},
+				{Hostname: "host2", CurrentPool: "pool1"},
+				{Hostname: "host3", CurrentPool: "pool1"},
+				{Hostname: "host4"},
 			},
-			hostToPoolMap: map[string]string{
-				"host1": common.DefaultHostPoolID,
-				"host2": common.DefaultHostPoolID,
+			expectedhostToPoolMap: map[string]string{
+				"host1": "pool0",
+				"host2": "pool1",
+				"host3": "pool1",
+				"host4": "default",
 			},
-			expectedCache: map[string]string{
-				"host1": common.DefaultHostPoolID,
-				"host2": common.DefaultHostPoolID,
-			},
+			expectedNewHost:   "host4",
+			expectedNumEvents: 1,
 		},
-		"more-hosts-in-pool-index": {
-			poolIndex: map[string][]string{
-				common.DefaultHostPoolID: {"host1", "host2"},
+		{
+			tcName: "host-removed-from-db",
+			dbHosts: []*pbhost.HostInfo{
+				{Hostname: "host1", CurrentPool: "pool0"},
+				{Hostname: "host2", CurrentPool: "pool1"},
 			},
-			hostToPoolMap: map[string]string{
-				"host1": common.DefaultHostPoolID,
+			expectedhostToPoolMap: map[string]string{
+				"host1": "pool0",
+				"host2": "pool1",
 			},
-			expectedCache: map[string]string{
-				"host1": common.DefaultHostPoolID,
-				"host2": common.DefaultHostPoolID,
-			},
+			expectedNumEvents: 1,
 		},
-		"more-hosts-in-host-to-pool-map": {
-			poolIndex: map[string][]string{
-				common.DefaultHostPoolID: {"host1"},
+		{
+			tcName: "host-in-different-pool",
+			dbHosts: []*pbhost.HostInfo{
+				{Hostname: "host1", CurrentPool: "pool0"},
+				{Hostname: "host2", CurrentPool: "pool0"},
+				{Hostname: "host3", CurrentPool: "pool1"},
 			},
-			hostToPoolMap: map[string]string{
-				"host1": common.DefaultHostPoolID,
-				"host2": common.DefaultHostPoolID,
+			expectedhostToPoolMap: map[string]string{
+				"host1": "pool0",
+				"host2": "pool0",
+				"host3": "pool1",
 			},
-			expectedCache: map[string]string{
-				"host1": common.DefaultHostPoolID,
-				"host2": common.DefaultHostPoolID,
-			},
+			expectedNumEvents: 1,
 		},
-		"more-hosts-in-agent-map": {
-			poolIndex: map[string][]string{
-				common.DefaultHostPoolID: {"host1"},
+		{
+			tcName: "new-pool-in-db",
+			dbHosts: []*pbhost.HostInfo{
+				{Hostname: "host1", CurrentPool: "pool0"},
+				{Hostname: "host2", CurrentPool: "pool1"},
+				{Hostname: "host3", CurrentPool: "pool2"},
 			},
-			hostToPoolMap: map[string]string{
-				"host1": common.DefaultHostPoolID,
+			expectedhostToPoolMap: map[string]string{
+				"host1": "pool0",
+				"host2": "pool1",
+				"host3": "pool2",
 			},
-			expectedCache: map[string]string{
-				"host1": common.DefaultHostPoolID,
-				"host2": common.DefaultHostPoolID,
-			},
+			expectedNumEvents: 1,
 		},
-		"more-hosts-in-host-pool-cache": {
-			poolIndex: map[string][]string{
-				common.DefaultHostPoolID: {
-					"host1",
-					"host2",
-					"host3",
-				},
+		{
+			tcName: "pool-with-no-host-in-db",
+			dbHosts: []*pbhost.HostInfo{
+				{Hostname: "host1", CurrentPool: "pool0"},
+				{Hostname: "host2", CurrentPool: "pool0"},
+				{Hostname: "host3", CurrentPool: "pool0"},
 			},
-			hostToPoolMap: map[string]string{
-				"host1": common.DefaultHostPoolID,
-				"host2": common.DefaultHostPoolID,
-				"host3": common.DefaultHostPoolID,
+			expectedhostToPoolMap: map[string]string{
+				"host1": "pool0",
+				"host2": "pool0",
+				"host3": "pool0",
 			},
-			expectedCache: map[string]string{
-				"host1": common.DefaultHostPoolID,
-				"host2": common.DefaultHostPoolID,
-			},
-		},
-		"host-in-multiple-host-pools": {
-			poolIndex: map[string][]string{
-				common.DefaultHostPoolID: {"host1", "host2"},
-				"pool1":                  {"host1"},
-			},
-			hostToPoolMap: map[string]string{
-				"host1": common.DefaultHostPoolID,
-				"host2": common.DefaultHostPoolID,
-			},
-			expectedCache: map[string]string{
-				"host1": common.DefaultHostPoolID,
-				"host2": common.DefaultHostPoolID,
-			},
+			expectedNumEvents: 2,
 		},
 	}
 
-	for tcName, tc := range testCases {
+	for _, tc := range testCases {
+		tcName := tc.tcName
+		suite.mockHostInfoOps.EXPECT().GetAll(gomock.Any()).
+			Return(tc.dbHosts, nil)
+		if tc.expectedNewHost != "" {
+			suite.mockHostInfoOps.EXPECT().UpdatePool(
+				gomock.Any(),
+				tc.expectedNewHost,
+				common.DefaultHostPoolID,
+				common.DefaultHostPoolID).
+				Return(nil)
+		}
 		manager := setupTestManager(
-			tc.poolIndex,
-			tc.hostToPoolMap,
+			poolIndex,
+			hostToPoolMap,
 			suite.eventStreamHandler,
-		)
+			suite.mockHostInfoOps)
+		mgr := manager.(*hostPoolManager)
+		// flush pending events
+		preEvents, _ := suite.eventStreamHandler.GetEvents()
 
-		manager.Start()
+		suite.NoError(mgr.reconcile(), tcName)
 
-		time.Sleep(2 * _testReconcileInterval)
+		suite.checkHostPoolMap(
+			tc.expectedhostToPoolMap,
+			mgr,
+			"reconcile: %s",
+			tcName)
+		suite.checkPoolIndexConsistency(mgr, "reconcile: %s", tcName)
+		suite.checkPoolCapacity(mgr, "reconcile: %s", tcName)
 
-		cached := make(map[string]string)
-		poolIndex := manager.Pools()
-		for poolID, pool := range poolIndex {
-			for hostname := range pool.Hosts() {
-				p, err := manager.GetPoolByHostname(hostname)
-				suite.NoError(err, "test case: %s", tcName)
-				suite.Equal(poolID, p.ID(), "test case: %s", tcName)
-				cached[hostname] = poolID
+		// Check all the old pools are still present.
+		pools := mgr.Pools()
+		for poolID := range poolIndex {
+			suite.Contains(pools, poolID, "reconcile: %s: %s", poolID, tcName)
+		}
+
+		// Check event published.
+		events, err := suite.eventStreamHandler.GetEvents()
+		suite.NoError(err, tcName)
+		suite.Equal(
+			tc.expectedNumEvents,
+			len(events)-len(preEvents),
+			"reconcile: %s: %s",
+			tcName, events)
+	}
+}
+
+func (suite *HostPoolManagerTestSuite) TestReconcileError() {
+	ctrl := gomock.NewController(suite.T())
+	defer ctrl.Finish()
+
+	expectedErr := errors.New("something bad")
+	suite.mockHostInfoOps.EXPECT().GetAll(gomock.Any()).
+		Return(nil, expectedErr)
+
+	manager := setupTestManager(
+		make(map[string][]string),
+		make(map[string]string),
+		suite.eventStreamHandler,
+		suite.mockHostInfoOps,
+	)
+	suite.Error(manager.(*hostPoolManager).reconcile())
+}
+
+func (suite *HostPoolManagerTestSuite) TestReconcileUpdateError() {
+	ctrl := gomock.NewController(suite.T())
+	defer ctrl.Finish()
+
+	dbHosts := []*pbhost.HostInfo{
+		{Hostname: "host0"},
+	}
+	suite.mockHostInfoOps.EXPECT().GetAll(gomock.Any()).
+		Return(dbHosts, nil)
+	expectedErr := errors.New("something bad")
+	suite.mockHostInfoOps.EXPECT().UpdatePool(
+		gomock.Any(),
+		"host0",
+		common.DefaultHostPoolID,
+		common.DefaultHostPoolID).
+		Return(expectedErr)
+
+	manager := setupTestManager(
+		make(map[string][]string),
+		make(map[string]string),
+		suite.eventStreamHandler,
+		suite.mockHostInfoOps,
+	)
+	suite.NoError(manager.(*hostPoolManager).reconcile())
+	_, err := manager.GetPoolByHostname("host1")
+	suite.Error(err)
+}
+
+func (suite *HostPoolManagerTestSuite) checkHostPoolMap(
+	expected map[string]string,
+	mgr *hostPoolManager,
+	msgFormat string,
+	msgArgs ...interface{},
+) {
+	msg := fmt.Sprintf(msgFormat, msgArgs...)
+	suite.Equal(len(expected), len(mgr.hostToPoolMap), msg)
+	for hostname, expectedPool := range expected {
+		actualPool, err := mgr.GetPoolByHostname(hostname)
+		suite.NoError(err, "%s: %s", hostname, msg)
+		if err == nil {
+			suite.Equal(expectedPool, actualPool.ID(), "%s: %s", hostname, msg)
+		}
+	}
+}
+
+// Checks that poolIndex is consistent with hostPoolMap.
+func (suite *HostPoolManagerTestSuite) checkPoolIndexConsistency(
+	mgr *hostPoolManager,
+	msgFormat string,
+	msgArgs ...interface{},
+) {
+	msg := fmt.Sprintf(msgFormat, msgArgs...)
+	for poolID, pool := range mgr.Pools() {
+		for hostname := range pool.Hosts() {
+			actualPool, err := mgr.GetPoolByHostname(hostname)
+			suite.NoError(err, "%s: %s", hostname, msg)
+			if err == nil {
+				suite.Equal(poolID, actualPool.ID(), "%s: %s", hostname, msg)
 			}
 		}
-		suite.EqualValues(tc.expectedCache, cached, "test case: %s", tcName)
+	}
+}
 
-		manager.Stop()
+// TestRefreshPoolCapacity verifies that pool capacities are updated correctly.
+func (suite *HostPoolManagerTestSuite) TestRefreshPoolCapacity() {
+	poolIndex := map[string][]string{
+		"pool0": {"host1", "host4", "host5"},
+		"pool1": {"host2", "host3"},
+	}
+	hostToPoolMap := map[string]string{
+		"host1": "pool0",
+		"host2": "pool1",
+		"host3": "pool1",
+		"host4": "pool0",
+		"host5": "pool0",
+	}
+	manager := setupTestManager(
+		poolIndex,
+		hostToPoolMap,
+		suite.eventStreamHandler,
+		suite.mockHostInfoOps)
+	mgr := manager.(*hostPoolManager)
+
+	ctrl := gomock.NewController(suite.T())
+	defer ctrl.Finish()
+
+	loader := suite.setupAgentMapLoader(ctrl)
+	loader.Load(nil)
+	host.GetAgentMap().HostCapacities = map[string]*host.ResourceCapacity{
+		"host1": suite.hostCapacity,
+		"host2": suite.hostCapacity,
+		"host3": suite.hostCapacity,
+		"host4": suite.hostCapacity,
+		"host5": suite.hostCapacity,
+	}
+
+	mgr.refreshPoolCapacity()
+	suite.checkPoolCapacity(mgr, "refreshPoolCapacity")
+}
+
+// Checks that the capacities of all Pools is as expected.
+func (suite *HostPoolManagerTestSuite) checkPoolCapacity(
+	mgr *hostPoolManager,
+	msgFormat string,
+	msgArgs ...interface{},
+) {
+	msg := fmt.Sprintf(msgFormat, msgArgs...)
+	for poolID, pool := range mgr.Pools() {
+		numHosts := float64(len(pool.Hosts()))
+		expected := host.ResourceCapacity{
+			Physical: scalar.Resources{
+				CPU:  numHosts * float64(2.0),
+				Mem:  numHosts * float64(4.0),
+				Disk: numHosts * float64(10.0),
+				GPU:  numHosts * float64(1.0),
+			},
+			Slack: scalar.Resources{
+				CPU: numHosts * float64(1.5),
+			},
+		}
+		suite.Equal(expected, pool.Capacity(), "%s: %s", poolID, msg)
 	}
 }
 
 // TestChangeHostPool tests various cases of changing pool for a host.
 func (suite *HostPoolManagerTestSuite) TestChangeHostPool() {
+	ctrl := gomock.NewController(suite.T())
+	defer ctrl.Finish()
+
+	loader := suite.setupAgentMapLoader(ctrl)
+	loader.Load(nil)
+
+	host.GetAgentMap().HostCapacities = map[string]*host.ResourceCapacity{
+		"host2": suite.hostCapacity,
+		"host3": suite.hostCapacity,
+	}
 
 	hostToPoolMap := map[string]string{
 		"host0": "pool0",
@@ -456,14 +776,28 @@ func (suite *HostPoolManagerTestSuite) TestChangeHostPool() {
 
 	testCases := map[string]struct {
 		pools                       map[string][]string
-		isErr                       bool
 		srcPoolID, destPoolID, host string
+		updated, isErr              bool
+		updatedErr                  error
+		srcCapacity, dstCapacity    host.ResourceCapacity
 	}{
 		"success": {
 			pools:      poolIndex,
 			srcPoolID:  "pool2",
 			destPoolID: "pool3",
 			host:       "host2",
+			updated:    true,
+			dstCapacity: host.ResourceCapacity{
+				Physical: scalar.Resources{
+					CPU:  2.0 * float64(2.0),
+					Mem:  2.0 * float64(4.0),
+					Disk: 2.0 * float64(10.0),
+					GPU:  2.0 * float64(1.0),
+				},
+				Slack: scalar.Resources{
+					CPU: 2.0 * float64(1.5),
+				},
+			},
 		},
 		"no-op": {
 			pools:      poolIndex,
@@ -499,43 +833,67 @@ func (suite *HostPoolManagerTestSuite) TestChangeHostPool() {
 			host:       "host2",
 			isErr:      true,
 		},
+		"update-host-info-failure": {
+			pools:      poolIndex,
+			srcPoolID:  "pool2",
+			destPoolID: "pool3",
+			host:       "host2",
+			updated:    true,
+			isErr:      true,
+			updatedErr: errors.New("some bad things happened"),
+		},
 	}
 
 	for tcName, tc := range testCases {
-		manager := setupTestManager(
+		if tc.updated {
+			suite.mockHostInfoOps.EXPECT().UpdatePool(
+				gomock.Any(),
+				tc.host,
+				tc.destPoolID,
+				tc.destPoolID,
+			).Return(tc.updatedErr)
+		}
+
+		suite.manager = setupTestManager(
 			tc.pools,
 			hostToPoolMap,
-			suite.eventStreamHandler)
+			suite.eventStreamHandler,
+			suite.mockHostInfoOps,
+		)
 
-		err := manager.ChangeHostPool(tc.host, tc.srcPoolID, tc.destPoolID)
+		err := suite.manager.ChangeHostPool(tc.host, tc.srcPoolID, tc.destPoolID)
 		if tc.isErr {
 			suite.Error(err, tcName)
 		} else {
 			suite.NoError(err, tcName)
 
-			p, err := manager.GetPoolByHostname(tc.host)
+			p, err := suite.manager.GetPoolByHostname(tc.host)
 			suite.NoError(err, tcName)
 			suite.Equal(tc.destPoolID, p.ID())
 
 			if tc.destPoolID != tc.srcPoolID {
-				destPool, err := manager.GetPool(tc.destPoolID)
+				destPool, err := suite.manager.GetPool(tc.destPoolID)
 				suite.NoError(err, tcName)
 				suite.Contains(destPool.Hosts(), tc.host, tcName)
 
-				srcPool, err := manager.GetPool(tc.srcPoolID)
+				srcPool, err := suite.manager.GetPool(tc.srcPoolID)
 				suite.NoError(err, tcName)
 				suite.NotContains(srcPool.Hosts(), tc.host, tcName)
+
+				// check pool capacity change
+				suite.Equal(tc.srcCapacity, srcPool.Capacity(), tcName)
+				suite.Equal(tc.dstCapacity, destPool.Capacity(), tcName)
 
 				// check event
 				events, err := suite.eventStreamHandler.GetEvents()
 				suite.NoError(err, tcName)
 				suite.Equal(1, len(events))
 				suite.Equal(
-					pb_eventstream.Event_HOST_EVENT,
+					pbeventstream.Event_HOST_EVENT,
 					events[0].GetType())
 				suite.Equal(tc.host, events[0].GetHostEvent().GetHostname())
 				suite.Equal(
-					pb_host.HostEvent_TYPE_HOST_POOL,
+					pbhost.HostEvent_TYPE_HOST_POOL,
 					events[0].GetHostEvent().GetType())
 				suite.Equal(
 					tc.destPoolID,
@@ -545,15 +903,104 @@ func (suite *HostPoolManagerTestSuite) TestChangeHostPool() {
 	}
 }
 
+func (suite *HostPoolManagerTestSuite) TestGetDesiredPool() {
+	testCases := map[string]struct {
+		hostname       string
+		hostInfo       *pbhost.HostInfo
+		getHostInfoErr error
+		expectedPool   string
+		expectedErrMsg string
+	}{
+		"success": {
+			hostname: "host1",
+			hostInfo: &pbhost.HostInfo{
+				DesiredPool: "pool1",
+			},
+			expectedPool: "pool1",
+		},
+		"empty-hostname": {
+			expectedErrMsg: "hostname is empty",
+		},
+		"get-host-info-failure": {
+			hostname:       "host1",
+			getHostInfoErr: errors.New("some bad things happened"),
+			expectedErrMsg: "some bad things happened",
+		},
+	}
+
+	for tcName, tc := range testCases {
+		if len(tc.hostname) > 0 {
+			suite.mockHostInfoOps.EXPECT().Get(
+				gomock.Any(),
+				tc.hostname,
+			).Return(tc.hostInfo, tc.getHostInfoErr)
+		}
+
+		pool, err := suite.manager.GetDesiredPool(tc.hostname)
+		if len(tc.expectedErrMsg) > 0 {
+			suite.EqualError(
+				err, tc.expectedErrMsg, "test case: %s", tcName)
+		} else {
+			suite.NoError(err, "test case: %s", tcName)
+		}
+		suite.Equal(tc.expectedPool, pool, "test case: %s", tcName)
+	}
+}
+
+func (suite *HostPoolManagerTestSuite) TestUpdateDesiredPool() {
+	testCases := map[string]struct {
+		hostname          string
+		poolID            string
+		updateHostInfoErr error
+		expectedErrMsg    string
+	}{
+		"success": {
+			hostname: "host1",
+			poolID:   "pool1",
+		},
+		"empty-hostname": {
+			expectedErrMsg: "hostname is empty",
+		},
+		"empty-poolID": {
+			hostname:       "host1",
+			expectedErrMsg: "poolID is empty",
+		},
+		"update-host-info-failure": {
+			hostname:          "host1",
+			poolID:            "pool1",
+			updateHostInfoErr: errors.New("some bad things happened"),
+			expectedErrMsg:    "some bad things happened",
+		},
+	}
+
+	for tcName, tc := range testCases {
+		if len(tc.hostname) > 0 && len(tc.poolID) > 0 {
+			suite.mockHostInfoOps.EXPECT().UpdateDesiredPool(
+				gomock.Any(),
+				tc.hostname,
+				tc.poolID,
+			).Return(tc.updateHostInfoErr)
+		}
+
+		err := suite.manager.UpdateDesiredPool(tc.hostname, tc.poolID)
+		if len(tc.expectedErrMsg) > 0 {
+			suite.EqualError(
+				err, tc.expectedErrMsg, "test case: %s", tcName)
+		} else {
+			suite.NoError(err, "test case: %s", tcName)
+		}
+	}
+}
+
 // makeAgentsResponse makes a fake GetAgents response from Mesos master.
-func (suite *HostPoolManagerTestSuite) makeAgentsResponse() *masterpb.Response_GetAgents {
-	response := &masterpb.Response_GetAgents{
-		Agents: []*masterpb.Response_GetAgents_Agent{},
+func (suite *HostPoolManagerTestSuite) makeAgentsResponse() *pbmesosmaster.Response_GetAgents {
+	response := &pbmesosmaster.Response_GetAgents{
+		Agents: []*pbmesosmaster.Response_GetAgents_Agent{},
 	}
 	pidUp := fmt.Sprintf("slave(0)@%s:0.0.0.0", suite.upMachines[0].GetIp())
 	hostnameUp := suite.upMachines[0].GetHostname()
-	agentUp := &masterpb.Response_GetAgents_Agent{
-		AgentInfo: &mesospb.AgentInfo{
+	agentUp := &pbmesosmaster.Response_GetAgents_Agent{
+		AgentInfo: &pbmesos.AgentInfo{
 			Hostname: &hostnameUp,
 		},
 		Pid: &pidUp,
@@ -563,8 +1010,8 @@ func (suite *HostPoolManagerTestSuite) makeAgentsResponse() *masterpb.Response_G
 	pidDraining := fmt.Sprintf(
 		"slave(0)@%s:0.0.0.0", suite.drainingMachines[0].GetIp())
 	hostnameDraining := suite.drainingMachines[0].GetHostname()
-	agentDraining := &masterpb.Response_GetAgents_Agent{
-		AgentInfo: &mesospb.AgentInfo{
+	agentDraining := &pbmesosmaster.Response_GetAgents_Agent{
+		AgentInfo: &pbmesos.AgentInfo{
 			Hostname: &hostnameDraining,
 		},
 		Pid: &pidDraining,
@@ -580,11 +1027,13 @@ func setupTestManager(
 	poolIndex map[string][]string,
 	hostToPoolMap map[string]string,
 	eventStreamHandler *eventstream.Handler,
+	mockHostInfoOps *orm_mocks.MockHostInfoOps,
 ) HostPoolManager {
 	scope := tally.NoopScope
 	manager := &hostPoolManager{
 		reconcileInternal:  _testReconcileInterval,
 		eventStreamHandler: eventStreamHandler,
+		hostInfoOps:        mockHostInfoOps,
 		poolIndex:          map[string]hostpool.HostPool{},
 		hostToPoolMap:      map[string]string{},
 		lifecycle:          lifecycle.NewLifeCycle(),
@@ -613,4 +1062,38 @@ func preRegisterTestPools(manager HostPoolManager, numPools int) {
 	for i := 0; i < numPools; i++ {
 		manager.RegisterPool(fmt.Sprintf(_testPoolIDTemplate, i))
 	}
+}
+
+// setupAgentMapLoader creates a host.Loader with the proper mocks.
+func (suite *HostPoolManagerTestSuite) setupAgentMapLoader(
+	ctrl *gomock.Controller,
+) *host.Loader {
+	mockMasterOperatorClient := mpbmocks.NewMockMasterOperatorClient(suite.ctrl)
+
+	response := suite.makeAgentsResponse()
+	suite.mockHostInfoOps.EXPECT().GetAll(gomock.Any()).Return(nil, nil)
+	mockMasterOperatorClient.EXPECT().Agents().Return(response, nil)
+	mockMasterOperatorClient.EXPECT().GetMaintenanceStatus().Return(nil, nil)
+	for _, a := range response.GetAgents() {
+		ip, _, err := util.ExtractIPAndPortFromMesosAgentPID(a.GetPid())
+		suite.NoError(err)
+
+		suite.mockHostInfoOps.EXPECT().Create(
+			gomock.Any(),
+			a.GetAgentInfo().GetHostname(),
+			ip,
+			pbhost.HostState_HOST_STATE_UP,
+			pbhost.HostState_HOST_STATE_UP,
+			map[string]string{},
+			"",
+			"",
+		).Return(nil)
+	}
+
+	loader := &host.Loader{
+		OperatorClient: mockMasterOperatorClient,
+		Scope:          tally.NewTestScope("", map[string]string{}),
+		HostInfoOps:    suite.mockHostInfoOps,
+	}
+	return loader
 }

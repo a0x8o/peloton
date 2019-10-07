@@ -28,7 +28,6 @@ import (
 	"strings"
 	"time"
 
-	mesos_v1 "github.com/uber/peloton/.gen/mesos/v1"
 	"github.com/uber/peloton/.gen/peloton/api/v0/job"
 	"github.com/uber/peloton/.gen/peloton/api/v0/peloton"
 	"github.com/uber/peloton/.gen/peloton/api/v0/query"
@@ -36,9 +35,13 @@ import (
 	"github.com/uber/peloton/.gen/peloton/api/v0/update"
 	pb_volume "github.com/uber/peloton/.gen/peloton/api/v0/volume"
 	"github.com/uber/peloton/.gen/peloton/api/v1alpha/job/stateless"
+	v1alphapeloton "github.com/uber/peloton/.gen/peloton/api/v1alpha/peloton"
+	"github.com/uber/peloton/.gen/peloton/api/v1alpha/pod"
 	"github.com/uber/peloton/.gen/peloton/private/models"
+	versionutil "github.com/uber/peloton/pkg/common/util/entityversion"
 
 	"github.com/uber/peloton/pkg/common"
+	apiconvertor "github.com/uber/peloton/pkg/common/api"
 	"github.com/uber/peloton/pkg/common/backoff"
 	"github.com/uber/peloton/pkg/common/util"
 	"github.com/uber/peloton/pkg/storage"
@@ -781,7 +784,6 @@ func (s *Store) addPodEvent(
 	instanceID uint32,
 	runtime *task.RuntimeInfo) error {
 	var runID, prevRunID, desiredRunID uint64
-	var podStatus []byte
 	var err, errMessage error
 
 	errLog := false
@@ -809,10 +811,7 @@ func (s *Store) addPodEvent(
 		errLog = true
 		errMessage = err
 	}
-	if podStatus, err = proto.Marshal(runtime); err != nil {
-		errLog = true
-		errMessage = err
-	}
+
 	if errLog {
 		s.metrics.TaskMetrics.PodEventsAddFail.Inc(1)
 		return errMessage
@@ -837,7 +836,7 @@ func (s *Store) addPodEvent(
 			"volumeID",
 			"message",
 			"reason",
-			"pod_status").
+			"update_timestamp").
 		Values(
 			jobID.GetValue(),
 			instanceID,
@@ -855,7 +854,7 @@ func (s *Store) addPodEvent(
 			runtime.GetVolumeID().GetValue(),
 			runtime.GetMessage(),
 			runtime.GetReason(),
-			podStatus).Into(podEventsTable)
+			time.Now()).Into(podEventsTable)
 
 	err = s.applyStatement(ctx, stmt, runtime.GetMesosTaskId().GetValue())
 	if err != nil {
@@ -866,14 +865,14 @@ func (s *Store) addPodEvent(
 	return nil
 }
 
-// getPodEvents returns pod events for a Job + Instance + PodID (optional)
+// GetPodEvents returns pod events for a Job + Instance + PodID (optional)
 // Pod events are sorted by PodID + Timestamp
 // only is called from this file
-func (s *Store) getPodEvents(
+func (s *Store) GetPodEvents(
 	ctx context.Context,
 	jobID string,
 	instanceID uint32,
-	podID ...string) ([]*task.PodEvent, error) {
+	podID ...string) ([]*pod.PodEvent, error) {
 	var stmt qb.SelectBuilder
 	queryBuilder := s.DataStore.NewQuery()
 
@@ -911,46 +910,64 @@ func (s *Store) getPodEvents(
 		return nil, err
 	}
 
-	var podEvents []*task.PodEvent
+	var podEvents []*pod.PodEvent
+	b := bytes.Buffer{}
+	b.WriteString(jobID)
+	b.WriteString("-")
+	b.WriteString(strconv.FormatUint(uint64(instanceID), 10))
+	podName := b.String()
 	for _, value := range allResults {
-		podEvent := &task.PodEvent{}
+		podEvent := &pod.PodEvent{}
 
-		mesosTaskID := fmt.Sprintf("%s-%d-%d",
-			value["job_id"].(qb.UUID),
-			value["instance_id"].(int),
-			value["run_id"].(int64))
+		b.Reset()
+		b.WriteString(podName)
+		b.WriteString("-")
+		b.WriteString(strconv.FormatInt(value["run_id"].(int64), 10))
+		mesosTaskID := b.String()
 
-		prevMesosTaskID := fmt.Sprintf("%s-%d-%d",
-			value["job_id"].(qb.UUID),
-			value["instance_id"].(int),
-			value["previous_run_id"].(int64))
+		b.Reset()
+		b.WriteString(podName)
+		b.WriteString("-")
+		b.WriteString(strconv.FormatInt(value["previous_run_id"].(int64), 10))
+		prevMesosTaskID := b.String()
 
-		desiredMesosTaskID := fmt.Sprintf("%s-%d-%d",
-			value["job_id"].(qb.UUID),
-			value["instance_id"].(int),
-			value["desired_run_id"].(int64))
+		b.Reset()
+		b.WriteString(podName)
+		b.WriteString("-")
+		b.WriteString(strconv.FormatInt(value["desired_run_id"].(int64), 10))
+		desiredMesosTaskID := b.String()
 
 		// Set podEvent fields
-		podEvent.TaskId = &mesos_v1.TaskID{
-			Value: &mesosTaskID,
+		podEvent.PodId = &v1alphapeloton.PodID{
+			Value: mesosTaskID,
 		}
-		podEvent.PrevTaskId = &mesos_v1.TaskID{
-			Value: &prevMesosTaskID,
+		podEvent.PrevPodId = &v1alphapeloton.PodID{
+			Value: prevMesosTaskID,
 		}
-		podEvent.DesriedTaskId = &mesos_v1.TaskID{
-			Value: &desiredMesosTaskID,
+		podEvent.DesiredPodId = &v1alphapeloton.PodID{
+			Value: desiredMesosTaskID,
 		}
+
 		podEvent.Timestamp =
 			value["update_time"].(qb.UUID).Time().Format(time.RFC3339)
-		podEvent.ConfigVersion = uint64(value["config_version"].(int64))
-		podEvent.DesiredConfigVersion = uint64(value["desired_config_version"].(int64))
-		podEvent.ActualState = value["actual_state"].(string)
-		podEvent.GoalState = value["goal_state"].(string)
+
+		podEvent.Version = versionutil.GetPodEntityVersion(
+			uint64(value["config_version"].(int64)))
+		podEvent.DesiredVersion = versionutil.GetPodEntityVersion(
+			uint64(value["desired_config_version"].(int64)))
+
+		podEvent.ActualState = apiconvertor.ConvertTaskStateToPodState(
+			task.TaskState(task.TaskState_value[value["actual_state"].(string)])).String()
+		podEvent.DesiredState = apiconvertor.ConvertTaskStateToPodState(
+			task.TaskState(task.TaskState_value[value["goal_state"].(string)])).String()
+
+		podEvent.Healthy = pod.HealthState(
+			task.HealthState_value[value["healthy"].(string)]).String()
+
 		podEvent.Message = value["message"].(string)
 		podEvent.Reason = value["reason"].(string)
-		podEvent.AgentID = value["agent_id"].(string)
+		podEvent.AgentId = value["agent_id"].(string)
 		podEvent.Hostname = value["hostname"].(string)
-		podEvent.Healthy = value["healthy"].(string)
 
 		podEvents = append(podEvents, podEvent)
 	}
@@ -1605,7 +1622,7 @@ func (s *Store) deletePodEventsOnDeleteJob(
 		// 2) read pod events if instance_id (shrunk instances) % 100 = 0
 		if instanceCount > jobConfig.InstanceCount &&
 			instanceCount%_defaultPodEventsLimit == 0 {
-			events, err := s.getPodEvents(
+			events, err := s.GetPodEvents(
 				ctx,
 				jobID,
 				instanceCount)
@@ -2327,13 +2344,15 @@ func (s *Store) AddWorkflowEvent(
 			"instance_id",
 			"type",
 			"state",
-			"create_time").
+			"create_time",
+			"update_timestamp").
 		Values(
 			updateID.GetValue(),
 			int(instanceID),
 			workflowType.String(),
 			workflowState.String(),
-			qb.UUID{UUID: gocql.UUIDFromTime(time.Now())})
+			qb.UUID{UUID: gocql.UUIDFromTime(time.Now())},
+			time.Now())
 	err := s.applyStatement(ctx, stmt, updateID.GetValue())
 	if err != nil {
 		s.metrics.WorkflowMetrics.WorkflowEventsAddFail.Inc(1)

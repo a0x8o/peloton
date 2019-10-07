@@ -25,6 +25,7 @@ import (
 	hostsvc "github.com/uber/peloton/.gen/peloton/api/v0/host/svc"
 	pbtask "github.com/uber/peloton/.gen/peloton/api/v0/task"
 	"github.com/uber/peloton/.gen/peloton/private/resmgr"
+	"github.com/uber/peloton/pkg/common"
 	"github.com/uber/peloton/pkg/common/lifecycle"
 	rmtask "github.com/uber/peloton/pkg/resmgr/task"
 
@@ -34,9 +35,6 @@ import (
 const (
 	// hostScorerInterval is the interval to run host scorer.
 	hostScorerInterval = 5 * time.Second
-
-	// defaultBatchPool is the default batch host pool
-	defaultBatchHostPool = "BATCH"
 
 	// _timeout is the time out setting to make HostMgr call
 	_timeout = 5 * time.Second
@@ -183,22 +181,41 @@ func (s *batchScorer) sortOnce() error {
 		&hostsvc.ListHostPoolsRequest{})
 
 	if err != nil {
+		log.WithError(err).Error("error in ListHostPools")
 		return err
 	}
 
 	poolFound := false
 	for _, p := range resp.GetPools() {
-		if p.GetName() == defaultBatchHostPool {
-			batchHosts = p.GetHosts()
+		if p.GetName() == common.SharedHostPoolID {
+			batchHosts = append(batchHosts, p.GetHosts()...)
 			poolFound = true
 		}
 	}
+	log.WithFields(log.Fields{
+		"number of batch hosts": len(batchHosts),
+		"hosts":                 batchHosts,
+	}).Info("all batch hosts from host manager")
+
 	if !poolFound {
-		return fmt.Errorf("pool %q not found", defaultBatchHostPool)
+		return fmt.Errorf("pool %q not "+
+			"found", common.SharedHostPoolID)
 	}
 
 	hostTasks := s.rmTracker.TasksByHosts(batchHosts, resmgr.TaskType_BATCH)
 	currentTime := time.Now()
+
+	var noTasksHosts []string
+	for _, batchHost := range batchHosts {
+		if _, ok := hostTasks[batchHost]; !ok {
+			noTasksHosts = append(noTasksHosts, batchHost)
+		}
+	}
+
+	log.WithFields(log.Fields{
+		"number of hosts": len(batchHosts),
+		"hosts":           batchHosts,
+	}).Info("all batch hosts which does not have tasks")
 
 	hostMetrics := make([]*batchHostMetrics, len(hostTasks))
 	index := 0
@@ -236,7 +253,7 @@ func (s *batchScorer) sortOnce() error {
 			hostMetrics[index].tasksAvgRunTime /= float64(len(tasksPerHost))
 		}
 
-		index += 1
+		index++
 	}
 
 	// Normalize the task priorities
@@ -246,14 +263,14 @@ func (s *batchScorer) sortOnce() error {
 	clusterMaxPriority := 0.0
 
 	for _, metrics := range hostMetrics {
-		for poolId, priorities := range metrics.tasksPriority {
+		for poolID, priorities := range metrics.tasksPriority {
 			for _, priority := range priorities {
 				clusterMaxPriority = math.Max(clusterMaxPriority, float64(priority))
 
-				if _, ok := poolMaxPriorities[poolId]; !ok {
-					poolMaxPriorities[poolId] = float64(priority)
+				if _, ok := poolMaxPriorities[poolID]; !ok {
+					poolMaxPriorities[poolID] = float64(priority)
 				} else {
-					poolMaxPriorities[poolId] = math.Max(poolMaxPriorities[poolId], float64(priority))
+					poolMaxPriorities[poolID] = math.Max(poolMaxPriorities[poolID], float64(priority))
 				}
 			}
 		}
@@ -262,8 +279,8 @@ func (s *batchScorer) sortOnce() error {
 	// Aggregated normalized priority of all the tasks
 	aggrPriorities := make([]float64, len(hostMetrics))
 	for index, metrics := range hostMetrics {
-		for poolId, priorities := range metrics.tasksPriority {
-			poolMaxPriority := poolMaxPriorities[poolId]
+		for poolID, priorities := range metrics.tasksPriority {
+			poolMaxPriority := poolMaxPriorities[poolID]
 			ratio := 0.0
 			if poolMaxPriority != 0 {
 				ratio = clusterMaxPriority / poolMaxPriority
@@ -295,16 +312,32 @@ func (s *batchScorer) sortOnce() error {
 		return true
 	})
 
-	hosts := make([]string, 0, len(hostMetrics))
+	//hosts := make([]string, 0, len(hostMetrics))
+	var hosts []string
 	for _, metrics := range hostMetrics {
 		if metrics.numNonpreemptible == 0 {
 			hosts = append(hosts, metrics.host)
 		}
 	}
 
+	log.WithFields(log.Fields{
+		"no task hosts":      noTasksHosts,
+		"len no task hosts ": len(noTasksHosts),
+		"taks hosts":         hosts,
+		"len task hosts":     len(hosts),
+	}).Info("hosts breakdown before appending")
+
+	// Append hosts with no task running on top of the list
+	hosts = append(noTasksHosts, hosts...)
 	// copy to target hosts array
 	s.hostsLock.Lock()
 	defer s.hostsLock.Unlock()
+
+	log.WithFields(log.Fields{
+		"all hosts":          hosts,
+		"len no task hosts ": len(hosts),
+	}).Info("final hosts list")
+
 	s.orderedHosts = hosts
 
 	return nil

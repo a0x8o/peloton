@@ -1,53 +1,11 @@
 from docker import errors as docker_errors
-import json
 import logging
-
-from peloton_client.client import PelotonClient
 
 import components
 import driver_base
-from tools.minicluster import minicluster
+from tools.minicluster import client
 
 log = logging.getLogger(__name__)
-
-
-class PelotonClientWrapper(PelotonClient):
-    """
-    Wrapper on the standard Peloton client to patch certain
-    parts of the data retrieved from Zookeeper. This is
-    needed to workaround the fact that Docker containers
-    created by minicluster cannot be directly addressed with
-    the information found in Zookeeper.
-    """
-
-    def _on_job_mgr_leader_change(self, data, stat, event):
-        data = self._patch_leader_ip("job_mgr", data)
-        super(PelotonClientWrapper, self)._on_job_mgr_leader_change(
-            data, stat, event
-        )
-
-    def _on_res_mgr_leader_change(self, data, stat, event):
-        data = self._patch_leader_ip("res_mgr", data)
-        super(PelotonClientWrapper, self)._on_res_mgr_leader_change(
-            data, stat, event
-        )
-
-    def _on_host_mgr_leader_change(self, data, stat, event):
-        data = self._patch_leader_ip("host_mgr", data)
-        super(PelotonClientWrapper, self)._on_host_mgr_leader_change(
-            data, stat, event
-        )
-
-    def _patch_leader_ip(self, comp_name, data):
-        if data.startswith("{"):
-            try:
-                leader = json.loads(data)
-                leader["ip"] = "localhost"
-                log.info("Patching %s leader with %s", comp_name, leader)
-                data = json.dumps(leader)
-            except Exception as e:
-                log.warn("Failed to patch leader data: %s", e)
-        return data
 
 
 class MiniClusterDriver(driver_base.ClusterDriverABC):
@@ -65,7 +23,8 @@ class MiniClusterDriver(driver_base.ClusterDriverABC):
     # ignored because the container was already started/stopped
     ERROR_NOT_MODIFIED = 304
 
-    def __init__(self):
+    def __init__(self, docker_client):
+        self.docker_client = docker_client
         self.component_name_map = {
             components.MesosMaster().name: "peloton-mesos-master",
             components.MesosAgent().name: "peloton-mesos-agent",
@@ -87,7 +46,7 @@ class MiniClusterDriver(driver_base.ClusterDriverABC):
 
     def find(self, component_name, running_only=True):
         cont_name = self._resolve_component_name(component_name)
-        containers = minicluster.cli.containers(all=not running_only)
+        containers = self.docker_client.containers(all=not running_only)
         ids = {}
         for c in containers:
             for n in c["Names"]:
@@ -97,29 +56,30 @@ class MiniClusterDriver(driver_base.ClusterDriverABC):
 
     def start(self, cid):
         try:
-            minicluster.cli.start(cid)
+            self.docker_client.start(cid)
         except docker_errors.APIError as e:
             if e.response.status_code != self.ERROR_NOT_MODIFIED:
                 raise
 
     def stop(self, cid):
         try:
-            minicluster.cli.stop(cid)
+            self.docker_client.stop(cid)
         except docker_errors.APIError as e:
             if e.response.status_code != self.ERROR_NOT_MODIFIED:
                 raise
 
     def execute(self, cid, *cmd_and_args):
-        ex = minicluster.cli.exec_create(
+        ex = self.docker_client.exec_create(
             cid, " ".join(cmd_and_args), stdout=True, stderr=True
         )
-        minicluster.cli.exec_start(ex, tty=True)
+        self.docker_client.exec_start(ex, tty=True)
 
     def match_zk_info(self, cid, cinfo, zk_node_info):
         return cinfo == "/" + zk_node_info["hostname"]
 
     def get_peloton_client(self, name):
-        return PelotonClientWrapper(name=name, zk_servers="localhost:8192")
+        return client.PelotonClientWrapper(name=name,
+                                           zk_servers="localhost:8192")
 
     def info(self):
         res = [("Docker containers", "")]

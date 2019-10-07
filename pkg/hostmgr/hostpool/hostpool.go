@@ -17,6 +17,9 @@ package hostpool
 import (
 	"sync"
 
+	"github.com/uber/peloton/pkg/hostmgr/host"
+	"github.com/uber/peloton/pkg/hostmgr/scalar"
+
 	log "github.com/sirupsen/logrus"
 	"github.com/uber-go/tally"
 )
@@ -41,6 +44,12 @@ type HostPool interface {
 
 	// RefreshMetrics refreshes metrics of the host pool.
 	RefreshMetrics()
+
+	// Get capacity of the pool.
+	Capacity() host.ResourceCapacity
+
+	// Recalculate host-pool capacity from given host capacities.
+	RefreshCapacity(hostCapacities map[string]*host.ResourceCapacity)
 }
 
 // hostPool implements HostPool interface.
@@ -55,6 +64,9 @@ type hostPool struct {
 
 	// Metrics.
 	metrics *Metrics
+
+	// Capacity of the pool.
+	capacity host.ResourceCapacity
 }
 
 // New returns a new hostPool instance.
@@ -90,16 +102,11 @@ func (hp *hostPool) Add(host string) {
 	hp.mu.Lock()
 	defer hp.mu.Unlock()
 
-	// Log warning since it might indicates data inconsistency in callers
-	if _, ok := hp.hosts[host]; ok {
-		log.WithFields(log.Fields{HostnameKey: host, HostPoolKey: poolID}).
-			Warn("Host already in host pool")
+	if _, ok := hp.hosts[host]; !ok {
+		hp.hosts[host] = struct{}{}
+		log.WithField(HostnameKey, host).WithField(HostPoolKey, poolID).
+			Debug("Added host to host pool")
 	}
-
-	// Insert host into map regardless to ensure idempotency
-	hp.hosts[host] = struct{}{}
-	log.WithField(HostnameKey, host).WithField(HostPoolKey, poolID).
-		Debug("Added host to host pool")
 }
 
 // Delete deletes given host from the pool.
@@ -109,16 +116,11 @@ func (hp *hostPool) Delete(host string) {
 	hp.mu.Lock()
 	defer hp.mu.Unlock()
 
-	// Log warning since it might indicates data inconsistency in callers
-	if _, ok := hp.hosts[host]; !ok {
+	if _, ok := hp.hosts[host]; ok {
+		delete(hp.hosts, host)
 		log.WithFields(log.Fields{HostnameKey: host, HostPoolKey: poolID}).
-			Warn("Host not found in host pool")
+			Debug("Deleted host from host pool")
 	}
-
-	// Delete host from map regardless to ensure idempotency
-	delete(hp.hosts, host)
-	log.WithFields(log.Fields{HostnameKey: host, HostPoolKey: poolID}).
-		Debug("Deleted host from host pool")
 }
 
 // Cleanup deletes all hosts from the pool.
@@ -138,4 +140,33 @@ func (hp *hostPool) RefreshMetrics() {
 	defer hp.mu.RUnlock()
 
 	hp.metrics.TotalHosts.Update(float64(len(hp.hosts)))
+	hp.metrics.PhysicalCapacity.Update(hp.capacity.Physical)
+	hp.metrics.SlackCapacity.Update(hp.capacity.Slack)
+}
+
+// Capacity returns the resource capacity of the host pool.
+func (hp *hostPool) Capacity() host.ResourceCapacity {
+	hp.mu.RLock()
+	defer hp.mu.RUnlock()
+
+	return hp.capacity
+}
+
+// RefreshCapacity updates the stored capacity of the pool.
+func (hp *hostPool) RefreshCapacity(
+	hostCapacities map[string]*host.ResourceCapacity,
+) {
+	hp.mu.Lock()
+	defer hp.mu.Unlock()
+
+	physical := scalar.Resources{}
+	slack := scalar.Resources{}
+	for host := range hp.hosts {
+		if cap, ok := hostCapacities[host]; ok {
+			physical = physical.Add(cap.Physical)
+			slack = slack.Add(cap.Slack)
+		}
+	}
+	hp.capacity.Physical = physical
+	hp.capacity.Slack = slack
 }

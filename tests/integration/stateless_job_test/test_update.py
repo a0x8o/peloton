@@ -18,6 +18,7 @@ from peloton_client.pbgen.peloton.api.v0.host import host_pb2
 from google.protobuf import json_format
 
 from tests.integration.conftest import get_container
+from tests.integration.conf_util import minicluster_type
 from tests.integration.stateless_job_test.util import (
     assert_pod_id_changed,
     assert_pod_spec_changed,
@@ -64,10 +65,15 @@ UPDATE_STATELESS_JOB_WITH_HEALTH_CHECK_SPEC = (
     "test_stateless_job_successful_health_check_spec.yaml"
 )
 UPDATE_STATELESS_JOB_INVALID_SPEC = "test_stateless_job_spec_invalid.yaml"
-UPDATE_STATELESS_JOB_NO_ERR = "test_stateless_job_exit_without_err_spec.yaml"
-UPDATE_STATELESS_JOB_LABEL_UPDATE_SPEC = (
-    "test_stateless_job_label_update_spec.yaml"
+UPDATE_STATELESS_JOB_JOB_CONFIG_UPDATE_SPEC = (
+    "test_stateless_job_job_config_update_spec.yaml"
 )
+
+
+def update_stateless_job_spec():
+    if minicluster_type() != "k8s":
+        return "test_update_stateless_job_spec.yaml"
+    return "test_stateless_job_spec_k8s.yaml"
 
 
 def test__create_update(stateless_job, in_place):
@@ -1031,17 +1037,22 @@ def test__create_update_before_job_fully_created(stateless_job, in_place):
 # It starts a job with 30 instances, and start the in-place update
 # without batch size, then it tests if any pod is running on unexpected
 # host.
+# TODO: Re-enable k8s when it stops being flaky.
+# @pytest.mark.k8s
 def test__in_place_update_success_rate(stateless_job):
     stateless_job.job_spec.instance_count = 30
     stateless_job.create()
     stateless_job.wait_for_all_pods_running()
     old_pod_infos = stateless_job.query_pods()
 
-    job_spec_dump = load_test_config(UPDATE_STATELESS_JOB_SPEC)
+    job_spec_dump = load_test_config(update_stateless_job_spec())
     updated_job_spec = JobSpec()
     json_format.ParseDict(job_spec_dump, updated_job_spec)
 
     updated_job_spec.instance_count = 30
+    if minicluster_type() == "k8s":
+        updated_job_spec.default_spec.containers[0].resource.mem_limit_mb = 0.1
+
     update = StatelessUpdate(stateless_job,
                              updated_job_spec=updated_job_spec,
                              batch_size=0)
@@ -1271,14 +1282,14 @@ def test__update_with_host_maintenance__bad_config(stateless_job, maintenance):
         assert is_host_in_state(test_host, host_pb2.HOST_STATE_DRAINING)
 
 
-# test__create_update_update_job_label tests update job label
+# test__create_update_update_job_config tests update job level config
 # would not trigger task restart
-def test__create_update_update_job_label(stateless_job):
+def test__create_update_update_job_config(stateless_job):
     stateless_job.create()
     stateless_job.wait_for_all_pods_running()
     old_pod_infos = stateless_job.query_pods()
     update = StatelessUpdate(
-        stateless_job, updated_job_file=UPDATE_STATELESS_JOB_LABEL_UPDATE_SPEC
+        stateless_job, updated_job_file=UPDATE_STATELESS_JOB_JOB_CONFIG_UPDATE_SPEC
     )
     update.create()
     update.wait_for_state(goal_state="SUCCEEDED")

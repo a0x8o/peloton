@@ -52,9 +52,11 @@ import (
 
 var errUnimplemented = errors.New("rpc is unimplemented")
 
-// Minimum task query depth when PodRunsDepth in the config is set to
-// larger than and equals to 2 and bounded by PodRunsMax.
-const minPodRunsDepth = 2
+const (
+	// Minimum task query depth when PodRunsDepth in the config is set to
+	// larger than and equals to 2 and bounded by PodRunsMax.
+	minPodRunsDepth = 2
+)
 
 // jobCache is an internal struct used to capture job id and name
 // of the a specific job. Mostly used as the job query return result.
@@ -564,11 +566,13 @@ func (h *ServiceHandler) getScheduledTasks(
 		return t, nil
 	}
 
+	workers := h.config.getTasksWithoutConfigsWorkers(len(inputs))
+
 	outputs, err := concurrency.Map(
 		ctx,
 		concurrency.MapperFunc(f),
 		inputs,
-		h.config.GetTasksWithoutConfigsWorkers)
+		workers)
 	if err != nil {
 		return nil, err
 	}
@@ -977,7 +981,13 @@ func (h *ServiceHandler) getJobUpdateDiff(
 	request *api.JobUpdateRequest,
 ) (*api.Result, *auroraError) {
 
-	respoolID, err := h.respoolLoader.Load(ctx)
+	respoolID, err := h.respoolLoader.Load(
+		ctx,
+		label.IsGpuConfig(
+			request.GetTaskConfig().GetMetadata(),
+			request.GetTaskConfig().GetResources(),
+		),
+	)
 	if err != nil {
 		return nil, auroraErrorf("load respool: %s", err)
 	}
@@ -2260,6 +2270,8 @@ func (h *ServiceHandler) queryPods(
 		inputs = append(inputs, fmt.Sprintf("%s-%d", jobID.GetValue(), i))
 	}
 
+	workers := h.config.getTasksWithoutConfigsWorkers(len(inputs))
+
 	f := func(ctx context.Context, input interface{}) (interface{}, error) {
 		podName := input.(string)
 		req := &podsvc.GetPodRequest{
@@ -2287,7 +2299,7 @@ func (h *ServiceHandler) queryPods(
 		ctx,
 		concurrency.MapperFunc(f),
 		inputs,
-		h.config.GetTasksWithoutConfigsWorkers)
+		workers)
 	if err != nil {
 		return nil, err
 	}
