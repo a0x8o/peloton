@@ -22,7 +22,7 @@ import (
 
 	mesos "github.com/uber/peloton/.gen/mesos/v1"
 	mesosmaintenance "github.com/uber/peloton/.gen/mesos/v1/maintenance"
-	mesosmaster "github.com/uber/peloton/.gen/mesos/v1/master"
+	mesosmain "github.com/uber/peloton/.gen/mesos/v1/master"
 	host "github.com/uber/peloton/.gen/peloton/api/v0/host"
 
 	"github.com/uber/peloton/pkg/common/lifecycle"
@@ -45,7 +45,7 @@ type drainerTestSuite struct {
 	ctx                      context.Context
 	drainer                  *drainer
 	mockCtrl                 *gomock.Controller
-	mockMasterOperatorClient *mpb_mocks.MockMasterOperatorClient
+	mockMainOperatorClient *mpb_mocks.MockMainOperatorClient
 	mockMaintenanceQueue     *mq_mocks.MockMaintenanceQueue
 	mockMaintenanceMap       *host_mocks.MockMaintenanceHostInfoMap
 	upMachine                *mesos.MachineID
@@ -117,23 +117,23 @@ func (suite *drainerTestSuite) SetupSuite() {
 func (suite *drainerTestSuite) SetupTest() {
 	suite.ctx = context.Background()
 	suite.mockCtrl = gomock.NewController(suite.T())
-	suite.mockMasterOperatorClient = mpb_mocks.NewMockMasterOperatorClient(suite.mockCtrl)
+	suite.mockMainOperatorClient = mpb_mocks.NewMockMainOperatorClient(suite.mockCtrl)
 	suite.mockMaintenanceQueue = mq_mocks.NewMockMaintenanceQueue(suite.mockCtrl)
 	suite.mockMaintenanceMap = host_mocks.NewMockMaintenanceHostInfoMap(suite.mockCtrl)
 
 	suite.drainer = &drainer{
 		drainerPeriod:          drainerPeriod,
 		pelotonAgentRole:       pelotonAgentRole,
-		masterOperatorClient:   suite.mockMasterOperatorClient,
+		mainOperatorClient:   suite.mockMainOperatorClient,
 		maintenanceQueue:       suite.mockMaintenanceQueue,
 		lifecycle:              lifecycle.NewLifeCycle(),
 		maintenanceHostInfoMap: suite.mockMaintenanceMap,
 	}
 
 	response := suite.makeAgentsResponse()
-	suite.mockMasterOperatorClient.EXPECT().Agents().Return(response, nil)
+	suite.mockMainOperatorClient.EXPECT().Agents().Return(response, nil)
 	loader := &Loader{
-		OperatorClient:         suite.mockMasterOperatorClient,
+		OperatorClient:         suite.mockMainOperatorClient,
 		Scope:                  tally.NewTestScope("", map[string]string{}),
 		MaintenanceHostInfoMap: suite.mockMaintenanceMap,
 	}
@@ -144,14 +144,14 @@ func (suite *drainerTestSuite) SetupTest() {
 	loader.Load(nil)
 }
 
-func (suite *drainerTestSuite) makeAgentsResponse() *mesosmaster.Response_GetAgents {
-	response := &mesosmaster.Response_GetAgents{
-		Agents: []*mesosmaster.Response_GetAgents_Agent{},
+func (suite *drainerTestSuite) makeAgentsResponse() *mesosmain.Response_GetAgents {
+	response := &mesosmain.Response_GetAgents{
+		Agents: []*mesosmain.Response_GetAgents_Agent{},
 	}
 
-	pidUp := fmt.Sprintf("slave(0)@%s:0.0.0.0", suite.upMachine.GetIp())
+	pidUp := fmt.Sprintf("subordinate(0)@%s:0.0.0.0", suite.upMachine.GetIp())
 	hostnameUp := suite.upMachine.GetHostname()
-	agentUp := &mesosmaster.Response_GetAgents_Agent{
+	agentUp := &mesosmain.Response_GetAgents_Agent{
 		AgentInfo: &mesos.AgentInfo{
 			Hostname: &hostnameUp,
 			Resources: []*mesos.Resource{
@@ -169,9 +169,9 @@ func (suite *drainerTestSuite) makeAgentsResponse() *mesosmaster.Response_GetAge
 	response.Agents = append(response.Agents, agentUp)
 
 	drainingMachine := suite.drainingMachines[0]
-	pidDraining := fmt.Sprintf("slave(0)@%s:0.0.0.0", drainingMachine.GetIp())
+	pidDraining := fmt.Sprintf("subordinate(0)@%s:0.0.0.0", drainingMachine.GetIp())
 	hostnameDraining := drainingMachine.GetHostname()
-	agentDraining := &mesosmaster.Response_GetAgents_Agent{
+	agentDraining := &mesosmain.Response_GetAgents_Agent{
 		AgentInfo: &mesos.AgentInfo{
 			Hostname: &hostnameDraining,
 		},
@@ -195,7 +195,7 @@ func (suite *drainerTestSuite) TestDrainerNewDrainer() {
 	drainer := NewDrainer(
 		drainerPeriod,
 		pelotonAgentRole,
-		suite.mockMasterOperatorClient,
+		suite.mockMainOperatorClient,
 		suite.mockMaintenanceQueue,
 		host_mocks.NewMockMaintenanceHostInfoMap(suite.mockCtrl))
 	suite.NotNil(drainer)
@@ -203,7 +203,7 @@ func (suite *drainerTestSuite) TestDrainerNewDrainer() {
 
 // TestDrainerStartSuccess tests the success case of starting the host drainer
 func (suite *drainerTestSuite) TestDrainerStartSuccess() {
-	response := mesosmaster.Response_GetMaintenanceStatus{
+	response := mesosmain.Response_GetMaintenanceStatus{
 		Status: &mesosmaintenance.ClusterStatus{
 			DrainingMachines: []*mesosmaintenance.ClusterStatus_DrainingMachine{},
 			DownMachines:     suite.downMachines,
@@ -224,7 +224,7 @@ func (suite *drainerTestSuite) TestDrainerStartSuccess() {
 		drainingHostnames = append(drainingHostnames, drainingMachine.GetHostname())
 	}
 
-	suite.mockMasterOperatorClient.EXPECT().
+	suite.mockMainOperatorClient.EXPECT().
 		GetMaintenanceStatus().
 		Return(&response, nil).
 		MinTimes(1).
@@ -253,7 +253,7 @@ func (suite *drainerTestSuite) TestDrainerStartSuccess() {
 // TestDrainerStartGetMaintenanceStatusFailure tests the failure case of
 // starting the host drainer due to error while getting maintenance status
 func (suite *drainerTestSuite) TestDrainerStartGetMaintenanceStatusFailure() {
-	suite.mockMasterOperatorClient.EXPECT().
+	suite.mockMainOperatorClient.EXPECT().
 		GetMaintenanceStatus().
 		Return(nil, fmt.Errorf("Fake GetMaintenanceStatus error")).
 		MinTimes(1).
@@ -268,7 +268,7 @@ func (suite *drainerTestSuite) TestDrainerStartGetMaintenanceStatusFailure() {
 // host drainer due to error while enqueuing hostnames into maintenance queue
 func (suite *drainerTestSuite) TestDrainerStartEnqueueFailure() {
 	var drainingHostnames []string
-	response := mesosmaster.Response_GetMaintenanceStatus{
+	response := mesosmain.Response_GetMaintenanceStatus{
 		Status: &mesosmaintenance.ClusterStatus{
 			DrainingMachines: []*mesosmaintenance.ClusterStatus_DrainingMachine{},
 			DownMachines:     suite.downMachines,
@@ -289,7 +289,7 @@ func (suite *drainerTestSuite) TestDrainerStartEnqueueFailure() {
 			drainingMachine.GetHostname())
 	}
 
-	suite.mockMasterOperatorClient.EXPECT().
+	suite.mockMainOperatorClient.EXPECT().
 		GetMaintenanceStatus().
 		Return(&response, nil).
 		MinTimes(1).
@@ -328,11 +328,11 @@ func (suite *drainerTestSuite) TestStartMaintenance() {
 	}
 
 	gomock.InOrder(
-		suite.mockMasterOperatorClient.EXPECT().GetMaintenanceSchedule().
-			Return(&mesosmaster.Response_GetMaintenanceSchedule{
+		suite.mockMainOperatorClient.EXPECT().GetMaintenanceSchedule().
+			Return(&mesosmain.Response_GetMaintenanceSchedule{
 				Schedule: &mesosmaintenance.Schedule{},
 			}, nil),
-		suite.mockMasterOperatorClient.EXPECT().
+		suite.mockMainOperatorClient.EXPECT().
 			UpdateMaintenanceSchedule(gomock.Any()).Return(nil),
 		suite.mockMaintenanceMap.EXPECT().
 			AddHostInfo(hostInfo),
@@ -349,7 +349,7 @@ func (suite *drainerTestSuite) TestStartMaintenance() {
 func (suite *drainerTestSuite) TestStartMaintenanceGetMaintenanceScheduleError() {
 	hostname := suite.upMachine.GetHostname()
 
-	suite.mockMasterOperatorClient.EXPECT().
+	suite.mockMainOperatorClient.EXPECT().
 		GetMaintenanceSchedule().
 		Return(nil, fmt.Errorf("fake GetMaintenanceSchedule error"))
 	err := suite.drainer.StartMaintenance(suite.ctx, hostname)
@@ -361,12 +361,12 @@ func (suite *drainerTestSuite) TestStartMaintenanceGetMaintenanceScheduleError()
 func (suite *drainerTestSuite) TestStartMaintenancePostMaintenanceScheduleError() {
 	hostname := suite.upMachine.GetHostname()
 
-	suite.mockMasterOperatorClient.EXPECT().
+	suite.mockMainOperatorClient.EXPECT().
 		GetMaintenanceSchedule().
-		Return(&mesosmaster.Response_GetMaintenanceSchedule{
+		Return(&mesosmain.Response_GetMaintenanceSchedule{
 			Schedule: &mesosmaintenance.Schedule{},
 		}, nil)
-	suite.mockMasterOperatorClient.EXPECT().
+	suite.mockMainOperatorClient.EXPECT().
 		UpdateMaintenanceSchedule(gomock.Any()).
 		Return(fmt.Errorf("fake UpdateMaintenanceSchedule error"))
 	err := suite.drainer.StartMaintenance(suite.ctx, hostname)
@@ -384,12 +384,12 @@ func (suite *drainerTestSuite) TestStartMaintenanceEnqueueError() {
 	}
 
 	gomock.InOrder(
-		suite.mockMasterOperatorClient.EXPECT().
+		suite.mockMainOperatorClient.EXPECT().
 			GetMaintenanceSchedule().
-			Return(&mesosmaster.Response_GetMaintenanceSchedule{
+			Return(&mesosmain.Response_GetMaintenanceSchedule{
 				Schedule: &mesosmaintenance.Schedule{},
 			}, nil),
-		suite.mockMasterOperatorClient.EXPECT().
+		suite.mockMainOperatorClient.EXPECT().
 			UpdateMaintenanceSchedule(gomock.Any()).Return(nil),
 		suite.mockMaintenanceMap.EXPECT().
 			AddHostInfo(hostInfo),
@@ -421,13 +421,13 @@ func (suite *drainerTestSuite) TestStartMaintenancePidParseError() {
 func (suite *drainerTestSuite) TestStartMaintenanceNonPelotonAgentError() {
 	hostname := suite.upMachine.GetHostname()
 	loader := &Loader{
-		OperatorClient:         suite.mockMasterOperatorClient,
+		OperatorClient:         suite.mockMainOperatorClient,
 		Scope:                  tally.NewTestScope("", map[string]string{}),
 		MaintenanceHostInfoMap: suite.mockMaintenanceMap,
 	}
 
-	suite.mockMasterOperatorClient.EXPECT().Agents().Return(&mesosmaster.Response_GetAgents{
-		Agents: []*mesosmaster.Response_GetAgents_Agent{
+	suite.mockMainOperatorClient.EXPECT().Agents().Return(&mesosmain.Response_GetAgents{
+		Agents: []*mesosmain.Response_GetAgents_Agent{
 			{
 				AgentInfo: &mesos.AgentInfo{
 					Hostname: &hostname,
@@ -463,7 +463,7 @@ func (suite *drainerTestSuite) TestCompleteMaintenance() {
 	suite.mockMaintenanceMap.EXPECT().
 		GetDownHostInfos([]string{}).
 		Return([]*host.HostInfo{hostInfo})
-	suite.mockMasterOperatorClient.EXPECT().
+	suite.mockMainOperatorClient.EXPECT().
 		StopMaintenance([]*mesos.MachineID{downMachine}).Return(nil)
 	suite.mockMaintenanceMap.EXPECT().
 		RemoveHostInfo(hostname)
@@ -472,9 +472,9 @@ func (suite *drainerTestSuite) TestCompleteMaintenance() {
 	suite.NoError(err)
 }
 
-// TestCompleteMaintenanceMesosMasterCallFail tests the failure case of
-// completing maintenance on a host due to error while posting to Mesos Master
-func (suite *drainerTestSuite) TestCompleteMaintenanceMesosMasterCallFail() {
+// TestCompleteMaintenanceMesosMainCallFail tests the failure case of
+// completing maintenance on a host due to error while posting to Mesos Main
+func (suite *drainerTestSuite) TestCompleteMaintenanceMesosMainCallFail() {
 	downMachine := suite.downMachines[0]
 
 	hostname := downMachine.GetHostname()
@@ -487,7 +487,7 @@ func (suite *drainerTestSuite) TestCompleteMaintenanceMesosMasterCallFail() {
 	suite.mockMaintenanceMap.EXPECT().
 		GetDownHostInfos([]string{}).
 		Return([]*host.HostInfo{hostInfo})
-	suite.mockMasterOperatorClient.EXPECT().
+	suite.mockMainOperatorClient.EXPECT().
 		StopMaintenance([]*mesos.MachineID{downMachine}).
 		Return(fmt.Errorf("fake StopMaintenance error"))
 
@@ -558,7 +558,7 @@ func (suite *drainerTestSuite) TestGetDrainingHostInfos() {
 // TestIsPelotonAgent tests isPelotonAgent
 func (suite *drainerTestSuite) TestIsPelotonAgent() {
 	loader := &Loader{
-		OperatorClient:         suite.mockMasterOperatorClient,
+		OperatorClient:         suite.mockMainOperatorClient,
 		Scope:                  tally.NoopScope,
 		MaintenanceHostInfoMap: NewMaintenanceHostInfoMap(tally.NoopScope),
 	}
@@ -568,7 +568,7 @@ func (suite *drainerTestSuite) TestIsPelotonAgent() {
 	for _, r := range agentsResponse.Agents[0].GetAgentInfo().GetResources() {
 		r.Reservations[0].Role = &[]string{"*"}[0]
 	}
-	suite.mockMasterOperatorClient.EXPECT().Agents().Return(agentsResponse, nil)
+	suite.mockMainOperatorClient.EXPECT().Agents().Return(agentsResponse, nil)
 	loader.Load(nil)
 	suite.False(suite.drainer.isPelotonAgent("id-0"))
 	suite.True(suite.drainer.isPelotonAgent("id-1"))

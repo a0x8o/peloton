@@ -775,8 +775,8 @@ func (suite *LauncherTestSuite) TestGenerateAssignedTask() {
 	taskConfigData := new(LauncherTestSuite).getTaskConfigData(suite.T())
 	assignment := assignmentInfo{
 		taskID:        "067687c5-2461-475f-b006-68e717f0493b",
-		slaveID:       "ca6bd27e-9abb-4a2e-9860-0a2c2a942510-S0",
-		slaveHost:     "192.168.33.7",
+		subordinateID:       "ca6bd27e-9abb-4a2e-9860-0a2c2a942510-S0",
+		subordinateHost:     "192.168.33.7",
 		assignedPorts: map[string]int32{"test": 12345},
 		instanceID:    3,
 	}

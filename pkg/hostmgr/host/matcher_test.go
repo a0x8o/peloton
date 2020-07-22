@@ -23,7 +23,7 @@ import (
 	"github.com/uber-go/tally"
 
 	mesos "github.com/uber/peloton/.gen/mesos/v1"
-	mesos_master "github.com/uber/peloton/.gen/mesos/v1/master"
+	mesos_main "github.com/uber/peloton/.gen/mesos/v1/master"
 	hpb "github.com/uber/peloton/.gen/peloton/api/v0/host"
 	"github.com/uber/peloton/.gen/peloton/api/v0/peloton"
 	"github.com/uber/peloton/.gen/peloton/api/v0/task"
@@ -47,15 +47,15 @@ type MatcherTestSuite struct {
 
 	ctrl               *gomock.Controller
 	testScope          tally.TestScope
-	operatorClient     *mock_mpb.MockMasterOperatorClient
-	response           *mesos_master.Response_GetAgents
+	operatorClient     *mock_mpb.MockMainOperatorClient
+	response           *mesos_main.Response_GetAgents
 	mockMaintenanceMap *hm.MockMaintenanceHostInfoMap
 }
 
 func (suite *MatcherTestSuite) SetupTest() {
 	suite.ctrl = gomock.NewController(suite.T())
 	suite.testScope = tally.NewTestScope("", map[string]string{})
-	suite.operatorClient = mock_mpb.NewMockMasterOperatorClient(suite.ctrl)
+	suite.operatorClient = mock_mpb.NewMockMainOperatorClient(suite.ctrl)
 	suite.mockMaintenanceMap = hm.NewMockMaintenanceHostInfoMap(suite.ctrl)
 	suite.InitializeHosts()
 }
@@ -94,7 +94,7 @@ func getNewMatcher(
 }
 
 // getAgentResponse generates the agent response
-func getAgentResponse(hostname string, resval float64) *mesos_master.Response_GetAgents_Agent {
+func getAgentResponse(hostname string, resval float64) *mesos_main.Response_GetAgents_Agent {
 	resVal := resval
 	tmpID := hostname
 	resources := []*mesos.Resource{
@@ -125,7 +125,7 @@ func getAgentResponse(hostname string, resval float64) *mesos_master.Response_Ge
 			WithRevocable(&mesos.Resource_RevocableInfo{}).
 			Build(),
 	}
-	return &mesos_master.Response_GetAgents_Agent{
+	return &mesos_main.Response_GetAgents_Agent{
 		AgentInfo: &mesos.AgentInfo{
 			Hostname:  &tmpID,
 			Resources: resources,
@@ -135,9 +135,9 @@ func getAgentResponse(hostname string, resval float64) *mesos_master.Response_Ge
 }
 
 // createAgentsResponse takes the number of agents and create agentresponse
-func createAgentsResponse(numAgents int, sameResource bool) *mesos_master.Response_GetAgents {
-	response := &mesos_master.Response_GetAgents{
-		Agents: []*mesos_master.Response_GetAgents_Agent{},
+func createAgentsResponse(numAgents int, sameResource bool) *mesos_main.Response_GetAgents {
+	response := &mesos_main.Response_GetAgents{
+		Agents: []*mesos_main.Response_GetAgents_Agent{},
 	}
 	res := _zeroResourceValue
 	if !sameResource {

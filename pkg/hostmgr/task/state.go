@@ -235,8 +235,8 @@ func (m *stateManager) Update(ctx context.Context, body *sched.Event) error {
 	}
 
 	// If buffer is full, AddStatusUpdate would fail and peloton would not
-	// ack the status update and mesos master would resend the status update.
-	// Return nil otherwise the framework would disconnect with the mesos master
+	// ack the status update and mesos main would resend the status update.
+	// Return nil otherwise the framework would disconnect with the mesos main
 	return nil
 }
 
@@ -259,7 +259,7 @@ func (m *stateManager) startAsyncProcessTaskUpdates() {
 			for taskStatus := range m.ackChannel {
 				uid := uuid.UUID(taskStatus.GetUuid()).String()
 				// once acked, delete from map
-				// if ack failed at mesos master then agent will re-send
+				// if ack failed at mesos main then agent will re-send
 				m.ackStatusMap.Delete(uid)
 
 				if err := m.acknowledgeTaskUpdate(
@@ -275,7 +275,7 @@ func (m *stateManager) startAsyncProcessTaskUpdates() {
 }
 
 // acknowledgeTaskUpdate, ACK task status update events
-// thru POST scheduler client call to Mesos Master.
+// thru POST scheduler client call to Mesos Main.
 func (m *stateManager) acknowledgeTaskUpdate(
 	ctx context.Context,
 	taskStatus *mesos.TaskStatus) error {
