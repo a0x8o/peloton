@@ -79,10 +79,10 @@ type LaunchableTaskInfo struct {
 type assignmentInfo struct {
 	// Mesos task id
 	taskID string
-	// Mesos slave id that this task has been assigned to
-	slaveID string
+	// Mesos subordinate id that this task has been assigned to
+	subordinateID string
 	// The name of the machine that this task has been assigned to
-	slaveHost string
+	subordinateHost string
 	// Ports reserved on the machine while this task is running
 	assignedPorts map[string]int32
 	// The instance ID assigned to this task
@@ -723,8 +723,8 @@ func populateExecutorData(
 	}
 	assignment := assignmentInfo{
 		taskID:        taskID,
-		slaveID:       placement.GetAgentId().GetValue(),
-		slaveHost:     placement.GetHostname(),
+		subordinateID:       placement.GetAgentId().GetValue(),
+		subordinateHost:     placement.GetHostname(),
 		assignedPorts: assignedPorts,
 		instanceID:    int32(instanceID),
 	}
@@ -760,8 +760,8 @@ func generateAssignedTask(
 
 	assignedTask := &aurora.AssignedTask{}
 	assignedTask.TaskId = &assignment.taskID
-	assignedTask.SlaveId = &assignment.slaveID
-	assignedTask.SlaveHost = &assignment.slaveHost
+	assignedTask.SubordinateId = &assignment.subordinateID
+	assignedTask.SubordinateHost = &assignment.subordinateHost
 	assignedTask.Task = taskConfig
 	assignedTask.AssignedPorts = assignment.assignedPorts
 	assignedTask.InstanceId = &assignment.instanceID

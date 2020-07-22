@@ -141,7 +141,7 @@ func (c *cleaner) cleanVolume(offer *mesos.Offer, volumeID string, reservationLa
 	return c.callMesosForOfferOperations(offer, operations)
 }
 
-// cleanOffer calls mesos master to destroy/unreserve resources that needs to be cleaned.
+// cleanOffer calls mesos main to destroy/unreserve resources that needs to be cleaned.
 func (c *cleaner) cleanOffer(offer *mesos.Offer) error {
 	reservedResources := reservation.GetLabeledReservedResources([]*mesos.Offer{offer})
 

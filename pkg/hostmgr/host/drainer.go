@@ -63,7 +63,7 @@ type Drainer interface {
 type drainer struct {
 	drainerPeriod          time.Duration
 	pelotonAgentRole       string
-	masterOperatorClient   mpb.MasterOperatorClient
+	mainOperatorClient   mpb.MainOperatorClient
 	maintenanceQueue       queue.MaintenanceQueue
 	lifecycle              lifecycle.LifeCycle // lifecycle manager
 	maintenanceHostInfoMap MaintenanceHostInfoMap
@@ -73,14 +73,14 @@ type drainer struct {
 func NewDrainer(
 	drainerPeriod time.Duration,
 	pelotonAgentRole string,
-	masterOperatorClient mpb.MasterOperatorClient,
+	mainOperatorClient mpb.MainOperatorClient,
 	maintenanceQueue queue.MaintenanceQueue,
 	hostInfoMap MaintenanceHostInfoMap,
 ) Drainer {
 	return &drainer{
 		drainerPeriod:          drainerPeriod,
 		pelotonAgentRole:       pelotonAgentRole,
-		masterOperatorClient:   masterOperatorClient,
+		mainOperatorClient:   mainOperatorClient,
 		maintenanceQueue:       maintenanceQueue,
 		lifecycle:              lifecycle.NewLifeCycle(),
 		maintenanceHostInfoMap: hostInfoMap,
@@ -132,7 +132,7 @@ func (d *drainer) Stop() {
 }
 
 func (d *drainer) reconcileMaintenanceState() error {
-	response, err := d.masterOperatorClient.GetMaintenanceStatus()
+	response, err := d.mainOperatorClient.GetMaintenanceStatus()
 	if err != nil {
 		return err
 	}
@@ -170,7 +170,7 @@ func (d *drainer) reconcileMaintenanceState() error {
 }
 
 // StartMaintenance puts the host(s) into DRAINING state by posting a maintenance
-// schedule to Mesos Master.
+// schedule to Mesos Main.
 func (d *drainer) StartMaintenance(
 	ctx context.Context,
 	hostname string,
@@ -185,7 +185,7 @@ func (d *drainer) StartMaintenance(
 	}
 
 	// Get current maintenance schedule
-	response, err := d.masterOperatorClient.GetMaintenanceSchedule()
+	response, err := d.mainOperatorClient.GetMaintenanceSchedule()
 	if err != nil {
 		return err
 	}
@@ -210,11 +210,11 @@ func (d *drainer) StartMaintenance(
 	schedule.Windows = append(schedule.Windows, maintenanceWindow)
 
 	// Post updated maintenance schedule
-	if err = d.masterOperatorClient.UpdateMaintenanceSchedule(schedule); err != nil {
+	if err = d.mainOperatorClient.UpdateMaintenanceSchedule(schedule); err != nil {
 		return err
 	}
 	log.WithField("maintenance_schedule", schedule).
-		Info("Maintenance Schedule posted to Mesos Master")
+		Info("Maintenance Schedule posted to Mesos Main")
 
 	hostInfo := &pbhost.HostInfo{
 		Hostname: machineID.GetHostname(),
@@ -246,14 +246,14 @@ func (d *drainer) CompleteMaintenance(
 		return yarpcerrors.NotFoundErrorf("Host is not DOWN")
 	}
 
-	// Stop Maintenance for the host on Mesos Master
+	// Stop Maintenance for the host on Mesos Main
 	machineID := []*mesos.MachineID{
 		{
 			Hostname: &hostInfo.Hostname,
 			Ip:       &hostInfo.Ip,
 		},
 	}
-	if err := d.masterOperatorClient.StopMaintenance(machineID); err != nil {
+	if err := d.mainOperatorClient.StopMaintenance(machineID); err != nil {
 		return err
 	}
 
